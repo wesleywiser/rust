@@ -24,10 +24,23 @@ pub fn expand_deriving_rand<F>(cx: &mut ExtCtxt,
                                push: F) where
     F: FnOnce(P<Item>),
 {
+    if !cx.use_std {
+        // FIXME(#21880): lift this requirement.
+        // The remaining use_std conditionals are dead code until then.
+        cx.span_err(span, "this trait cannot be derived with #![no_std]");
+        return;
+    }
+
+    let (rand, rng) = if cx.use_std {
+        (path!(std::rand::Rand), path!(std::rand::Rng))
+    } else {
+        (path!(rand::Rand), path!(rand::Rng))
+    };
+
     let trait_def = TraitDef {
         span: span,
         attributes: Vec::new(),
-        path: path!(std::rand::Rand),
+        path: rand,
         additional_bounds: Vec::new(),
         generics: LifetimeBounds::empty(),
         methods: vec!(
@@ -35,8 +48,7 @@ pub fn expand_deriving_rand<F>(cx: &mut ExtCtxt,
                 name: "rand",
                 generics: LifetimeBounds {
                     lifetimes: Vec::new(),
-                    bounds: vec!(("R",
-                                  vec!( path!(std::rand::Rng) ))),
+                    bounds: vec!(("R", vec!(rng))),
                 },
                 explicit_self: None,
                 args: vec!(
@@ -60,12 +72,16 @@ fn rand_substructure(cx: &mut ExtCtxt, trait_span: Span, substr: &Substructure) 
         [ref rng] => rng,
         _ => cx.bug("Incorrect number of arguments to `rand` in `derive(Rand)`")
     };
-    let rand_ident = vec!(
-        cx.ident_of("std"),
-        cx.ident_of("rand"),
-        cx.ident_of("Rand"),
-        cx.ident_of("rand")
-    );
+    let rand_ident = if cx.use_std {
+        vec![cx.ident_of("std"),
+             cx.ident_of("rand"),
+             cx.ident_of("Rand"),
+             cx.ident_of("rand")]
+    } else {
+        vec![cx.ident_of("rand"),
+             cx.ident_of("Rand"),
+             cx.ident_of("rand")]
+    };
     let mut rand_call = |&mut: cx: &mut ExtCtxt, span| {
         cx.expr_call_global(span,
                             rand_ident.clone(),

@@ -434,7 +434,5 @@ pub use core::fmt::{argument, argumentuint};
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn format(args: Arguments) -> string::String {
-    let mut output = string::String::new();
-    let _ = write!(&mut output, "{}", args);
-    output
+    string::String::format(args)
 }

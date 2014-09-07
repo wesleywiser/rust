@@ -671,6 +671,29 @@ impl String {
     pub fn clear(&mut self) {
         self.vec.clear()
     }
+
+    /// The format function takes a precompiled format string and a list of
+    /// arguments, to return the resulting formatted string.
+    ///
+    /// # Arguments
+    ///
+    ///   * args - a structure of arguments generated via the `format_args!` macro.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let s = String::format(format_args!("Hello, {}!", "world"));
+    /// assert_eq!(s, "Hello, world!".to_string());
+    /// ```
+    #[unstable(feature = "collections",
+               reason = "duplicates std::fmt::format, only needed when libstd is missing")]
+    pub fn format(args: fmt::Arguments) -> String {
+        // FIXME #21826
+        use core::fmt::Writer;
+        let mut output = String::new();
+        let _ = write!(&mut output, "{}", args);
+        output
+    }
 }
 
 impl FromUtf8Error {
@@ -1346,6 +1369,12 @@ mod tests {
         let mut d = t.to_string();
         d.extend(vec![u].into_iter());
         assert_eq!(s, d);
+    }
+
+    #[test]
+    fn test_format() {
+        let s = format_args!(String::format, "Hello, {}!", "world");
+        assert_eq!(s.as_slice(), "Hello, world!");
     }
 
     #[bench]

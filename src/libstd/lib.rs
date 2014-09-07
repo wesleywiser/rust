@@ -139,7 +139,7 @@ extern crate log;
 extern crate core;
 
 #[macro_use]
-#[macro_reexport(vec)]
+#[macro_reexport(vec, format)]
 extern crate "collections" as core_collections;
 
 extern crate "rand" as core_rand;
@@ -284,11 +284,12 @@ mod tuple;
 // can be resolved within libstd.
 #[doc(hidden)]
 mod std {
+    // NOTE: remove after next snapshot
     // mods used for deriving
-    pub use clone;
-    pub use cmp;
-    pub use hash;
-    pub use default;
+    #[cfg(stage0)] pub use clone;
+    #[cfg(stage0)] pub use cmp;
+    #[cfg(stage0)] pub use hash;
+    #[cfg(stage0)] pub use default;
 
     pub use sync; // used for select!()
     pub use error; // used for try!()
@@ -311,5 +312,6 @@ mod std {
 
     pub use boxed; // used for vec![]
     // for-loops
-    pub use iter;
+    // NOTE: remove after next snapshot
+    #[cfg(stage0)] pub use iter;
 }
