@@ -13,6 +13,7 @@
 
 use prelude::v1::*;
 
+use fmt;
 use io::{self, Error, ErrorKind};
 use net::{ToSocketAddrs, SocketAddr, IpAddr};
 use sys_common::net2 as net_imp;
@@ -138,6 +139,13 @@ impl UdpSocket {
 
 impl AsInner<net_imp::UdpSocket> for UdpSocket {
     fn as_inner(&self) -> &net_imp::UdpSocket { &self.0 }
+}
+
+impl fmt::Debug for UdpSocket {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let addr = self.socket_addr();
+        write!(f, "UdpSocket {{ addr: {:?} }}", addr)
+    }
 }
 
 #[cfg(test)]
