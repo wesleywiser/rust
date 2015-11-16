@@ -8,8 +8,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use llvm::BasicBlockRef;
+use llvm::{BasicBlockRef, True};
 use rustc_mir::repr as mir;
+use rustc::middle::const_eval::ConstVal;
 use trans::base;
 use trans::build;
 use trans::common::Block;
@@ -46,8 +47,26 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                 build::CondBr(bcx, cond.immediate(), lltrue, llfalse, DebugLoc::None);
             }
 
-            mir::Terminator::Switch { .. } => {
-                unimplemented!()
+            mir::Terminator::Switch { discr: ref discr, adt_def: adt, targets: ref targets } => {
+                println!("Var[0] Type: {:?}", self.vars[0].ty);
+                println!("adt_def: {:?}", adt);
+                println!("Switch {{ discr: {:?}, adt_def: {:?}, targets: {:?} }}", discr, adt, targets);
+                //panic!("Not implemented");
+
+                let discr_lvalue = self.trans_lvalue(bcx, discr);
+                let discr = build::Load(bcx, build::StructGEP(bcx, discr_lvalue.llval, 0));
+                //let discr = self.trans_lvalue(bcx, discr).llval;//build::LoadRangeAssert(bcx, , 0, adt.variants.len() as u64, True);
+                let switch = build::Switch(bcx, discr, self.blocks[0].llbb, targets.len());
+                for (adt_thing, target) in adt.variants.iter().zip(targets) {
+                    let discr_ty = discr_lvalue.ty.to_ty(bcx.tcx());
+                    println!("discr_ty: {:?}", discr_ty);
+                    //let llval = self.trans_constval(bcx, &ConstVal::Uint(adt_thing.disr_val), discr_ty).immediate();//bcx.tcx().types.u64).immediate();
+                    let llval = self.trans_lvalue(bcx, adt_thing.disr_val).llval;
+                    let llbb = self.llblock(*target);
+                    build::AddCase(switch, llval, llbb)
+                    //println!("({:?}, {:?})", adt_thing, target);
+                }
+                
             }
 
             mir::Terminator::SwitchInt { ref discr, switch_ty, ref values, ref targets } => {

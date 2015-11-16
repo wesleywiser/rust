@@ -1473,6 +1473,7 @@ pub type AdtDefMaster<'tcx> = &'tcx AdtDefData<'tcx, 'tcx>;
 pub type VariantDefMaster<'tcx> = &'tcx VariantDefData<'tcx, 'tcx>;
 pub type FieldDefMaster<'tcx> = &'tcx FieldDefData<'tcx, 'tcx>;
 
+#[derive(Debug)]
 pub struct VariantDefData<'tcx, 'container: 'tcx> {
     /// The variant's DefId. If this is a tuple-like struct,
     /// this is the DefId of the struct's ctor.
@@ -1482,6 +1483,7 @@ pub struct VariantDefData<'tcx, 'container: 'tcx> {
     pub fields: Vec<FieldDefData<'tcx, 'container>>,
 }
 
+#[derive(Debug)]
 pub struct FieldDefData<'tcx, 'container: 'tcx> {
     /// The field's DefId. NOTE: the fields of tuple-like enum variants
     /// are not real items, and don't have entries in tcache etc.
