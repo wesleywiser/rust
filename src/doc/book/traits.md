@@ -527,3 +527,22 @@ However, deriving is limited to a certain set of traits:
 - [`Ord`](../core/cmp/trait.Ord.html)
 - [`PartialEq`](../core/cmp/trait.PartialEq.html)
 - [`PartialOrd`](../core/cmp/trait.PartialOrd.html)
+
+# Self
+
+Sometimes, it is useful to be able to refer to the type which will implement a trait.
+Rust defines `Self` to be the implementor type for a trait:
+
+```rust
+trait Foo {
+    fn bar() -> Self; //notice `Self` here
+}
+
+struct Baz;
+
+impl Foo for Baz {
+    fn bar() -> Baz { //notice `Baz` here
+        Baz
+    }
+}
+```
