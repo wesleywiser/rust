@@ -280,6 +280,10 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
             return false;
         }
 
+        // Don't inline default methods in traits
+        if let Some(_) = self.tcx.trait_of_item(callsite.callee) {
+            return false;
+        }
 
         let attrs = tcx.get_attrs(callsite.callee);
         let hint = attr::find_inline_attr(None, &attrs[..]);
