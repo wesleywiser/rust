@@ -430,17 +430,25 @@ impl DepGraph {
             (*dep_node, fingerprint)
         }).collect();
 
-        let total_edge_count: usize = current_dep_graph.edges.iter()
-                                                             .map(|v| v.len())
-                                                             .sum();
-
         let mut edge_list_indices = IndexVec::with_capacity(nodes.len());
-        let mut edge_list_data = Vec::with_capacity(total_edge_count);
+        let mut edge_list_data = Vec::with_capacity(nodes.len() * 10);
 
         for (current_dep_node_index, edges) in current_dep_graph.edges.iter_enumerated() {
             let start = edge_list_data.len() as u32;
-            // This should really just be a memcpy :/
-            edge_list_data.extend(edges.iter().map(|i| SerializedDepNodeIndex::new(i.index())));
+
+            //deduplicate edges here since that doesn't happen as the reads are recorded
+            if edges.len() > 2 {
+                let mut deduplicated_edges = FxHashSet();
+                deduplicated_edges.reserve(edges.len());
+                deduplicated_edges.extend(edges.iter().cloned());
+
+                edge_list_data.extend(deduplicated_edges.iter().map(|i| SerializedDepNodeIndex::new(i.index())));
+            } else if edges.len() > 0 {
+                edge_list_data.push(SerializedDepNodeIndex::new(edges[0].index()));
+                if edges.len() == 2 && edges[0] != edges[1] {
+                    edge_list_data.push(SerializedDepNodeIndex::new(edges[1].index()));
+                }
+            }
             let end = edge_list_data.len() as u32;
 
             debug_assert_eq!(current_dep_node_index.index(), edge_list_indices.len());
@@ -448,7 +456,6 @@ impl DepGraph {
         }
 
         debug_assert!(edge_list_data.len() <= ::std::u32::MAX as usize);
-        debug_assert_eq!(edge_list_data.len(), total_edge_count);
 
         SerializedDepGraph {
             nodes,
@@ -797,7 +804,6 @@ impl CurrentDepGraph {
         self.task_stack.push(OpenTask::Regular {
             node: key,
             reads: Vec::new(),
-            read_set: FxHashSet(),
         });
     }
 
@@ -806,7 +812,6 @@ impl CurrentDepGraph {
 
         if let OpenTask::Regular {
             node,
-            read_set: _,
             reads
         } = popped_node {
             assert_eq!(node, key);
@@ -908,25 +913,19 @@ impl CurrentDepGraph {
         match self.task_stack.last_mut() {
             Some(&mut OpenTask::Regular {
                 ref mut reads,
-                ref mut read_set,
                 node: ref target,
             }) => {
-                self.total_read_count += 1;
-                if read_set.insert(source) {
-                    reads.push(source);
+                reads.push(source);
 
-                    if cfg!(debug_assertions) {
-                        if let Some(ref forbidden_edge) = self.forbidden_edge {
-                            let source = self.nodes[source];
-                            if forbidden_edge.test(&source, &target) {
-                                bug!("forbidden edge {:?} -> {:?} created",
-                                     source,
-                                     target)
-                            }
+                if cfg!(debug_assertions) {
+                    if let Some(ref forbidden_edge) = self.forbidden_edge {
+                        let source = self.nodes[source];
+                        if forbidden_edge.test(&source, &target) {
+                            bug!("forbidden edge {:?} -> {:?} created",
+                                    source,
+                                    target)
                         }
                     }
-                } else {
-                    self.total_duplicate_read_count += 1;
                 }
             }
             Some(&mut OpenTask::Anon {
@@ -964,7 +963,6 @@ enum OpenTask {
     Regular {
         node: DepNode,
         reads: Vec<DepNodeIndex>,
-        read_set: FxHashSet<DepNodeIndex>,
     },
     Anon {
         reads: Vec<DepNodeIndex>,
