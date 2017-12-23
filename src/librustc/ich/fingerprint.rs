@@ -9,6 +9,7 @@
 // except according to those terms.
 
 use rustc_data_structures::stable_hasher;
+use serialize::{self, Decoder, Encoder};
 
 #[derive(Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Clone, Copy, RustcEncodable, RustcDecodable)]
 pub struct Fingerprint(u64, u64);
@@ -67,5 +68,29 @@ impl<CTX> stable_hasher::HashStable<CTX> for Fingerprint {
                                           _: &mut CTX,
                                           hasher: &mut stable_hasher::StableHasher<W>) {
         ::std::hash::Hash::hash(self, hasher);
+    }
+}
+
+impl serialize::UseSpecializedEncodable for Fingerprint {
+    fn default_encode<E: Encoder>(&self, _e: &mut E) -> Result<(), E::Error> {
+        panic!("hit");
+    }
+}
+
+impl serialize::UseSpecializedDecodable for Fingerprint {
+    fn default_decode<D: Decoder>(_d: &mut D) -> Result<Fingerprint, D::Error> {
+        panic!("hit");
+    }
+}
+
+impl<'a> serialize::SpecializedEncoder<Fingerprint> for serialize::opaque::Encoder<'a> {
+    fn specialized_encode(&mut self, _f: &Fingerprint) -> Result<(), Self::Error> {
+        panic!("hit");
+    }
+}
+
+impl<'a> serialize::SpecializedDecoder<Fingerprint> for serialize::opaque::Decoder<'a> {
+    fn specialized_decode(&mut self) -> Result<Fingerprint, Self::Error> {
+        panic!("hit");
     }
 }
