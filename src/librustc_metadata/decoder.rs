@@ -14,7 +14,7 @@ use cstore::{self, CrateMetadata, MetadataBlob, NativeLibrary};
 use schema::*;
 
 use rustc::hir::map::{DefKey, DefPath, DefPathData, DefPathHash};
-use rustc::hir;
+use rustc::hir::{self, TransFnAttrs};//, TransFnAttrFlags};
 use rustc::middle::cstore::{LinkagePreference, ExternConstBody,
                             ExternBodyNestedBodies};
 use rustc::hir::def::{self, Def, CtorKind};
@@ -895,6 +895,30 @@ impl<'a, 'tcx> CrateMetadata {
         }
         vec_[node_index] = Some(result.clone());
         result
+    }
+
+    pub fn trans_fn_attrs(&self, _id: DefId, _tcx: TyCtxt<'a, 'tcx, 'tcx>) -> TransFnAttrs {
+        TransFnAttrs::new()
+        //let attrs = tcx.get_attrs(id);
+
+        //let mut trans_fn_attrs = TransFnAttrs::new();
+
+        //for attr in attrs.iter() {
+        //    if attr.check_name("cold") {
+        //        trans_fn_attrs.flags |= TransFnAttrFlags::COLD;
+        //    } else if attr.check_name("allocator") {
+        //        trans_fn_attrs.flags |= TransFnAttrFlags::ALLOCATOR;
+        //    } else if attr.check_name("unwind") {
+        //        trans_fn_attrs.flags |= TransFnAttrFlags::UNWIND;
+        //    } else if attr.check_name("rustc_allocator_nounwind") {
+        //        trans_fn_attrs.flags |= TransFnAttrFlags::RUSTC_ALLOCATOR_NOUNWIND;
+        //    } else if attr.check_name("naked") {
+        //        trans_fn_attrs.flags |= TransFnAttrFlags::NAKED;
+        //    } else if attr.check_name("inline") {
+        //    }
+        //}
+
+        //trans_fn_attrs
     }
 
     pub fn get_struct_field_names(&self, id: DefIndex) -> Vec<ast::Name> {

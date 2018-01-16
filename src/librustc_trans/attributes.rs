@@ -12,6 +12,7 @@
 use std::ffi::{CStr, CString};
 use std::rc::Rc;
 
+//use rustc::hir::TransFnAttrFlags;
 use rustc::hir::Unsafety;
 use rustc::hir::def_id::{DefId, LOCAL_CRATE};
 use rustc::session::config::Sanitizer;
@@ -125,6 +126,21 @@ pub fn from_fn_attrs(cx: &CodegenCx, llfn: ValueRef, id: DefId) {
     }
 
     let target_features = cx.tcx.target_features_enabled(id);
+    //let trans_fn_attrs = ccx.tcx().trans_fn_attrs(id);
+
+    //if trans_fn_attrs.flags.contains(TransFnAttrFlags::COLD) {
+    //    Attribute::Cold.apply_llfn(Function, llfn);
+    //} else if trans_fn_attrs.flags.contains(TransFnAttrFlags::NAKED) {
+    //    naked(llfn, true);
+    //} else if trans_fn_attrs.flags.contains(TransFnAttrFlags::ALLOCATOR) {
+    //    Attribute::NoAlias.apply_llfn(
+    //        llvm::AttributePlace::ReturnValue, llfn);
+    //} else if trans_fn_attrs.flags.contains(TransFnAttrFlags::UNWIND) {
+    //    unwind(llfn, true);
+    //} else if trans_fn_attrs.flags.contains(TransFnAttrFlags::RUSTC_ALLOCATOR_NOUNWIND) {
+    //    unwind(llfn, false);
+    //}
+
     if !target_features.is_empty() {
         let val = CString::new(target_features.join(",")).unwrap();
         llvm::AddFunctionAttrStringValue(

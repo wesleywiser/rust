@@ -556,6 +556,7 @@ define_dep_nodes!( <'tcx>
     [] IsExportedSymbol(DefId),
     [] IsMirAvailable(DefId),
     [] ItemAttrs(DefId),
+    [] TransFnAttrs(DefId),
     [] FnArgNames(DefId),
     [] DylibDepFormats(CrateNum),
     [] IsPanicRuntime(CrateNum),

@@ -152,6 +152,7 @@ provide! { <'tcx> tcx, def_id, other, cdata,
         cdata.get_deprecation(def_id.index).map(DeprecationEntry::external)
     }
     item_attrs => { cdata.get_item_attrs(def_id.index, tcx.sess) }
+    trans_fn_attrs => { cdata.trans_fn_attrs(def_id, tcx) }
     // FIXME(#38501) We've skipped a `read` on the `HirBody` of
     // a `fn` when encoding, so the dep-tracking wouldn't work.
     // This is only used by rustdoc anyway, which shouldn't have
