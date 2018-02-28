@@ -18,6 +18,7 @@
 #![feature(proc_macro_internals)]
 #![feature(proc_macro_quote)]
 #![feature(quote)]
+#![feature(range_contains)]
 #![feature(rustc_diagnostic_macros)]
 #![feature(slice_sort_by_cached_key)]
 #![feature(crate_visibility_modifier)]

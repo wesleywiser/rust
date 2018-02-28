@@ -32,8 +32,10 @@ use rustc::ty::codec::TyDecoder;
 use rustc::mir::Mir;
 use rustc::util::captures::Captures;
 
+use std::cell::Ref;
 use std::io;
 use std::mem;
+use std::ops::RangeInclusive;
 use std::u32;
 
 use rustc_serialize::{Decodable, Decoder, SpecializedDecoder, opaque};
@@ -50,9 +52,6 @@ pub struct DecodeContext<'a, 'tcx: 'a> {
     cdata: Option<&'a CrateMetadata>,
     sess: Option<&'a Session>,
     tcx: Option<TyCtxt<'a, 'tcx, 'tcx>>,
-
-    // Cache the last used source_file for translating spans as an optimization.
-    last_source_file_index: usize,
 
     lazy_state: LazyState,
 
@@ -74,7 +73,6 @@ pub trait Metadata<'a, 'tcx>: Copy {
             cdata: self.cdata(),
             sess: self.sess().or(tcx.map(|tcx| tcx.sess)),
             tcx,
-            last_source_file_index: 0,
             lazy_state: LazyState::NoNode,
             alloc_decoding_session: self.cdata().map(|cdata| {
                 cdata.alloc_decoding_state.new_decoding_session()
@@ -297,17 +295,17 @@ impl<'a, 'tcx> SpecializedDecoder<interpret::AllocId> for DecodeContext<'a, 'tcx
 
 impl<'a, 'tcx> SpecializedDecoder<Span> for DecodeContext<'a, 'tcx> {
     fn specialized_decode(&mut self) -> Result<Span, Self::Error> {
-        let tag = u8::decode(self)?;
+        let cnum_tag = u32::decode(self)?;
 
-        if tag == TAG_INVALID_SPAN {
+        if cnum_tag == TAG_INVALID_SPAN_CNUM {
             return Ok(DUMMY_SP)
         }
 
-        debug_assert_eq!(tag, TAG_VALID_SPAN);
+        let original_cnum = CrateNum::from_u32(cnum_tag - TAG_VALID_SPAN_CNUM_START);
+        let cnum = self.map_encoded_cnum_to_current(original_cnum);
 
         let lo = BytePos::decode(self)?;
         let len = BytePos::decode(self)?;
-        let hi = lo + len;
 
         let sess = if let Some(sess) = self.sess {
             sess
@@ -315,47 +313,29 @@ impl<'a, 'tcx> SpecializedDecoder<Span> for DecodeContext<'a, 'tcx> {
             bug!("Cannot decode Span without Session.")
         };
 
-        let imported_source_files = self.cdata().imported_source_files(&sess.source_map());
-        let source_file = {
-            // Optimize for the case that most spans within a translated item
-            // originate from the same source_file.
-            let last_source_file = &imported_source_files[self.last_source_file_index];
-
-            if lo >= last_source_file.original_start_pos &&
-               lo <= last_source_file.original_end_pos {
-                last_source_file
-            } else {
-                let mut a = 0;
-                let mut b = imported_source_files.len();
-
-                while b - a > 1 {
-                    let m = (a + b) / 2;
-                    if imported_source_files[m].original_start_pos > lo {
-                        b = m;
-                    } else {
-                        a = m;
-                    }
-                }
-
-                self.last_source_file_index = a;
-                &imported_source_files[a]
-            }
+        let span_cdata_rc_any;
+        let span_cdata = if original_cnum == LOCAL_CRATE {
+            self.cdata()
+        } else {
+            // FIXME(eddyb) this requires the `tcx` which isn't always available.
+            // However, currently only MIR inlining can end up producing such
+            // cross-crate spans, and decoding MIR always provides a `tcx`.
+            span_cdata_rc_any = self.tcx().crate_data_as_rc_any(cnum);
+            span_cdata_rc_any.downcast_ref::<CrateMetadata>()
+                .expect("CrateStore crate data is not a CrateMetadata")
         };
 
-        // Make sure our binary search above is correct.
-        debug_assert!(lo >= source_file.original_start_pos &&
-                      lo <= source_file.original_end_pos);
+        let source_map =
+            span_cdata.imported_source_map_containing(&sess.source_map(), lo, |source_map| {
+                source_map.original_start_pos..=source_map.original_end_pos
+        });
 
         // Make sure we correctly filtered out invalid spans during encoding
-        debug_assert!(hi >= source_file.original_start_pos &&
-                      hi <= source_file.original_end_pos);
+        debug_assert!(lo + len >= source_map.original_start_pos &&
+                      lo + len <= source_map.original_end_pos);
 
-        let lo = (lo + source_file.translated_source_file.start_pos)
-                 - source_file.original_start_pos;
-        let hi = (hi + source_file.translated_source_file.start_pos)
-                 - source_file.original_start_pos;
-
-        Ok(Span::new(lo, hi, NO_EXPANSION))
+        let lo = (lo + source_map.translated_source_file.start_pos) - source_map.original_start_pos;
+        Ok(Span::new(lo, lo + len, NO_EXPANSION))
     }
 }
 
@@ -1267,5 +1247,42 @@ impl<'a, 'tcx> CrateMetadata {
 
         // This shouldn't borrow twice, but there is no way to downgrade RefMut to Ref.
         self.source_map_import_info.borrow()
+    }
+
+    pub fn imported_source_map_containing<F>(&'a self,
+                                             local_source_map: &source_map::SourceMap,
+                                             pos: BytePos,
+                                             range_of: F)
+                                             -> Ref<'a, cstore::ImportedSourceFile>
+        where F: Fn(&cstore::ImportedSourceFile) -> RangeInclusive<BytePos>
+    {
+        Ref::map(self.imported_source_files(local_source_map), |imported_source_maps| {
+            // Optimize for the case that most spans within a translated item
+            // originate from the same source_map.
+            let last_source_map = &imported_source_maps[self.last_source_map_index.get()];
+            if range_of(last_source_map).contains(&pos)  {
+                last_source_map
+            } else {
+                let mut a = 0;
+                let mut b = imported_source_maps.len();
+
+                while b - a > 1 {
+                    let m = (a + b) / 2;
+                    if range_of(&imported_source_maps[m]).start() > &pos {
+                        b = m;
+                    } else {
+                        a = m;
+                    }
+                }
+
+                self.last_source_map_index.set(a);
+                let filemap = &imported_source_maps[a];
+
+                // Make sure our binary search above is correct.
+                debug_assert!(range_of(filemap).contains(&pos));
+
+                filemap
+            }
+        })
     }
 }

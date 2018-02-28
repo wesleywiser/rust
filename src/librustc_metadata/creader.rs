@@ -30,6 +30,7 @@ use rustc::util::common::record_time;
 use rustc::util::nodemap::FxHashSet;
 use rustc::hir::map::Definitions;
 
+use std::cell::Cell;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::{cmp, fs};
@@ -264,6 +265,7 @@ impl<'a> CrateLoader<'a> {
             cnum,
             dependencies: Lock::new(dependencies),
             source_map_import_info: RwLock::new(vec![]),
+            last_source_map_index: Cell::new(0),
             alloc_decoding_state: AllocDecodingState::new(interpret_alloc_index),
             dep_kind: Lock::new(dep_kind),
             source: cstore::CrateSource {

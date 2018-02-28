@@ -8,6 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use cstore::CrateMetadata;
 use index::Index;
 use index_builder::{FromId, IndexBuilder, Untracked};
 use isolated_encoder::IsolatedEncoder;
@@ -149,7 +150,7 @@ impl<'a, 'tcx> SpecializedEncoder<DefIndex> for EncodeContext<'a, 'tcx> {
 impl<'a, 'tcx> SpecializedEncoder<Span> for EncodeContext<'a, 'tcx> {
     fn specialized_encode(&mut self, span: &Span) -> Result<(), Self::Error> {
         if span.is_dummy() {
-            return TAG_INVALID_SPAN.encode(self)
+            return TAG_INVALID_SPAN_CNUM.encode(self)
         }
 
         let span = span.data();
@@ -166,11 +167,31 @@ impl<'a, 'tcx> SpecializedEncoder<Span> for EncodeContext<'a, 'tcx> {
         if !self.source_file_cache.contains(span.hi) {
             // Unfortunately, macro expansion still sometimes generates Spans
             // that malformed in this way.
-            return TAG_INVALID_SPAN.encode(self)
+            return TAG_INVALID_SPAN_CNUM.encode(self)
         }
 
-        TAG_VALID_SPAN.encode(self)?;
-        span.lo.encode(self)?;
+        let cnum = CrateNum::from_u32(self.source_file_cache.crate_of_origin);
+        let cnum_tag = TAG_VALID_SPAN_CNUM_START + cnum.as_u32();
+        cnum_tag.encode(self)?;
+        let original_lo = if cnum == LOCAL_CRATE {
+            span.lo
+        } else {
+            // Imported spans were adjusted when they were decoded, so
+            // they have to be translated back into their crate of origin.
+            let codemap = self.tcx.sess.source_map();
+            let span_cdata_rc_any = self.tcx.crate_data_as_rc_any(cnum);
+            let span_cdata = span_cdata_rc_any.downcast_ref::<CrateMetadata>()
+                .expect("CrateStore crate data is not a CrateMetadata");
+            // FIXME(eddyb) It'd be easier to just put `original_{start,end}_pos`
+            // in `syntax_pos::SourceMap` instead of `ImportedSourceMap`.
+            let source_map =
+                span_cdata.imported_source_map_containing(&codemap, span.lo, |source_map| {
+                    let translated = &source_map.translated_source_file;
+                    translated.start_pos..=translated.end_pos
+                });
+            (span.lo + source_map.original_start_pos) - source_map.translated_source_file.start_pos
+        };
+        original_lo.encode(self)?;
 
         // Encode length which is usually less than span.hi and profits more
         // from the variable-length integer encoding that we use.

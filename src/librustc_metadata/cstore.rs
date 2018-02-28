@@ -25,6 +25,8 @@ use syntax::ext::base::SyntaxExtension;
 use syntax::symbol::Symbol;
 use syntax_pos;
 
+use std::cell::Cell;
+
 pub use rustc::middle::cstore::{NativeLibrary, NativeLibraryKind, LinkagePreference};
 pub use rustc::middle::cstore::NativeLibraryKind::*;
 pub use rustc::middle::cstore::{CrateSource, LibSource, ForeignModule};
@@ -70,6 +72,8 @@ pub struct CrateMetadata {
     pub cnum: CrateNum,
     pub dependencies: Lock<Vec<CrateNum>>,
     pub source_map_import_info: RwLock<Vec<ImportedSourceFile>>,
+    // Cache the last used source map for translating spans as an optimization.
+    pub last_source_map_index: Cell<usize>,
 
     /// Used for decoding interpret::AllocIds in a cached & thread-safe manner.
     pub alloc_decoding_state: AllocDecodingState,
