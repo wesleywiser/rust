@@ -274,7 +274,8 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         let mut result = Self {
             definitions,
             elements: elements.clone(),
-            liveness_constraints: RegionValues::new(elements, num_region_variables),
+            liveness_constraints:
+                RegionValues::new(elements, num_region_variables, TrackCauses(false)),
             inferred_values: None,
             dependency_map: None,
             constraints: IndexVec::new(),
