@@ -35,6 +35,9 @@ impl<'a> StringReader<'a> {
             let tree = match self.parse_token_tree() {
                 Ok(tree) => tree,
                 Err(mut e) => {
+                    let fmb = self.filemap.clone();
+                    self.sess.codemap().finish_building_filemap(fmb);
+
                     e.emit();
                     return TokenStream::concat(tts);
                 }
@@ -82,6 +85,10 @@ impl<'a> StringReader<'a> {
                     token::CloseDelim(other) => {
                         let token_str = token_to_string(&self.token);
                         let msg = format!("incorrect close delimiter: `{}`", token_str);
+
+                        let fmb = self.filemap.clone();
+                        self.sess.codemap().finish_building_filemap(fmb);
+
                         let mut err = self.sess.span_diagnostic.struct_span_err(self.span, &msg);
                         // This is a conservative error: only report the last unclosed delimiter.
                         // The previous unclosed delimiters could actually be closed! The parser

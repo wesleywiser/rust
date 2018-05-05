@@ -134,6 +134,9 @@ impl<'a> StringReader<'a> {
     }
 
     fn fail_unterminated_raw_string(&self, pos: BytePos, hash_count: u16) {
+        let fmb = self.filemap.clone();
+        self.sess.codemap().finish_building_filemap(fmb);
+
         let mut err = self.struct_span_fatal(pos, pos, "unterminated raw string");
         err.span_label(self.mk_sp(pos, pos), "unterminated raw string");
         if hash_count > 0 {
@@ -148,6 +151,9 @@ impl<'a> StringReader<'a> {
         self.fatal_span(self.peek_span, m)
     }
     pub fn emit_fatal_errors(&mut self) {
+        let fmb = self.filemap.clone();
+        self.sess.codemap().finish_building_filemap(fmb);
+
         for err in &mut self.fatal_errs {
             err.emit();
         }
@@ -159,6 +165,10 @@ impl<'a> StringReader<'a> {
             tok: self.peek_tok.clone(),
             sp: self.peek_span,
         }
+    }
+
+    pub fn take_filemap(self) -> syntax_pos::FileMapBuilder {
+        self.filemap
     }
 }
 
@@ -241,11 +251,17 @@ impl<'a> StringReader<'a> {
 
     /// Report a fatal lexical error with a given span.
     pub fn fatal_span(&self, sp: Span, m: &str) -> FatalError {
+        let fmb = self.filemap.clone();
+        self.sess.codemap().finish_building_filemap(fmb);
+
         self.sess.span_diagnostic.span_fatal(sp, m)
     }
 
     /// Report a lexical error with a given span.
     pub fn err_span(&self, sp: Span, m: &str) {
+        let fmb = self.filemap.clone();
+        self.sess.codemap().finish_building_filemap(fmb);
+
         self.sess.span_diagnostic.span_err(sp, m)
     }
 
@@ -520,6 +536,9 @@ impl<'a> StringReader<'a> {
 
         self.with_str_from(start, |string| {
             if string == "_" {
+                let fmb = self.filemap.clone();
+                self.sess.codemap().finish_building_filemap(fmb);
+
                 self.sess.span_diagnostic
                     .struct_span_warn(self.mk_sp(start, self.pos),
                                       "underscore literal suffix is not allowed")
@@ -937,6 +956,9 @@ impl<'a> StringReader<'a> {
                                 true
                             }
                             c => {
+                                let fmb = self.filemap.clone();
+                                self.sess.codemap().finish_building_filemap(fmb);
+
                                 let pos = self.pos;
                                 let mut err = self.struct_err_span_char(escaped_pos,
                                                                         pos,
@@ -1365,6 +1387,10 @@ impl<'a> StringReader<'a> {
                             let start = self.byte_offset(start).to_usize();
                             let end = self.byte_offset(self.pos).to_usize();
                             self.bump();
+
+                            let fmb = self.filemap.clone();
+                            self.sess.codemap().finish_building_filemap(fmb);
+
                             let span = self.mk_sp(start_with_quote, self.pos);
                             self.sess.span_diagnostic
                                 .struct_span_err(span,
