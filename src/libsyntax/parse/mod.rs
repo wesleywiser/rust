@@ -13,7 +13,7 @@
 use rustc_data_structures::sync::{Lrc, Lock};
 use ast::{self, CrateConfig};
 use codemap::{CodeMap, FilePathMapping};
-use syntax_pos::{self, Span, FileMap, NO_EXPANSION, FileName};
+use syntax_pos::{self, Span, FileMapBuilder, NO_EXPANSION, FileName};
 use errors::{Handler, ColorConfig, DiagnosticBuilder};
 use feature_gate::UnstableFeatures;
 use parse::parser::Parser;
@@ -189,7 +189,7 @@ pub fn new_sub_parser_from_file<'a>(sess: &'a ParseSess,
 }
 
 /// Given a filemap and config, return a parser
-pub fn filemap_to_parser(sess: & ParseSess, filemap: Lrc<FileMap>) -> Parser {
+pub fn filemap_to_parser(sess: & ParseSess, filemap: FileMapBuilder) -> Parser {
     let end_pos = filemap.end_pos;
     let mut parser = stream_to_parser(sess, filemap_to_stream(sess, filemap, None));
 
@@ -212,7 +212,7 @@ pub fn new_parser_from_tts(sess: &ParseSess, tts: Vec<TokenTree>) -> Parser {
 /// Given a session and a path and an optional span (for error reporting),
 /// add the path to the session's codemap and return the new filemap.
 fn file_to_filemap(sess: &ParseSess, path: &Path, spanopt: Option<Span>)
-                   -> Lrc<FileMap> {
+                   -> FileMapBuilder {
     match sess.codemap().load_file(path) {
         Ok(filemap) => filemap,
         Err(e) => {

@@ -184,7 +184,7 @@ impl CodeMap {
         self.file_loader.file_exists(path)
     }
 
-    pub fn load_file(&self, path: &Path) -> io::Result<Lrc<FileMap>> {
+    pub fn load_file(&self, path: &Path) -> io::Result<FileMapBuilder> {
         let src = self.file_loader.read_file(path)?;
         let filename = if let Some((ref name, _)) = self.doctest_offset {
             name.clone()
@@ -214,7 +214,7 @@ impl CodeMap {
     /// Creates a new filemap without setting its line information. If you don't
     /// intend to set the line information yourself, you should use new_filemap_and_lines.
     /// This does not ensure that only one FileMap exists per file name.
-    pub fn new_filemap(&self, filename: FileName, src: String) -> Lrc<FileMap> {
+    pub fn new_filemap(&self, filename: FileName, src: String) -> FileMapBuilder {
         let start_pos = self.next_start_pos();
 
         // The path is used to determine the directory for loading submodules and
@@ -231,37 +231,52 @@ impl CodeMap {
             },
             other => (other, false),
         };
-        let filemap = Lrc::new(FileMap::new(
+        let mut filemap_builder = FileMapBuilder::new(
             filename,
             was_remapped,
             unmapped_path,
             src,
             Pos::from_usize(start_pos),
-        ));
+        );
+
+        let copy = filemap_builder.clone().build();
 
         let mut files = self.files.borrow_mut();
 
-        files.file_maps.push(filemap.clone());
-        files.stable_id_to_filemap.insert(StableFilemapId::new(&filemap), filemap.clone());
+        files.file_maps.push(Lrc::new(copy));
+        filemap_builder.codemap_file_idx = Some(files.file_maps.len() - 1);
 
-        filemap
+        filemap_builder
+    }
+
+    pub fn finish_building_filemap(&self, builder: FileMapBuilder) -> Lrc<FileMap> {
+        let idx = builder.codemap_file_idx.expect("codemap_file_idx was None");
+
+        let fm = Lrc::new(builder.build());
+
+        let mut files = self.files.borrow_mut();
+
+        files.file_maps[idx] = fm.clone();
+        files.stable_id_to_filemap.insert(StableFilemapId::new(&fm), fm.clone());
+
+        fm
     }
 
     /// Creates a new filemap and sets its line information.
     /// This does not ensure that only one FileMap exists per file name.
     pub fn new_filemap_and_lines(&self, filename: &Path, src: &str) -> Lrc<FileMap> {
-        let fm = self.new_filemap(filename.to_owned().into(), src.to_owned());
-        let mut byte_pos: u32 = fm.start_pos.0;
+        let mut fmb = self.new_filemap(filename.to_owned().into(), src.to_owned());
+        let mut byte_pos: u32 = fmb.start_pos.0;
         for line in src.lines() {
             // register the start of this line
-            fm.next_line(BytePos(byte_pos));
+            fmb.next_line(BytePos(byte_pos));
 
             // update byte_pos to include this line and the \n at the end
             byte_pos += line.len() as u32 + 1;
         }
-        fm
-    }
 
+        self.finish_building_filemap(fmb)
+    }
 
     /// Allocates a new FileMap representing a source file from an external
     /// crate. The source code of such an "imported filemap" is not available,
@@ -305,9 +320,9 @@ impl CodeMap {
             external_src: Lock::new(ExternalSource::AbsentOk),
             start_pos,
             end_pos,
-            lines: Lock::new(file_local_lines),
-            multibyte_chars: Lock::new(file_local_multibyte_chars),
-            non_narrow_chars: Lock::new(file_local_non_narrow_chars),
+            lines: file_local_lines,
+            multibyte_chars: file_local_multibyte_chars,
+            non_narrow_chars: file_local_non_narrow_chars,
             name_hash,
         });
 
@@ -345,21 +360,20 @@ impl CodeMap {
         match self.lookup_line(pos) {
             Ok(FileMapAndLine { fm: f, line: a }) => {
                 let line = a + 1; // Line numbers start at 1
-                let linebpos = (*f.lines.borrow())[a];
+                let linebpos = f.lines[a];
                 let linechpos = self.bytepos_to_file_charpos(linebpos);
                 let col = chpos - linechpos;
 
                 let col_display = {
-                    let non_narrow_chars = f.non_narrow_chars.borrow();
-                    let start_width_idx = non_narrow_chars
+                    let start_width_idx = f.non_narrow_chars
                         .binary_search_by_key(&linebpos, |x| x.pos())
                         .unwrap_or_else(|x| x);
-                    let end_width_idx = non_narrow_chars
+                    let end_width_idx = f.non_narrow_chars
                         .binary_search_by_key(&pos, |x| x.pos())
                         .unwrap_or_else(|x| x);
                     let special_chars = end_width_idx - start_width_idx;
                     let non_narrow: usize =
-                        non_narrow_chars[start_width_idx..end_width_idx]
+                        f.non_narrow_chars[start_width_idx..end_width_idx]
                         .into_iter()
                         .map(|x| x.width())
                         .sum();
@@ -380,12 +394,11 @@ impl CodeMap {
             }
             Err(f) => {
                 let col_display = {
-                    let non_narrow_chars = f.non_narrow_chars.borrow();
-                    let end_width_idx = non_narrow_chars
+                    let end_width_idx = f.non_narrow_chars
                         .binary_search_by_key(&pos, |x| x.pos())
                         .unwrap_or_else(|x| x);
                     let non_narrow: usize =
-                        non_narrow_chars[0..end_width_idx]
+                        f.non_narrow_chars[0..end_width_idx]
                         .into_iter()
                         .map(|x| x.width())
                         .sum();
@@ -830,7 +843,7 @@ impl CodeMap {
         // The number of extra bytes due to multibyte chars in the FileMap
         let mut total_extra_bytes = 0;
 
-        for mbc in map.multibyte_chars.borrow().iter() {
+        for mbc in map.multibyte_chars.iter() {
             debug!("{}-byte char at {:?}", mbc.bytes, mbc.pos);
             if mbc.pos < bpos {
                 // every character is at least one byte, so we only

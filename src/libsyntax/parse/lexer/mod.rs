@@ -48,7 +48,7 @@ pub struct StringReader<'a> {
     pub col: CharPos,
     /// The current character (which has been read from self.pos)
     pub ch: Option<char>,
-    pub filemap: Lrc<syntax_pos::FileMap>,
+    pub filemap: syntax_pos::FileMapBuilder,
     /// If Some, stop reading the source at this position (inclusive).
     pub terminator: Option<BytePos>,
     /// Whether to record new-lines and multibyte chars in filemap.
@@ -164,13 +164,13 @@ impl<'a> StringReader<'a> {
 
 impl<'a> StringReader<'a> {
     /// For comments.rs, which hackily pokes into next_pos and ch
-    pub fn new_raw(sess: &'a ParseSess, filemap: Lrc<syntax_pos::FileMap>) -> Self {
+    pub fn new_raw(sess: &'a ParseSess, filemap: syntax_pos::FileMapBuilder) -> Self {
         let mut sr = StringReader::new_raw_internal(sess, filemap);
         sr.bump();
         sr
     }
 
-    fn new_raw_internal(sess: &'a ParseSess, filemap: Lrc<syntax_pos::FileMap>) -> Self {
+    fn new_raw_internal(sess: &'a ParseSess, filemap: syntax_pos::FileMapBuilder) -> Self {
         if filemap.src.is_none() {
             sess.span_diagnostic.bug(&format!("Cannot lex filemap without source: {}",
                                               filemap.name));
@@ -199,7 +199,7 @@ impl<'a> StringReader<'a> {
         }
     }
 
-    pub fn new(sess: &'a ParseSess, filemap: Lrc<syntax_pos::FileMap>) -> Self {
+    pub fn new(sess: &'a ParseSess, filemap: syntax_pos::FileMapBuilder) -> Self {
         let mut sr = StringReader::new_raw(sess, filemap);
         if sr.advance_token().is_err() {
             sr.emit_fatal_errors();
@@ -217,7 +217,9 @@ impl<'a> StringReader<'a> {
             span = span.shrink_to_lo();
         }
 
-        let mut sr = StringReader::new_raw_internal(sess, begin.fm);
+        let fmb = (*begin.fm).clone().into_builder();
+
+        let mut sr = StringReader::new_raw_internal(sess, fmb);
 
         // Seek the lexer to the right byte range.
         sr.save_new_lines_and_multibyte = false;
@@ -611,7 +613,8 @@ impl<'a> StringReader<'a> {
                 // I guess this is the only way to figure out if
                 // we're at the beginning of the file...
                 let cmap = CodeMap::new(FilePathMapping::empty());
-                cmap.files.borrow_mut().file_maps.push(self.filemap.clone());
+                let fm = self.filemap.clone().build();
+                cmap.files.borrow_mut().file_maps.push(Lrc::new(fm));
                 let loc = cmap.lookup_char_pos_adj(self.pos);
                 debug!("Skipping a shebang");
                 if loc.line == 1 && loc.col == CharPos(0) {
