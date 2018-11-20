@@ -247,7 +247,7 @@ impl<'a, 'mir, 'tcx: 'mir, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tc
         );
         ty::Instance::resolve(
             *self.tcx,
-            self.param_env,
+            self.param_env.with_reveal_all(),
             def_id,
             substs,
         ).ok_or_else(|| EvalErrorKind::TooGeneric.into())
