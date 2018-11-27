@@ -56,6 +56,8 @@ impl MirPass for ConstProp {
             _ => false,
         };
 
+        debug!("is_fn_like={:?}, is_assoc_const={:?}", is_fn_like, is_assoc_const);
+
         // Only run const prop on functions, methods, closures and associated constants
         if !is_fn_like && !is_assoc_const  {
             // skip anon_const/statics/consts because they'll be evaluated by miri anyway
@@ -332,6 +334,7 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
         place_layout: TyLayout<'tcx>,
         source_info: SourceInfo,
     ) -> Option<Const<'tcx>> {
+        debug!("const_prop(rvalue={:?}", rvalue);
         let span = source_info.span;
         match *rvalue {
             Rvalue::Use(ref op) => {

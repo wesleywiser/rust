@@ -1263,6 +1263,7 @@ pub fn provide(providers: &mut Providers) {
 fn mir_const_qualif<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                               def_id: DefId)
                               -> (u8, Lrc<BitSet<Local>>) {
+    debug!("mir_const_qualif(def_id={:?})", def_id);
     // N.B., this `borrow()` is guaranteed to be valid (i.e., the value
     // cannot yet be stolen), because `mir_validated()`, which steals
     // from `mir_const(), forces this query to execute before
@@ -1270,6 +1271,7 @@ fn mir_const_qualif<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     let mir = &tcx.mir_const(def_id).borrow();
 
     if mir.return_ty().references_error() {
+        debug!("mir_const_qualif: references_error true");
         tcx.sess.delay_span_bug(mir.span, "mir_const_qualif: Mir had errors");
         return (Qualif::NOT_CONST.bits(), Lrc::new(BitSet::new_empty(0)));
     }

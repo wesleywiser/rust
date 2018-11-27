@@ -97,6 +97,7 @@ pub(crate) fn eval_promoted<'a, 'mir, 'tcx>(
     param_env: ty::ParamEnv<'tcx>,
 ) -> EvalResult<'tcx, MPlaceTy<'tcx>> {
     let mut ecx = mk_borrowck_eval_cx(tcx, cid.instance, mir, DUMMY_SP).unwrap();
+    debug!("eval_promoted(cid={:?}, param_env={:?})", cid, param_env);
     eval_body_using_ecx(&mut ecx, cid, Some(mir), param_env)
 }
 
@@ -165,6 +166,7 @@ fn eval_body_and_ecx<'a, 'mir, 'tcx>(
     let span = tcx.def_span(cid.instance.def_id());
     let span = mir.map(|mir| mir.span).unwrap_or(span);
     let mut ecx = EvalContext::new(tcx.at(span), param_env, CompileTimeInterpreter::new());
+    debug!("eval_body_and_ecx(cid={:?}, param_env={:?})", cid, param_env);
     let r = eval_body_using_ecx(&mut ecx, cid, mir, param_env);
     (r, ecx)
 }
@@ -641,13 +643,17 @@ pub fn const_eval_raw_provider<'a, 'tcx>(
     // associated constants of generic functions will fail due to not enough monomorphization
     // information being available.
 
+    debug!("const_eval_raw_provider(key={:?})", key);
+
     // In case we fail in the `UserFacing` variant, we just do the real computation.
     if key.param_env.reveal == Reveal::All {
+        debug!("const_eval_raw_provider: Reveal::All = true");
         let mut key = key.clone();
         key.param_env.reveal = Reveal::UserFacing;
+        debug!("const_eval_raw_provider: Reveal reset to UserFacing");
         match tcx.const_eval_raw(key) {
             // try again with reveal all as requested
-            Err(ErrorHandled::TooGeneric) => {},
+            Err(ErrorHandled::TooGeneric) => {debug!("const_eval_raw_provider: Err - TooGeneric");},
             // dedupliate calls
             other => return other,
         }
@@ -658,21 +664,24 @@ pub fn const_eval_raw_provider<'a, 'tcx>(
     // or MIR.
     // https://rust-lang.zulipchat.com/#narrow/stream/146212-t-compiler.2Fconst-eval/
     // subject/anon_const_instance_printing/near/135980032
-    trace!("const eval: {}", key.value.instance);
-    trace!("const eval: {:?}", key);
+    //trace!("const eval: {}", key.value.instance);
+    //trace!("const eval: {:?}", key);
 
     let cid = key.value;
     let def_id = cid.instance.def.def_id();
 
     if let Some(id) = tcx.hir().as_local_node_id(def_id) {
+        debug!("const_eval_raw_provider: is local node");
         let tables = tcx.typeck_tables_of(def_id);
 
         // Do match-check before building MIR
         if let Err(ErrorReported) = tcx.check_match(def_id) {
+            debug!("const_eval_raw_provider: check_match returns error");
             return Err(ErrorHandled::Reported)
         }
 
         if let hir::BodyOwnerKind::Const = tcx.hir().body_owner_kind(id) {
+            debug!("const_eval_raw_provider: is BodyOwnerKind::Const");
             tcx.mir_const_qualif(def_id);
         }
 
@@ -681,6 +690,8 @@ pub fn const_eval_raw_provider<'a, 'tcx>(
             return Err(ErrorHandled::Reported)
         }
     };
+
+    debug!("const_eval_raw_provider: hit 2");
 
     let (res, ecx) = eval_body_and_ecx(tcx, cid, None, key.param_env);
     res.and_then(|place| {
