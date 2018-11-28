@@ -348,11 +348,6 @@ impl SourceMap {
                         .sum();
                     col.0 - special_chars + non_narrow
                 };
-                debug!("byte pos {:?} is on the line at byte pos {:?}",
-                       pos, linebpos);
-                debug!("char pos {:?} is on the line at char pos {:?}",
-                       chpos, linechpos);
-                debug!("byte is on line: {}", line);
                 assert!(chpos >= linechpos);
                 Loc {
                     file: f,
@@ -472,16 +467,12 @@ impl SourceMap {
     }
 
     pub fn span_to_lines(&self, sp: Span) -> FileLinesResult {
-        debug!("span_to_lines(sp={:?})", sp);
-
         if sp.lo() > sp.hi() {
             return Err(SpanLinesError::IllFormedSpan(sp));
         }
 
         let lo = self.lookup_char_pos(sp.lo());
-        debug!("span_to_lines: lo={:?}", lo);
         let hi = self.lookup_char_pos(sp.hi());
-        debug!("span_to_lines: hi={:?}", hi);
 
         if lo.file.start_pos != hi.file.start_pos {
             return Err(SpanLinesError::DistinctSources(DistinctSources {
@@ -736,33 +727,25 @@ impl SourceMap {
     fn find_width_of_character_at_span(&self, sp: Span, forwards: bool) -> u32 {
         // Disregard malformed spans and assume a one-byte wide character.
         if sp.lo() >= sp.hi() {
-            debug!("find_width_of_character_at_span: early return malformed span");
             return 1;
         }
 
         let local_begin = self.lookup_byte_offset(sp.lo());
         let local_end = self.lookup_byte_offset(sp.hi());
-        debug!("find_width_of_character_at_span: local_begin=`{:?}`, local_end=`{:?}`",
-               local_begin, local_end);
 
         let start_index = local_begin.pos.to_usize();
         let end_index = local_end.pos.to_usize();
-        debug!("find_width_of_character_at_span: start_index=`{:?}`, end_index=`{:?}`",
-               start_index, end_index);
 
         // Disregard indexes that are at the start or end of their spans, they can't fit bigger
         // characters.
         if (!forwards && end_index == usize::min_value()) ||
             (forwards && start_index == usize::max_value()) {
-            debug!("find_width_of_character_at_span: start or end of span, cannot be multibyte");
             return 1;
         }
 
         let source_len = (local_begin.sf.end_pos - local_begin.sf.start_pos).to_usize();
-        debug!("find_width_of_character_at_span: source_len=`{:?}`", source_len);
         // Ensure indexes are also not malformed.
         if start_index > end_index || end_index > source_len {
-            debug!("find_width_of_character_at_span: source indexes are malformed");
             return 1;
         }
 
@@ -779,10 +762,8 @@ impl SourceMap {
         } else {
             return 1;
         };
-        debug!("find_width_of_character_at_span: snippet=`{:?}`", snippet);
 
         let mut target = if forwards { end_index + 1 } else { end_index - 1 };
-        debug!("find_width_of_character_at_span: initial target=`{:?}`", target);
 
         while !snippet.is_char_boundary(target - start_index) && target < source_len {
             target = if forwards {
@@ -795,9 +776,7 @@ impl SourceMap {
                     }
                 }
             };
-            debug!("find_width_of_character_at_span: target=`{:?}`", target);
         }
-        debug!("find_width_of_character_at_span: final target=`{:?}`", target);
 
         if forwards {
             (target - end_index) as u32
@@ -832,7 +811,6 @@ impl SourceMap {
         let mut total_extra_bytes = 0;
 
         for mbc in map.multibyte_chars.iter() {
-            debug!("{}-byte char at {:?}", mbc.bytes, mbc.pos);
             if mbc.pos < bpos {
                 // every character is at least one byte, so we only
                 // count the actual extra bytes.

@@ -439,7 +439,6 @@ crate fn proc_macro_def_path_table(crate_root: &CrateRoot,
 
     let name = crate_root.name.as_str();
     let disambiguator = crate_root.disambiguator;
-    debug!("creating proc macro def path table for {:?}/{:?}", name, disambiguator);
     let crate_root = definitions.create_root_def(&name, disambiguator);
     for (index, (name, _)) in proc_macros.iter().enumerate() {
         let def_index = definitions.create_def_with_parent(
@@ -449,7 +448,6 @@ crate fn proc_macro_def_path_table(crate_root: &CrateRoot,
             DefIndexAddressSpace::High,
             Mark::root(),
             DUMMY_SP);
-        debug!("definition for {:?} is {:?}", name, def_index);
         assert_eq!(def_index, DefIndex::from_proc_macro_index(index));
     }
 
@@ -1135,7 +1133,6 @@ impl<'a, 'tcx> CrateMetadata {
 
     // Returns the path leading to the thing with this `id`.
     pub fn def_path(&self, id: DefIndex) -> DefPath {
-        debug!("def_path(cnum={:?}, id={:?})", self.cnum, id);
         DefPath::make(self.cnum, id, |parent| self.def_path_table.def_key(parent))
     }
 
@@ -1229,11 +1226,6 @@ impl<'a, 'tcx> CrateMetadata {
                                                                    lines,
                                                                    multibyte_chars,
                                                                    non_narrow_chars);
-            debug!("CrateMetaData::imported_source_files alloc \
-                    source_file {:?} original (start_pos {:?} end_pos {:?}) \
-                    translated (start_pos {:?} end_pos {:?})",
-                   local_version.name, start_pos, end_pos,
-                   local_version.start_pos, local_version.end_pos);
 
             cstore::ImportedSourceFile {
                 original_start_pos: start_pos,

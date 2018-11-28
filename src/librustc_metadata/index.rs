@@ -75,10 +75,6 @@ impl<'tcx> LazySeq<Index> {
     pub fn lookup(&self, bytes: &[u8], def_index: DefIndex) -> Option<Lazy<Entry<'tcx>>> {
         let words = &bytes_to_words(&bytes[self.position..])[..self.len];
 
-        debug!("Index::lookup: index={:?} words.len={:?}",
-               def_index,
-               words.len());
-
         let positions = match def_index.address_space() {
             DefIndexAddressSpace::Low => &words[1..],
             DefIndexAddressSpace::High => {
@@ -92,10 +88,8 @@ impl<'tcx> LazySeq<Index> {
         let array_index = def_index.as_array_index();
         let position = u32::from_le(positions[array_index].get());
         if position == u32::MAX {
-            debug!("Index::lookup: position=u32::MAX");
             None
         } else {
-            debug!("Index::lookup: position={:?}", position);
             Some(Lazy::with_position(position as usize))
         }
     }

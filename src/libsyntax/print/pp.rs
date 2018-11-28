@@ -213,24 +213,6 @@ impl fmt::Display for Token {
     }
 }
 
-fn buf_str(buf: &[BufEntry], left: usize, right: usize, lim: usize) -> String {
-    let n = buf.len();
-    let mut i = left;
-    let mut l = lim;
-    let mut s = String::from("[");
-    while i != right && l != 0 {
-        l -= 1;
-        if i != left {
-            s.push_str(", ");
-        }
-        s.push_str(&format!("{}={}", buf[i].size, &buf[i].token));
-        i += 1;
-        i %= n;
-    }
-    s.push(']');
-    s
-}
-
 #[derive(Copy, Clone)]
 pub enum PrintStackBreak {
     Fits,
@@ -248,7 +230,6 @@ const SIZE_INFINITY: isize = 0xffff;
 pub fn mk_printer<'a>(out: Box<dyn io::Write+'a>, linewidth: usize) -> Printer<'a> {
     // Yes 55, it makes the ring buffers big enough to never fall behind.
     let n: usize = 55 * linewidth;
-    debug!("mk_printer {}", linewidth);
     Printer {
         out,
         buf_max_len: n,
@@ -337,8 +318,6 @@ impl<'a> Printer<'a> {
         } else {
             self.advance_right();
         }
-        debug!("pp Begin({})/buffer Vec<{},{}>",
-               b.offset, self.left, self.right);
         self.buf[self.right] = BufEntry { token: Token::Begin(b), size: -self.right_total };
         let right = self.right;
         self.scan_push(right);
@@ -347,10 +326,8 @@ impl<'a> Printer<'a> {
 
     fn pretty_print_end(&mut self) -> io::Result<()> {
         if self.scan_stack.is_empty() {
-            debug!("pp End/print Vec<{},{}>", self.left, self.right);
             self.print_end()
         } else {
-            debug!("pp End/buffer Vec<{},{}>", self.left, self.right);
             self.advance_right();
             self.buf[self.right] = BufEntry { token: Token::End, size: -1 };
             let right = self.right;
@@ -368,8 +345,6 @@ impl<'a> Printer<'a> {
         } else {
             self.advance_right();
         }
-        debug!("pp Break({})/buffer Vec<{},{}>",
-               b.offset, self.left, self.right);
         self.check_stack(0);
         let right = self.right;
         self.scan_push(right);
@@ -380,12 +355,8 @@ impl<'a> Printer<'a> {
 
     fn pretty_print_string(&mut self, s: Cow<'static, str>, len: isize) -> io::Result<()> {
         if self.scan_stack.is_empty() {
-            debug!("pp String('{}')/print Vec<{},{}>",
-                   s, self.left, self.right);
             self.print_string(s, len)
         } else {
-            debug!("pp String('{}')/buffer Vec<{},{}>",
-                   s, self.left, self.right);
             self.advance_right();
             self.buf[self.right] = BufEntry { token: Token::String(s, len), size: len };
             self.right_total += len;
@@ -394,13 +365,8 @@ impl<'a> Printer<'a> {
     }
 
     pub fn check_stream(&mut self) -> io::Result<()> {
-        debug!("check_stream Vec<{}, {}> with left_total={}, right_total={}",
-               self.left, self.right, self.left_total, self.right_total);
         if self.right_total - self.left_total > self.space {
-            debug!("scan window is {}, longer than space on line ({})",
-                   self.right_total - self.left_total, self.space);
             if Some(&self.left) == self.scan_stack.back() {
-                debug!("setting {} to infinity and popping", self.left);
                 let scanned = self.scan_pop_bottom();
                 self.buf[scanned].size = SIZE_INFINITY;
             }
@@ -413,7 +379,6 @@ impl<'a> Printer<'a> {
     }
 
     pub fn scan_push(&mut self, x: usize) {
-        debug!("scan_push {}", x);
         self.scan_stack.push_front(x);
     }
 
@@ -440,9 +405,6 @@ impl<'a> Printer<'a> {
     }
 
     pub fn advance_left(&mut self) -> io::Result<()> {
-        debug!("advance_left Vec<{},{}>, sizeof({})={}", self.left, self.right,
-               self.left, self.buf[self.left].size);
-
         let mut left_size = self.buf[self.left].size;
 
         while left_size >= 0 {
@@ -503,7 +465,6 @@ impl<'a> Printer<'a> {
     }
 
     pub fn print_newline(&mut self, amount: isize) -> io::Result<()> {
-        debug!("NEWLINE {}", amount);
         let ret = write!(self.out, "\n");
         self.pending_indentation = 0;
         self.indent(amount);
@@ -511,7 +472,6 @@ impl<'a> Printer<'a> {
     }
 
     pub fn indent(&mut self, amount: isize) {
-        debug!("INDENT {}", amount);
         self.pending_indentation += amount;
     }
 
@@ -528,13 +488,11 @@ impl<'a> Printer<'a> {
     pub fn print_begin(&mut self, b: BeginToken, l: isize) -> io::Result<()> {
         if l > self.space {
             let col = self.margin - self.space + b.offset;
-            debug!("print Begin -> push broken block at col {}", col);
             self.print_stack.push(PrintStackElem {
                 offset: col,
                 pbreak: PrintStackBreak::Broken(b.breaks)
             });
         } else {
-            debug!("print Begin -> push fitting block");
             self.print_stack.push(PrintStackElem {
                 offset: 0,
                 pbreak: PrintStackBreak::Fits
@@ -544,7 +502,6 @@ impl<'a> Printer<'a> {
     }
 
     pub fn print_end(&mut self) -> io::Result<()> {
-        debug!("print End -> pop End");
         let print_stack = &mut self.print_stack;
         assert!(!print_stack.is_empty());
         print_stack.pop().unwrap();
@@ -555,28 +512,21 @@ impl<'a> Printer<'a> {
         let top = self.get_top();
         match top.pbreak {
             PrintStackBreak::Fits => {
-                debug!("print Break({}) in fitting block", b.blank_space);
                 self.space -= b.blank_space;
                 self.indent(b.blank_space);
                 Ok(())
             }
             PrintStackBreak::Broken(Breaks::Consistent) => {
-                debug!("print Break({}+{}) in consistent block",
-                       top.offset, b.offset);
                 let ret = self.print_newline(top.offset + b.offset);
                 self.space = self.margin - (top.offset + b.offset);
                 ret
             }
             PrintStackBreak::Broken(Breaks::Inconsistent) => {
                 if l > self.space {
-                    debug!("print Break({}+{}) w/ newline in inconsistent",
-                           top.offset, b.offset);
                     let ret = self.print_newline(top.offset + b.offset);
                     self.space = self.margin - (top.offset + b.offset);
                     ret
                 } else {
-                    debug!("print Break({}) w/o newline in inconsistent",
-                           b.blank_space);
                     self.indent(b.blank_space);
                     self.space -= b.blank_space;
                     Ok(())
@@ -586,7 +536,6 @@ impl<'a> Printer<'a> {
     }
 
     pub fn print_string(&mut self, s: Cow<'static, str>, len: isize) -> io::Result<()> {
-        debug!("print String({})", s);
         // assert!(len <= space);
         self.space -= len;
         while self.pending_indentation > 0 {
@@ -597,12 +546,6 @@ impl<'a> Printer<'a> {
     }
 
     pub fn print(&mut self, token: Token, l: isize) -> io::Result<()> {
-        debug!("print {} {} (remaining line space={})", token, l,
-               self.space);
-        debug!("{}", buf_str(&self.buf,
-                             self.left,
-                             self.right,
-                             6));
         match token {
             Token::Begin(b) => self.print_begin(b, l),
             Token::End => self.print_end(),

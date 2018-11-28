@@ -65,7 +65,6 @@ impl DefPathTable {
         let index = {
             let index_to_key = &mut self.index_to_key[address_space.index()];
             let index = DefIndex::from_array_index(index_to_key.len(), address_space);
-            debug!("DefPathTable::insert() - {:?} <-> {:?}", key, index);
             index_to_key.push(key);
             index
         };
@@ -89,7 +88,6 @@ impl DefPathTable {
     pub fn def_path_hash(&self, index: DefIndex) -> DefPathHash {
         let ret = self.def_path_hashes[index.address_space().index()]
                                       [index.as_array_index()];
-        debug!("def_path_hash({:?}) = {:?}", index, ret);
         return ret
     }
 
@@ -251,10 +249,8 @@ impl DefPath {
         let mut data = vec![];
         let mut index = Some(start_index);
         loop {
-            debug!("DefPath::make: krate={:?} index={:?}", krate, index);
             let p = index.unwrap();
             let key = get_key(p);
-            debug!("DefPath::make: key={:?}", key);
             match key.disambiguated_data.data {
                 DefPathData::CrateRoot => {
                     assert!(key.parent.is_none());
@@ -539,9 +535,6 @@ impl Definitions {
                                   expansion: Mark,
                                   span: Span)
                                   -> DefIndex {
-        debug!("create_def_with_parent(parent={:?}, node_id={:?}, data={:?})",
-               parent, node_id, data);
-
         assert!(!self.node_to_def_index.contains_key(&node_id),
                 "adding a def'n for node-id {:?} and data {:?} but a previous def'n exists: {:?}",
                 node_id,
@@ -569,8 +562,6 @@ impl Definitions {
         let parent_hash = self.table.def_path_hash(parent);
         let def_path_hash = key.compute_stable_hash(parent_hash);
 
-        debug!("create_def_with_parent: after disambiguation, key = {:?}", key);
-
         // Create the definition.
         let index = self.table.allocate(key, def_path_hash, address_space);
         assert_eq!(index.as_array_index(),
@@ -581,7 +572,6 @@ impl Definitions {
         // anything in the AST, so they don't have a NodeId. For these cases
         // we don't need a mapping from NodeId to DefIndex.
         if node_id != ast::DUMMY_NODE_ID {
-            debug!("create_def_with_parent: def_index_to_node[{:?} <-> {:?}", index, node_id);
             self.node_to_def_index.insert(node_id, index);
         }
 
