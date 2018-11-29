@@ -293,10 +293,6 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     pub fn push_item_path<T>(self, buffer: &mut T, def_id: DefId, pushed_prelude_crate: bool)
         where T: ItemPathBuffer + Debug
     {
-        debug!(
-            "push_item_path: buffer={:?} def_id={:?} pushed_prelude_crate={:?}",
-            buffer, def_id, pushed_prelude_crate
-        );
         match *buffer.root_mode() {
             RootMode::Local if !def_id.is_local() =>
                 if self.try_push_visible_item_path(buffer, def_id, pushed_prelude_crate) { return },
@@ -304,7 +300,6 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         }
 
         let key = self.def_key(def_id);
-        debug!("push_item_path: key={:?}", key);
         match key.disambiguated_data.data {
             DefPathData::CrateRoot => {
                 assert!(key.parent.is_none());
