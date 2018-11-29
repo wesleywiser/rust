@@ -857,13 +857,11 @@ struct HasTypeFlagsVisitor {
 
 impl<'tcx> TypeVisitor<'tcx> for HasTypeFlagsVisitor {
     fn visit_ty(&mut self, t: Ty<'_>) -> bool {
-        debug!("HasTypeFlagsVisitor: t={:?} t.flags={:?} self.flags={:?}", t, t.flags, self.flags);
         t.flags.intersects(self.flags)
     }
 
     fn visit_region(&mut self, r: ty::Region<'tcx>) -> bool {
         let flags = r.type_flags();
-        debug!("HasTypeFlagsVisitor: r={:?} r.flags={:?} self.flags={:?}", r, flags, self.flags);
         flags.intersects(self.flags)
     }
 

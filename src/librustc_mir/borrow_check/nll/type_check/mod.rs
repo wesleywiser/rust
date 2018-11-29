@@ -1722,6 +1722,7 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
     }
 
     fn ensure_place_sized(&mut self, ty: Ty<'tcx>, span: Span) {
+        debug!("ensure_place_sized(ty={:?})", ty);
         let tcx = self.tcx();
 
         // Erase the regions from `ty` to get a global type.  The
@@ -1729,6 +1730,7 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
         // shouldn't affect `is_sized`.
         let gcx = tcx.global_tcx();
         let erased_ty = gcx.lift(&tcx.erase_regions(&ty)).unwrap();
+        debug!("ensure_place_sized: erased_ty={:?}", erased_ty);
         if !erased_ty.is_sized(gcx.at(span), self.param_env) {
             // in current MIR construction, all non-control-flow rvalue
             // expressions evaluate through `as_temp` or `into` a return

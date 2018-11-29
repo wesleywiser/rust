@@ -826,10 +826,12 @@ impl LintPass for VariantSizeDifferences {
 
 impl<'a, 'tcx> LateLintPass<'a, 'tcx> for VariantSizeDifferences {
     fn check_item(&mut self, cx: &LateContext, it: &hir::Item) {
+        debug!("VariantSizeDifferences::check_item(it={:?})", it);
         if let hir::ItemKind::Enum(ref enum_definition, _) = it.node {
             let item_def_id = cx.tcx.hir().local_def_id(it.id);
             let t = cx.tcx.type_of(item_def_id);
             let ty = cx.tcx.erase_regions(&t);
+            debug!("VariantSizeDifferences::check_item: ty={:?}", ty);
             match cx.layout_of(ty) {
                 Ok(layout) => {
                     let variants = &layout.variants;

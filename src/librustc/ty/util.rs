@@ -245,6 +245,7 @@ impl<'a, 'tcx> TyCtxt<'a, 'tcx, 'tcx> {
         // erase them. The erase_regions() call will also anonymize bound
         // regions, which is desirable too.
         let ty = self.erase_regions(&ty);
+        debug!("hashing type {:?}", ty);
 
         hcx.while_hashing_spans(false, |hcx| {
             hcx.with_node_id_hashing_mode(NodeIdHashingMode::HashDefPath, |hcx| {

@@ -489,6 +489,7 @@ fn compute_layout<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         GeneratorLayout<'tcx>,
         FxHashMap<BasicBlock, liveness::LiveVarSet<Local>>)
 {
+    debug!("compute_layout(source={:?}, upvars={:?}, movable={:?})", source, upvars, movable);
     // Use a liveness analysis to compute locals which are live across a suspension point
     let (live_locals, storage_liveness) = locals_live_across_suspend_points(tcx,
                                                                             mir,
@@ -497,6 +498,7 @@ fn compute_layout<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     // Erase regions from the types passed in from typeck so we can compare them with
     // MIR types
     let allowed_upvars = tcx.erase_regions(&upvars);
+    debug!("compute_layout: allowed_upvars={:?}", allowed_upvars);
     let allowed = match interior.sty {
         ty::GeneratorWitness(s) => tcx.erase_late_bound_regions(&s),
         _ => bug!(),

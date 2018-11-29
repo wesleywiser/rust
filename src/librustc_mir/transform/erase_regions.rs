@@ -34,7 +34,9 @@ impl<'a, 'tcx> EraseRegionsVisitor<'a, 'tcx> {
 
 impl<'a, 'tcx> MutVisitor<'tcx> for EraseRegionsVisitor<'a, 'tcx> {
     fn visit_ty(&mut self, ty: &mut Ty<'tcx>, _: TyContext) {
+        debug!("EraseRegionsVisitor::visit_ty(ty={:?})", ty);
         *ty = self.tcx.erase_regions(ty);
+        debug!("EraseRegionsVisitor::visit_ty: ty={:?}", ty);
         self.super_ty(ty);
     }
 
@@ -43,11 +45,15 @@ impl<'a, 'tcx> MutVisitor<'tcx> for EraseRegionsVisitor<'a, 'tcx> {
     }
 
     fn visit_const(&mut self, constant: &mut &'tcx ty::Const<'tcx>, _: Location) {
+        debug!("EraseRegionsVisitor::visit_const(constant={:?})", constant);
         *constant = self.tcx.erase_regions(constant);
+        debug!("EraseRegionsVisitor::visit_const: constant={:?}", constant);
     }
 
     fn visit_substs(&mut self, substs: &mut &'tcx Substs<'tcx>, _: Location) {
+        debug!("EraseRegionsVisitor::visit_substs(substs={:?})", substs);
         *substs = self.tcx.erase_regions(substs);
+        debug!("EraseRegionsVisitor::visit_substs: substs={:?}", substs);
     }
 
     fn visit_statement(&mut self,

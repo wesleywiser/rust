@@ -141,6 +141,7 @@ pub fn find_associated_item<'a, 'tcx>(
                 let substs = translate_substs(&infcx, param_env, impl_data.impl_def_id,
                                               substs, node_item.node);
                 let substs = infcx.tcx.erase_regions(&substs);
+                debug!("find_associated_item: final substs={:?}", substs);
                 tcx.lift(&substs).unwrap_or_else(||
                     bug!("find_method: translate_substs \
                           returned {:?} which contains inference types/regions",

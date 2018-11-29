@@ -94,11 +94,14 @@ impl<'cx, 'gcx, 'tcx> VerifyBoundCx<'cx, 'gcx, 'tcx> {
         &self,
         projection_ty: ty::ProjectionTy<'tcx>,
     ) -> Vec<ty::OutlivesPredicate<Ty<'tcx>, ty::Region<'tcx>>> {
+        debug!("projection_approx_declared_bounds_from_env(projection_ty: {:?})", projection_ty);
         let projection_ty = GenericKind::Projection(projection_ty).to_ty(self.tcx);
         let erased_projection_ty = self.tcx.erase_regions(&projection_ty);
+        debug!("projection_approx_declared_bounds_from_env: erased_projection_ty={:?}", erased_projection_ty);
         self.declared_generic_bounds_from_env_with_compare_fn(|ty| {
             if let ty::Projection(..) = ty.sty {
                 let erased_ty = self.tcx.erase_regions(&ty);
+                debug!("projection_approx_declared_bounds_from_env: erased_ty={:?}", erased_ty);
                 erased_ty == erased_projection_ty
             } else {
                 false

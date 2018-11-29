@@ -390,6 +390,7 @@ fn resolve_associated_item<'a, 'tcx>(
             };
             if eligible {
                 let substs = tcx.erase_regions(&substs);
+                debug!("resolve_associated_item: substs={:?}", substs);
                 Some(ty::Instance::new(def_id, substs))
             } else {
                 None

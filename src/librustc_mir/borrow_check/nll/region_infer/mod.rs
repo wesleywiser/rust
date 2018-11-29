@@ -589,6 +589,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         mut propagated_outlives_requirements: Option<&mut Vec<ClosureOutlivesRequirement<'gcx>>>,
         errors_buffer: &mut Vec<Diagnostic>,
     ) {
+        debug!("check_type_tests(mir={:?})", mir);
         let tcx = infcx.tcx;
 
         // Sometimes we register equivalent type-tests that would
@@ -629,6 +630,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
             // Skip duplicate-ish errors.
             let type_test_span = type_test.locations.span(mir);
             let erased_generic_kind = tcx.erase_regions(&type_test.generic_kind);
+            debug!("check_type_tests: erased_generic_kind={:?}", erased_generic_kind);
             if !deduplicate_errors.insert((
                 erased_generic_kind,
                 lower_bound_region,

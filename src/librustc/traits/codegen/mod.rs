@@ -35,8 +35,10 @@ pub fn codegen_fulfill_obligation<'a, 'tcx>(ty: TyCtxt<'a, 'tcx, 'tcx>,
                                           (ty::ParamEnv<'tcx>, ty::PolyTraitRef<'tcx>))
                                           -> Vtable<'tcx, ()>
 {
+    debug!("codegen_fulfill_obligation(ty={:?}, param_env={:?})", ty, param_env);
     // Remove any references to regions; this helps improve caching.
     let trait_ref = ty.erase_regions(&trait_ref);
+    debug!("codegen_fulfill_obligation: trait_ref={:?}", trait_ref);
 
     debug!("codegen_fulfill_obligation(trait_ref={:?}, def_id={:?})",
         (param_env, trait_ref), trait_ref.def_id());
@@ -169,6 +171,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
 
         let result = self.resolve_type_vars_if_possible(result);
         let result = self.tcx.erase_regions(&result);
+        debug!("drain_fulfillment_cx_or_panic: result={:?}", result);
 
         self.tcx.lift_to_global(&result).unwrap_or_else(||
             span_bug!(span, "Uninferred types/regions in `{:?}`", result)

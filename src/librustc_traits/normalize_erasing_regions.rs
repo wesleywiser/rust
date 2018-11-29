@@ -36,6 +36,7 @@ fn normalize_ty_after_erasing_regions<'tcx>(
                 value: normalized_value,
                 obligations: normalized_obligations,
             }) => {
+                debug!("normalize_ty_after_erasing_regions: normalization succeeded");
                 // We don't care about the `obligations`; they are
                 // always only region relations, and we are about to
                 // erase those anyway:
@@ -48,6 +49,7 @@ fn normalize_ty_after_erasing_regions<'tcx>(
 
                 let normalized_value = infcx.resolve_type_vars_if_possible(&normalized_value);
                 let normalized_value = infcx.tcx.erase_regions(&normalized_value);
+                debug!("normalize_ty_after_erasing_regions: normalized_value={:?}", normalized_value);
                 tcx.lift_to_global(&normalized_value).unwrap()
             }
             Err(NoSolution) => bug!("could not fully normalize `{:?}`", value),

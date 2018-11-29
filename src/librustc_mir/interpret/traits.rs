@@ -29,6 +29,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
         trace!("get_vtable(trait_ref={:?})", poly_trait_ref);
 
         let (ty, poly_trait_ref) = self.tcx.erase_regions(&(ty, poly_trait_ref));
+        debug!("get_vtable: ty={:?}, poly_trait_ref={:?}", ty, poly_trait_ref);
 
         if let Some(&vtable) = self.vtables.get(&(ty, poly_trait_ref)) {
             return Ok(Pointer::from(vtable).with_default_tag());
@@ -36,6 +37,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
 
         let trait_ref = poly_trait_ref.with_self_ty(*self.tcx, ty);
         let trait_ref = self.tcx.erase_regions(&trait_ref);
+        debug!("get_vtable: trait_ref={:?}", trait_ref);
 
         let methods = self.tcx.vtable_methods(trait_ref);
 

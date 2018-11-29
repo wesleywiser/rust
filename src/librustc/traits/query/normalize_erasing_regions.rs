@@ -40,6 +40,7 @@ impl<'cx, 'tcx> TyCtxt<'cx, 'tcx, 'tcx> {
         // Erase first before we do the real query -- this keeps the
         // cache from being too polluted.
         let value = self.erase_regions(&value);
+        debug!("normalize_erasing_regions: value={:?}", value);
         if !value.has_projections() {
             value
         } else {

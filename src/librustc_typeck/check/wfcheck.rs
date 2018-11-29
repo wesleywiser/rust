@@ -250,6 +250,7 @@ fn check_type_defn<'a, 'tcx, F>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                                 item: &hir::Item, all_sized: bool, mut lookup_fields: F)
     where F: for<'fcx, 'gcx, 'tcx2> FnMut(&FnCtxt<'fcx, 'gcx, 'tcx2>) -> Vec<AdtVariant<'tcx2>>
 {
+    debug!("check_type_defn(item={:?}, all_sized={:?})", item, all_sized);
     for_item(tcx, item).with_fcx(|fcx, fcx_tcx| {
         let variants = lookup_fields(fcx);
         let def_id = fcx.tcx.hir().local_def_id(item.id);
@@ -265,6 +266,7 @@ fn check_type_defn<'a, 'tcx, F>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                         .unwrap_or_else(|| {
                             span_bug!(item.span, "inference variables in {:?}", ty)
                         });
+                    debug!("check_type_defn: ty={:?}", ty);
                     ty.needs_drop(fcx_tcx, fcx_tcx.param_env(def_id))
                 }
             };

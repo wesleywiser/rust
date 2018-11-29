@@ -1055,6 +1055,7 @@ impl<'b, 'a, 'v> RootCollector<'b, 'a, 'v> {
     /// the return type of `main`. This is not needed when
     /// the user writes their own `start` manually.
     fn push_extra_entry_roots(&mut self) {
+        debug!("push_extra_entry_roots()");
         if self.tcx.sess.entry_fn.get().map(|e| e.2) != Some(config::EntryFnType::Main) {
             return
         }
@@ -1079,6 +1080,7 @@ impl<'b, 'a, 'v> RootCollector<'b, 'a, 'v> {
         let main_ret_ty = self.tcx.erase_regions(
             &main_ret_ty.no_bound_vars().unwrap(),
         );
+        debug!("push_extra_entry_roots: main_ret_ty={:?}", main_ret_ty);
 
         let start_instance = Instance::resolve(
             self.tcx,

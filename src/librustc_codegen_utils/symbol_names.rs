@@ -324,6 +324,7 @@ fn compute_symbol_name<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, instance: Instance
     // Erase regions because they may not be deterministic when hashed
     // and should not matter anyhow.
     let instance_ty = tcx.erase_regions(&instance_ty);
+    debug!("compute_symbol_name: instance_ty={:?}", instance_ty);
 
     let hash = get_symbol_hash(tcx, def_id, instance, instance_ty, substs);
 

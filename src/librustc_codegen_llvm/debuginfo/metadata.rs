@@ -159,6 +159,7 @@ impl TypeMap<'ll, 'tcx> {
     // ID will be generated and stored for later lookup.
     fn get_unique_type_id_of_type<'a>(&mut self, cx: &CodegenCx<'a, 'tcx>,
                                       type_: Ty<'tcx>) -> UniqueTypeId {
+        debug!("get_unique_type_id_of_type(type_={:?})", type_);
         // Let's see if we already have something in the cache
         if let Some(unique_type_id) = self.type_to_unique_id.get(&type_).cloned() {
             return unique_type_id;
@@ -170,6 +171,7 @@ impl TypeMap<'ll, 'tcx> {
         let mut hasher = StableHasher::<Fingerprint>::new();
         let mut hcx = cx.tcx.create_stable_hashing_context();
         let type_ = cx.tcx.erase_regions(&type_);
+        debug!("get_unique_type_id_of_type: type_={:?}", type_);
         hcx.while_hashing_spans(false, |hcx| {
             hcx.with_node_id_hashing_mode(NodeIdHashingMode::HashDefPath, |hcx| {
                 type_.hash_stable(hcx, &mut hasher);

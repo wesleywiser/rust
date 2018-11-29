@@ -1337,6 +1337,7 @@ impl<'a, 'tcx> SizeSkeleton<'tcx> {
                    param_env: ty::ParamEnv<'tcx>)
                    -> Result<SizeSkeleton<'tcx>, LayoutError<'tcx>> {
         debug_assert!(!ty.has_infer_types());
+        debug!("compute(ty={:?}, param_env={:?})", ty, param_env);
 
         // First try computing a static layout.
         let err = match tcx.layout_of(param_env.and(ty)) {
