@@ -94,6 +94,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
                     }
                     ty::FnDef(def_id, substs) => {
                         let sig = func.layout.ty.fn_sig(*self.tcx);
+                        debug!("eval_terminator(): calling resolve");
                         (self.resolve(def_id, substs)?, sig.abi())
                     },
                     _ => {

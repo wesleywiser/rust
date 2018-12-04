@@ -287,6 +287,7 @@ impl<'cx, 'gcx, 'tcx> Visitor<'gcx> for WritebackCx<'cx, 'gcx, 'tcx> {
     fn visit_local(&mut self, l: &'gcx hir::Local) {
         intravisit::walk_local(self, l);
         let var_ty = self.fcx.local_ty(l.span, l.id).decl_ty;
+        debug!("WritebackCx::visit_local(): calling resolve");
         let var_ty = self.resolve(&var_ty, &l.span);
         self.write_ty_to_tables(l.hir_id, var_ty);
     }
@@ -294,6 +295,7 @@ impl<'cx, 'gcx, 'tcx> Visitor<'gcx> for WritebackCx<'cx, 'gcx, 'tcx> {
     fn visit_ty(&mut self, hir_ty: &'gcx hir::Ty) {
         intravisit::walk_ty(self, hir_ty);
         let ty = self.fcx.node_ty(hir_ty.hir_id);
+        debug!("WritebackCx::visit_ty(): calling resolve");
         let ty = self.resolve(&ty, &hir_ty.span);
         self.write_ty_to_tables(hir_ty.hir_id, ty);
     }
@@ -572,12 +574,14 @@ impl<'cx, 'gcx, 'tcx> WritebackCx<'cx, 'gcx, 'tcx> {
 
         // Resolve the type of the node with id `node_id`
         let n_ty = self.fcx.node_ty(hir_id);
+        debug!("WritebackCx::visit_node_id(): calling resolve");
         let n_ty = self.resolve(&n_ty, &span);
         self.write_ty_to_tables(hir_id, n_ty);
         debug!("Node {:?} has type {:?}", hir_id, n_ty);
 
         // Resolve any substitutions
         if let Some(substs) = self.fcx.tables.borrow().node_substs_opt(hir_id) {
+            debug!("WritebackCx::visit_node_id(): calling resolve again");
             let substs = self.resolve(&substs, &span);
             debug!("write_substs_to_tcx({:?}, {:?})", hir_id, substs);
             assert!(!substs.needs_infer() && !substs.has_placeholders());
@@ -613,6 +617,7 @@ impl<'cx, 'gcx, 'tcx> WritebackCx<'cx, 'gcx, 'tcx> {
             }
 
             Some(adjustment) => {
+                debug!("WritebackCx::visit_adjustments(): calling resolve");
                 let resolved_adjustment = self.resolve(&adjustment, &span);
                 debug!(
                     "Adjustments for node {:?}: {:?}",
@@ -637,6 +642,7 @@ impl<'cx, 'gcx, 'tcx> WritebackCx<'cx, 'gcx, 'tcx> {
             }
 
             Some(adjustment) => {
+                debug!("WritebackCx::visit_pat_adjustments(): calling resolve");
                 let resolved_adjustment = self.resolve(&adjustment, &span);
                 debug!(
                     "pat_adjustments for node {:?}: {:?}",
@@ -659,6 +665,7 @@ impl<'cx, 'gcx, 'tcx> WritebackCx<'cx, 'gcx, 'tcx> {
                 owner: common_local_id_root.index,
                 local_id,
             };
+            debug!("WritebackCx::visit_liberated_fn_sigs(): calling resolve");
             let fn_sig = self.resolve(fn_sig, &hir_id);
             self.tables
                 .liberated_fn_sigs_mut()
@@ -676,6 +683,7 @@ impl<'cx, 'gcx, 'tcx> WritebackCx<'cx, 'gcx, 'tcx> {
                 owner: common_local_id_root.index,
                 local_id,
             };
+            debug!("WritebackCx::visit_fru_field_types(): calling resolve");
             let ftys = self.resolve(ftys, &hir_id);
             self.tables.fru_field_types_mut().insert(hir_id, ftys);
         }

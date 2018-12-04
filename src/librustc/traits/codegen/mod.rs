@@ -35,7 +35,7 @@ pub fn codegen_fulfill_obligation<'a, 'tcx>(ty: TyCtxt<'a, 'tcx, 'tcx>,
                                           (ty::ParamEnv<'tcx>, ty::PolyTraitRef<'tcx>))
                                           -> Vtable<'tcx, ()>
 {
-    debug!("codegen_fulfill_obligation(ty={:?}, param_env={:?})", ty, param_env);
+    debug!("codegen_fulfill_obligation(param_env={:?})", param_env);
     // Remove any references to regions; this helps improve caching.
     let trait_ref = ty.erase_regions(&trait_ref);
     debug!("codegen_fulfill_obligation: trait_ref={:?}", trait_ref);

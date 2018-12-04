@@ -79,6 +79,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
 
         for (i, method) in methods.iter().enumerate() {
             if let Some((def_id, substs)) = *method {
+                debug!("get_vtable(): calling resolve");
                 let instance = self.resolve(def_id, substs)?;
                 let fn_ptr = self.memory.create_fn_alloc(instance).with_default_tag();
                 let method_ptr = vtable.offset(ptr_size * (3 + i as u64), self)?;

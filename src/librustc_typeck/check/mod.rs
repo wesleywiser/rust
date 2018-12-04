@@ -347,6 +347,7 @@ impl<'a, 'gcx, 'tcx> Expectation<'tcx> {
     }
 
     fn to_option(self, fcx: &FnCtxt<'a, 'gcx, 'tcx>) -> Option<Ty<'tcx>> {
+        debug!("to_option(): calling resolve");
         match self.resolve(fcx) {
             NoExpectation => None,
             ExpectIfCondition => Some(fcx.tcx.types.bool),
@@ -361,6 +362,7 @@ impl<'a, 'gcx, 'tcx> Expectation<'tcx> {
     /// for the program to type-check). `only_has_type` will return
     /// such a constraint, if it exists.
     fn only_has_type(self, fcx: &FnCtxt<'a, 'gcx, 'tcx>) -> Option<Ty<'tcx>> {
+        debug!("only_has_type(): calling resolve");
         match self.resolve(fcx) {
             ExpectHasType(ty) => Some(ty),
             ExpectIfCondition => Some(fcx.tcx.types.bool),
@@ -833,6 +835,7 @@ fn used_trait_imports<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 fn typeck_tables_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                               def_id: DefId)
                               -> &'tcx ty::TypeckTables<'tcx> {
+    debug!("typeck_tables_of(def_id={:?})", def_id);
     // Closures' tables come from their outermost function,
     // as they are part of the same "inference environment".
     let outer_def_id = tcx.closure_base_def_id(def_id);

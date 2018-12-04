@@ -371,6 +371,9 @@ fn resolve_associated_item<'a, 'tcx>(
                     }
                 };
 
+                debug!("resolve_associated_item: is_default={:?}", is_default);
+                debug!("resolve_associated_item: param_env={:?}", param_env);
+
                 // Only reveal a specializable default if we're past type-checking
                 // and the obligations is monomorphic, otherwise passes such as
                 // transmute checking and polymorphic MIR optimizations could
@@ -379,6 +382,7 @@ fn resolve_associated_item<'a, 'tcx>(
                     true
                 } else if param_env.reveal == traits::Reveal::All {
                     assert!(!trait_ref.needs_infer());
+                    debug!("resolve_associated_item: trait_ref.needs_subst()={:?}", trait_ref.needs_subst());
                     if !trait_ref.needs_subst() {
                         true
                     } else {

@@ -1398,6 +1398,7 @@ impl<'o, 'gcx: 'tcx, 'tcx> dyn AstConv<'gcx, 'tcx> + 'o {
 
     pub fn prohibit_generics<'a, T: IntoIterator<Item = &'a hir::PathSegment>>(&self, segments: T) {
         for segment in segments {
+            debug!("prohibit_generics(): segment={:?}", segment);
             segment.with_generic_args(|generic_args| {
                 let (mut err_for_lt, mut err_for_ty) = (false, false);
                 for arg in &generic_args.args {
@@ -1453,6 +1454,7 @@ impl<'o, 'gcx: 'tcx, 'tcx> dyn AstConv<'gcx, 'tcx> + 'o {
         let span = path.span;
         match path.def {
             Def::Existential(did) => {
+                debug!("def_to_ty: Existential");
                 // Check for desugared impl trait.
                 assert!(ty::is_impl_trait_defn(tcx, did).is_none());
                 let item_segment = path.segments.split_last().unwrap();
@@ -1465,11 +1467,13 @@ impl<'o, 'gcx: 'tcx, 'tcx> dyn AstConv<'gcx, 'tcx> + 'o {
             }
             Def::Enum(did) | Def::TyAlias(did) | Def::Struct(did) |
             Def::Union(did) | Def::ForeignTy(did) => {
+                debug!("def_to_ty: Enum | TyAlias | Struct | Union | ForeignTy");
                 assert_eq!(opt_self_ty, None);
                 self.prohibit_generics(path.segments.split_last().unwrap().1);
                 self.ast_path_to_ty(span, did, path.segments.last().unwrap())
             }
             Def::Variant(did) if permit_variants => {
+                debug!("def_to_ty: Variant");
                 // Convert "variant type" as if it were a real type.
                 // The resulting `Ty` is type of the variant's enum for now.
                 assert_eq!(opt_self_ty, None);
@@ -1479,6 +1483,7 @@ impl<'o, 'gcx: 'tcx, 'tcx> dyn AstConv<'gcx, 'tcx> + 'o {
                                     path.segments.last().unwrap())
             }
             Def::TyParam(did) => {
+                debug!("def_to_ty: TyParam");
                 assert_eq!(opt_self_ty, None);
                 self.prohibit_generics(&path.segments);
 
@@ -1490,6 +1495,7 @@ impl<'o, 'gcx: 'tcx, 'tcx> dyn AstConv<'gcx, 'tcx> + 'o {
                 tcx.mk_ty_param(index, tcx.hir().name(node_id).as_interned_str())
             }
             Def::SelfTy(_, Some(def_id)) => {
+                debug!("def_to_ty: SelfTy1");
                 // `Self` in impl (we know the concrete type)
 
                 assert_eq!(opt_self_ty, None);
@@ -1498,12 +1504,14 @@ impl<'o, 'gcx: 'tcx, 'tcx> dyn AstConv<'gcx, 'tcx> + 'o {
                 tcx.at(span).type_of(def_id)
             }
             Def::SelfTy(Some(_), None) => {
+                debug!("def_to_ty: SelfTy2");
                 // `Self` in trait
                 assert_eq!(opt_self_ty, None);
                 self.prohibit_generics(&path.segments);
                 tcx.mk_self_type()
             }
             Def::AssociatedTy(def_id) => {
+                debug!("def_to_ty: AssociatedTy");
                 self.prohibit_generics(&path.segments[..path.segments.len()-2]);
                 self.qpath_to_ty(span,
                                  opt_self_ty,
@@ -1512,8 +1520,10 @@ impl<'o, 'gcx: 'tcx, 'tcx> dyn AstConv<'gcx, 'tcx> + 'o {
                                  path.segments.last().unwrap())
             }
             Def::PrimTy(prim_ty) => {
+                debug!("def_to_ty: PrimTy");
                 assert_eq!(opt_self_ty, None);
                 self.prohibit_generics(&path.segments);
+                debug!("after prohibit_generics()");
                 match prim_ty {
                     hir::Bool => tcx.types.bool,
                     hir::Char => tcx.types.char,

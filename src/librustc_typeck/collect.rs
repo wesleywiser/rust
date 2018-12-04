@@ -882,6 +882,7 @@ fn has_late_bound_regions<'a, 'tcx>(
 }
 
 fn generics_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) -> &'tcx ty::Generics {
+    debug!("generics_of(def_id={:?})", def_id);
     use rustc::hir::*;
 
     let node_id = tcx.hir().as_local_node_id(def_id).unwrap();
@@ -1101,6 +1102,8 @@ fn generics_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) -> &'tcx ty
         .map(|param| (param.def_id, param.index))
         .collect();
 
+    debug!("generics_of(): finished. Allocating generics...");
+
     tcx.alloc_generics(ty::Generics {
         parent: parent_def_id,
         parent_count,
@@ -1121,6 +1124,7 @@ fn report_assoc_ty_on_inherent_impl<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, span:
 }
 
 fn type_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) -> Ty<'tcx> {
+    debug!("type_of(def_id={:?})", def_id);
     use rustc::hir::*;
 
     let node_id = tcx.hir().as_local_node_id(def_id).unwrap();

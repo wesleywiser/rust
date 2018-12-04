@@ -169,6 +169,7 @@ impl<'a, Ctx> Snapshot<'a, Ctx> for AllocId
     type Item = AllocIdSnapshot<'a>;
 
     fn snapshot(&self, ctx: &'a Ctx) -> Self::Item {
+        debug!("<AllocId as Snapshot>::snapshot(): calling resolve");
         AllocIdSnapshot(ctx.resolve(self).map(|alloc| alloc.snapshot(ctx)))
     }
 }

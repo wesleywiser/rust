@@ -555,6 +555,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
         trace!("const_value_to_op: {:?}", val);
         match val {
             ConstValue::Unevaluated(def_id, substs) => {
+                debug!("const_value_to_op(): calling resolve");
                 let instance = self.resolve(def_id, substs)?;
                 Ok(*OpTy::from(self.const_eval_raw(GlobalId {
                     instance,
