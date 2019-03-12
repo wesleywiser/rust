@@ -845,6 +845,13 @@ impl<'a, 'gcx> HashStable<StableHashingContext<'a>> for ty::InstanceDef<'gcx> {
                 def_id.hash_stable(hcx, hasher);
                 ty.hash_stable(hcx, hasher);
             }
+            ty::InstanceDef::CloneCopyShim(def_id) => {
+                def_id.hash_stable(hcx, hasher);
+            }
+            ty::InstanceDef::CloneStructuralShim(def_id, ty) => {
+                def_id.hash_stable(hcx, hasher);
+                ty.hash_stable(hcx, hasher);
+            }
         }
     }
 }

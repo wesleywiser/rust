@@ -4,6 +4,7 @@ use crate::ty::{self, Ty, PolyFnSig, TypeFoldable, SubstsRef, TyCtxt};
 use crate::traits;
 use rustc_target::spec::abi::Abi;
 use crate::util::ppaux;
+use syntax_pos::DUMMY_SP;
 
 use std::fmt;
 use std::iter;
@@ -35,8 +36,14 @@ pub enum InstanceDef<'tcx> {
     /// `drop_in_place::<T>; None` for empty drop glue.
     DropGlue(DefId, Option<Ty<'tcx>>),
 
-    ///`<T as Clone>::clone` shim.
+    /// `<T as Clone>::clone` shim.
     CloneShim(DefId, Ty<'tcx>),
+
+    /// `<T as Clone>::clone` shim when `T` is `Copy`.
+    CloneCopyShim(DefId),
+
+    /// `<T as Clone>::clone` shim when `T` is an array or tuple.
+    CloneStructuralShim(DefId, Ty<'tcx>),
 }
 
 impl<'a, 'tcx> Instance<'tcx> {
@@ -128,7 +135,9 @@ impl<'tcx> InstanceDef<'tcx> {
             InstanceDef::Intrinsic(def_id, ) |
             InstanceDef::ClosureOnceShim { call_once: def_id } |
             InstanceDef::DropGlue(def_id, _) |
-            InstanceDef::CloneShim(def_id, _) => def_id
+            InstanceDef::CloneShim(def_id, _) |
+            InstanceDef::CloneCopyShim(def_id) |
+            InstanceDef::CloneStructuralShim(def_id, _) => def_id
         }
     }
 
@@ -196,6 +205,12 @@ impl<'tcx> fmt::Display for Instance<'tcx> {
                 write!(f, " - shim({:?})", ty)
             }
             InstanceDef::CloneShim(_, ty) => {
+                write!(f, " - shim({:?})", ty)
+            }
+            InstanceDef::CloneCopyShim(def) => {
+                write!(f, " - shim({:?})", def)
+            }
+            InstanceDef::CloneStructuralShim(_, ty) => {
                 write!(f, " - shim({:?})", ty)
             }
         }
@@ -385,9 +400,26 @@ fn resolve_associated_item<'a, 'tcx>(
         }
         traits::VtableBuiltin(..) => {
             if tcx.lang_items().clone_trait().is_some() {
+                let substs = rcvr_substs;
+                let name = tcx.item_name(def_id);
+                let self_ty = trait_ref.self_ty();
+                let def = if name  == "clone" {
+                    match self_ty.sty {
+                        ty::TyKind::Array(..) |
+                        ty::TyKind::Tuple(..) =>
+                            ty::InstanceDef::CloneStructuralShim(def_id, self_ty),
+                        _ if self_ty.is_copy_modulo_regions(tcx, param_env, DUMMY_SP) =>
+                            ty::InstanceDef::CloneCopyShim(def_id),
+                        _ =>
+                            ty::InstanceDef::CloneShim(def_id, self_ty),
+                    }
+                } else {
+                    ty::InstanceDef::CloneShim(def_id, self_ty)
+                };
+
                 Some(Instance {
-                    def: ty::InstanceDef::CloneShim(def_id, trait_ref.self_ty()),
-                    substs: rcvr_substs
+                    def,
+                    substs,
                 })
             } else {
                 None

@@ -713,7 +713,9 @@ fn visit_instance_use<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         ty::InstanceDef::ClosureOnceShim { .. } |
         ty::InstanceDef::Item(..) |
         ty::InstanceDef::FnPtrShim(..) |
-        ty::InstanceDef::CloneShim(..) => {
+        ty::InstanceDef::CloneShim(..) |
+        ty::InstanceDef::CloneCopyShim(..) |
+        ty::InstanceDef::CloneStructuralShim(..) => {
             output.push(create_fn_mono_item(instance));
         }
     }
@@ -732,7 +734,9 @@ fn should_monomorphize_locally<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, instance: 
         ty::InstanceDef::FnPtrShim(..) |
         ty::InstanceDef::DropGlue(..) |
         ty::InstanceDef::Intrinsic(_) |
-        ty::InstanceDef::CloneShim(..) => return true
+        ty::InstanceDef::CloneShim(..) |
+        ty::InstanceDef::CloneCopyShim(..) |
+        ty::InstanceDef::CloneStructuralShim(..) => return true
     };
 
     if tcx.is_foreign_item(def_id) {
