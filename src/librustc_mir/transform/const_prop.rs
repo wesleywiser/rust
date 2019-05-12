@@ -596,6 +596,28 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
     fn should_const_prop(&self) -> bool {
         self.tcx.sess.opts.debugging_opts.mir_opt_level >= 2
     }
+
+    fn should_const_prop_local(&self, local: Local, rval: &Rvalue<'tcx>) -> bool {
+        trace!("should_const_prop(local={:?}, rval={:?})", local, rval);
+        if self.can_const_prop[local] {
+            return true;
+        }
+
+        // if we should not actually perform const propagation, then we're done
+        if !self.should_const_prop() {
+            return false;
+        }
+
+        // if `rval` is a read of a local that we already propagated into,
+        // then we can also propagate it
+        if let Rvalue::Use(Operand::Move(Place::Projection(proj))) = rval {
+            if let Place::Base(PlaceBase::Local(l)) = &proj.base {
+                return self.places[*l].is_some()
+            }
+        }
+
+        false
+    }
 }
 
 fn type_size_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
@@ -692,7 +714,7 @@ impl<'b, 'a, 'tcx> MutVisitor<'tcx> for ConstPropagator<'b, 'a, 'tcx> {
                 if let Some(value) = self.const_prop(rval, place_layout, statement.source_info) {
                     if let Place::Base(PlaceBase::Local(local)) = *place {
                         trace!("checking whether {:?} can be stored to {:?}", value, local);
-                        if self.can_const_prop[local] {
+                        if self.should_const_prop_local(local, rval) {
                             trace!("storing {:?} to {:?}", value, local);
                             assert!(self.places[local].is_none());
                             self.places[local] = Some(value);
