@@ -296,7 +296,10 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
     fn eval_place(&mut self, place: &Place<'tcx>, source_info: SourceInfo) -> Option<Const<'tcx>> {
         trace!("eval_place(place={:?})", place);
         match *place {
-            Place::Base(PlaceBase::Local(loc)) => self.places[loc].clone(),
+            Place::Base(PlaceBase::Local(loc)) => {
+                trace!("local");
+                self.places[loc].clone()
+            },
             Place::Projection(ref proj) => match proj.elem {
                 ProjectionElem::Field(field, _) => {
                     trace!("field proj on {:?}", proj.base);
@@ -306,14 +309,30 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
                     })?;
                     Some(res)
                 },
+                ProjectionElem::Deref => {
+                    trace!("Deref");
+                    let base = self.eval_place(&proj.base, source_info);
+                    trace!("base={:?}", base);
+                    let base = base?;
+                    let res = self.use_ecx(source_info, |this| {
+                        this.ecx.deref_operand(base)
+                    })?;
+                    trace!("res={:?}", res);
+
+                    Some(res.into())
+                }
                 // We could get more projections by using e.g., `operand_projection`,
                 // but we do not even have the stack frame set up properly so
                 // an `Index` projection would throw us off-track.
-                _ => None,
+                _ => {
+                    trace!("proj_elem: {:?} not implemented", proj.elem);
+                    None
+                },
             },
             Place::Base(
                 PlaceBase::Static(box Static {kind: StaticKind::Promoted(promoted), ..})
             ) => {
+                trace!("PlaceBase::Static(Promoted)");
                 let generics = self.tcx.generics_of(self.source.def_id());
                 if generics.requires_monomorphization(self.tcx) {
                     // FIXME: can't handle code with generics
@@ -334,7 +353,10 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
                 trace!("evaluated promoted {:?} to {:?}", promoted, res);
                 Some(res.into())
             },
-            _ => None,
+            _ => {
+                trace!("other - not implemented");
+                None
+            },
         }
     }
 
@@ -372,8 +394,11 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
                 })
             },
             Rvalue::Len(ref place) => {
+                trace!("Len({:?})", place);
                 let place = self.eval_place(&place, source_info)?;
+                trace!("place={:?}", place);
                 let mplace = place.to_mem_place();
+                trace!("mplace={:?}", mplace);
 
                 if mplace.layout.ty.is_slice() {
                     let len = mplace.meta.unwrap().to_usize(&self.ecx).unwrap();

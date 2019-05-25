@@ -7,13 +7,17 @@ fn main() {
 // START rustc.main.ConstProp.before.mir
 //  bb0: {
 //      ...
-//      _2 = const 1usize;
-//      _3 = Len((*(X: &[u32])));
-//      _4 = Lt(_2, _3);
-//      assert(move _4, "index out of bounds: the len is move _3 but the index is _2") -> bb1;
+//      _3 = &(promoted[0]: [u32; 3]);
+//      _2 = _3;
+//      _1 = move _2 as &[u32] (Pointer(Unsize));
+//      ...
+//      _6 = const 1usize;
+//      _7 = Len((*_1));
+//      _8 = Lt(_6, _7);
+//      assert(move _8, "index out of bounds: the len is move _7 but the index is _6") -> bb1;
 //  }
 //  bb1: {
-//      _1 = (*(X: &[u32]))[_2];
+//      _5 = (*_1)[_6];
 //      ...
 //      return;
 //  }
@@ -21,13 +25,17 @@ fn main() {
 // START rustc.main.ConstProp.after.mir
 //  bb0: {
 //      ...
-//      _2 = const 1usize;
-//      _3 = const 3usize;
-//      _4 = const true;
-//      assert(const true, "index out of bounds: the len is move _3 but the index is _2") -> bb1;
+//      _3 = &(promoted[0]: [u32; 3]);
+//      _2 = _3;
+//      _1 = move _2 as &[u32] (Pointer(Unsize));
+//      ...
+//      _6 = const 1usize;
+//      _7 = Len((*_1));
+//      _8 = Lt(_6, _7);
+//      assert(move _8, "index out of bounds: the len is move _7 but the index is _6") -> bb1;
 //  }
 //  bb1: {
-//      _1 = (*(X: &[u32]))[_2];
+//      _5 = (*_1)[_6];
 //      ...
 //      return;
 //  }
