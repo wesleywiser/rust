@@ -1,7 +1,6 @@
-static X: &[u32] = &[0, 1, 2];
-
 fn main() {
-    let x = X[1];
+    let x: &[u32] = &[1, 2, 3];
+    x[1];
 }
 
 // END RUST SOURCE

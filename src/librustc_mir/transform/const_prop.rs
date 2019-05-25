@@ -2,7 +2,6 @@
 //! assertion failures
 
 use rustc::hir::def::DefKind;
-use rustc::hir::def_id::DefId;
 use rustc::mir::{
     AggregateKind, Constant, Location, Place, PlaceBase, Mir, Operand, Rvalue, Local,
     NullOp, UnOp, StatementKind, Statement, LocalKind, Static, StaticKind,
@@ -294,26 +293,6 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
         }
     }
 
-    fn get_global_id_for_static(
-        &self,
-        def_id: DefId,
-        promoted: Option<Promoted>,
-    ) -> Option<GlobalId<'tcx>> {
-        let generics = self.tcx.generics_of(def_id);
-        if generics.requires_monomorphization(self.tcx) {
-            trace!("can't monomorphize");
-            // FIXME: can't handle code with generics
-            return None;
-        }
-        let substs = InternalSubsts::identity_for_item(self.tcx, def_id);
-        let instance = Instance::new(def_id, substs);
-
-        Some(GlobalId {
-            instance,
-            promoted,
-        })
-    }
-
     fn eval_place(&mut self, place: &Place<'tcx>, source_info: SourceInfo) -> Option<Const<'tcx>> {
         trace!("eval_place(place={:?})", place);
         match *place {
@@ -327,14 +306,6 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
                     })?;
                     Some(res)
                 },
-                ProjectionElem::Deref => {
-                    let base = self.eval_place(&proj.base, source_info)?;
-                    let res = self.use_ecx(source_info, |this| {
-                        this.ecx.deref_operand(base)
-                    })?;
-
-                    Some(res.into())
-                },
                 // We could get more projections by using e.g., `operand_projection`,
                 // but we do not even have the stack frame set up properly so
                 // an `Index` projection would throw us off-track.
@@ -343,7 +314,17 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
             Place::Base(
                 PlaceBase::Static(box Static {kind: StaticKind::Promoted(promoted), ..})
             ) => {
-                let cid = self.get_global_id_for_static(self.source.def_id(), Some(promoted))?;
+                let generics = self.tcx.generics_of(self.source.def_id());
+                if generics.requires_monomorphization(self.tcx) {
+                    // FIXME: can't handle code with generics
+                    return None;
+                }
+                let substs = InternalSubsts::identity_for_item(self.tcx, self.source.def_id());
+                let instance = Instance::new(self.source.def_id(), substs);
+                let cid = GlobalId {
+                    instance,
+                    promoted: Some(promoted),
+                };
                 // cannot use `const_eval` here, because that would require having the MIR
                 // for the current function available, but we're producing said MIR right now
                 let res = self.use_ecx(source_info, |this| {
@@ -353,24 +334,7 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
                 trace!("evaluated promoted {:?} to {:?}", promoted, res);
                 Some(res.into())
             },
-            Place::Base(
-                PlaceBase::Static(box Static {kind: StaticKind::Static(def_id), .. })
-            ) => {
-                // mutable statics can change value at any time so we can't const
-                // propagate their values
-                if self.tcx.is_mutable_static(def_id) {
-                    trace!("can't const-prop mutable static");
-                    return None;
-                }
-
-                let cid = self.get_global_id_for_static(def_id, None)?;
-
-                let res = self.use_ecx(source_info, |this| {
-                    this.ecx.const_eval_raw(cid)
-                })?;
-                trace!("evaluated static {:?} to {:?}", def_id, res);
-                Some(res.into())
-            },
+            _ => None,
         }
     }
 
@@ -411,11 +375,7 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
                 let place = self.eval_place(&place, source_info)?;
                 let mplace = place.to_mem_place();
 
-                let is_slice =
-                    if let ty::Slice(_) = mplace.layout.ty.sty { true }
-                    else { mplace.layout.ty.is_slice() };
-
-                if is_slice {
+                if mplace.layout.ty.is_slice() {
                     let len = mplace.meta.unwrap().to_usize(&self.ecx).unwrap();
 
                     Some(ImmTy {
