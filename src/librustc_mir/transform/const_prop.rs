@@ -1,6 +1,8 @@
 //! Propagates constants for early reporting of statically known
 //! assertion failures
 
+use std::cell::Cell;
+
 use rustc::hir::def::DefKind;
 use rustc::mir::{
     AggregateKind, Constant, Location, Place, PlaceBase, Body, Operand, Rvalue,
@@ -21,7 +23,8 @@ use rustc::ty::layout::{
 };
 
 use crate::interpret::{
-    self, InterpretCx, ScalarMaybeUndef, Immediate, OpTy, ImmTy, MemoryKind,
+    self, InterpretCx, ScalarMaybeUndef, Immediate, OpTy,
+    ImmTy, MemoryKind, StackPopCleanup, LocalValue, LocalState,
 };
 use crate::const_eval::{
     CompileTimeInterpreter, error_to_const_error, eval_promoted, mk_eval_cx,
@@ -59,21 +62,38 @@ impl MirPass for ConstProp {
 
         trace!("ConstProp starting for {:?}", source.def_id());
 
+        // steal some data we need from `body`
+        let source_scope_local_data = std::mem::replace(
+            &mut body.source_scope_local_data,
+            ClearCrossCrate::Clear
+        );
+        let promoted = std::mem::replace(
+            &mut body.promoted,
+            IndexVec::new()
+        );
+
         // FIXME(oli-obk, eddyb) Optimize locals (or even local paths) to hold
         // constants, instead of just checking for const-folding succeeding.
         // That would require an uniform one-def no-mutation analysis
         // and RPO (or recursing when needing the value of a local).
-        let mut optimization_finder = ConstPropagator::new(body, tcx, source);
+        let mut optimization_finder = ConstPropagator::new(
+            body,
+            source_scope_local_data,
+            promoted,
+            tcx,
+            source
+        );
         optimization_finder.visit_body(body);
 
         // put back the data we stole from `mir`
+        let (source_scope_local_data, promoted) = optimization_finder.release_stolen_data();
         std::mem::replace(
             &mut body.source_scope_local_data,
-            optimization_finder.source_scope_local_data
+            source_scope_local_data
         );
         std::mem::replace(
             &mut body.promoted,
-            optimization_finder.promoted
+            promoted
         );
 
         trace!("ConstProp done for {:?}", source.def_id());
@@ -87,7 +107,6 @@ struct ConstPropagator<'a, 'mir, 'tcx:'a+'mir> {
     ecx: InterpretCx<'a, 'mir, 'tcx, CompileTimeInterpreter<'a, 'mir, 'tcx>>,
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
     source: MirSource<'tcx>,
-    places: IndexVec<Local, Option<Const<'tcx>>>,
     can_const_prop: IndexVec<Local, bool>,
     param_env: ParamEnv<'tcx>,
     source_scope_local_data: ClearCrossCrate<IndexVec<SourceScope, SourceScopeLocalData>>,
@@ -120,20 +139,34 @@ impl<'a, 'b, 'tcx> HasTyCtxt<'tcx> for ConstPropagator<'a, 'b, 'tcx> {
 
 impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
     fn new(
-        body: &mut Body<'tcx>,
+        body: &'mir Body<'tcx>,
+        source_scope_local_data: ClearCrossCrate<IndexVec<SourceScope, SourceScopeLocalData>>,
+        promoted: IndexVec<Promoted, Body<'tcx>>,
         tcx: TyCtxt<'a, 'tcx, 'tcx>,
         source: MirSource<'tcx>,
     ) -> ConstPropagator<'a, 'mir, 'tcx> {
-        let param_env = tcx.param_env(source.def_id());
-        let ecx = mk_eval_cx(tcx, tcx.def_span(source.def_id()), param_env);
+        let def_id = source.def_id();
+        let param_env = tcx.param_env(def_id);
+        let span = tcx.def_span(def_id);
+        let mut ecx = mk_eval_cx(tcx, span, param_env);
         let can_const_prop = CanConstProp::check(body);
-        let source_scope_local_data = std::mem::replace(
-            &mut body.source_scope_local_data,
-            ClearCrossCrate::Clear
-        );
-        let promoted = std::mem::replace(
-            &mut body.promoted,
-            IndexVec::new()
+        //let source_scope_local_data = std::mem::replace(
+        //    &mut body.source_scope_local_data,
+        //    ClearCrossCrate::Clear
+        //);
+        //let promoted = std::mem::replace(
+        //    &mut body.promoted,
+        //    IndexVec::new()
+        //);
+
+        ecx.push_stack_frame(
+            Instance::mono(tcx, def_id),
+            span,
+            body,
+            None,
+            StackPopCleanup::None {
+                cleanup: false,
+            },
         );
 
         ConstPropagator {
@@ -142,7 +175,6 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
             source,
             param_env,
             can_const_prop,
-            places: IndexVec::from_elem(None, &body.local_decls),
             source_scope_local_data,
             //FIXME(wesleywiser) we can't steal this because `Visitor::super_visit_body()` needs it
             local_decls: body.local_decls.clone(),
@@ -150,12 +182,26 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
         }
     }
 
+    fn release_stolen_data(self) ->
+        (ClearCrossCrate<IndexVec<SourceScope, SourceScopeLocalData>>,
+         IndexVec<Promoted, Body<'tcx>>)
+    {
+        (self.source_scope_local_data, self.promoted)
+    }
+
     fn get_const(&self, local: Local) -> Option<Const<'tcx>> {
-        self.places[local]
+        self.ecx.access_local(self.ecx.frame(), local, None).ok()
     }
 
     fn set_const(&mut self, local: Local, c: Option<Const<'tcx>>) {
-        self.places[local] = c;
+        self.ecx.frame_mut().locals[local] =
+            match c {
+                Some(op_ty) => LocalState {
+                    value: LocalValue::Live(*op_ty),
+                    layout: Cell::new(Some(op_ty.layout)),
+                },
+                None => LocalState { value: LocalValue::Uninitialized, layout: Cell::new(None) },
+            };
     }
 
     fn use_ecx<F, T>(
