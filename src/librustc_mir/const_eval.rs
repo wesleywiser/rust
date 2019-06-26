@@ -168,7 +168,11 @@ pub(crate) fn eval_body_using_ecx<'mir, 'tcx, M: Machine<'mir, 'tcx>>(
     )?;
 
     // The main interpreter loop.
-    ecx.run_frame()?;
+    if ecx.cur_frame() == 0 {
+        ecx.run()?;
+    } else {
+        ecx.run_frame()?;
+    }
 
     // Intern the result
     M::intern_alloc(
