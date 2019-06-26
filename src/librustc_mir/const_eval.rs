@@ -11,7 +11,7 @@ use rustc::hir::def::DefKind;
 use rustc::hir::def_id::DefId;
 use rustc::mir::interpret::{ConstEvalErr, ErrorHandled, ScalarMaybeUndef};
 use rustc::mir;
-use rustc::ty::{self, TyCtxt, query::TyCtxtAt};
+use rustc::ty::{self, ParamEnv, TyCtxt, query::TyCtxtAt};
 use rustc::ty::layout::{self, LayoutOf, VariantIdx};
 use rustc::ty::subst::Subst;
 use rustc::traits::Reveal;
@@ -24,7 +24,7 @@ use crate::interpret::{self,
     PlaceTy, MPlaceTy, OpTy, ImmTy, Immediate, Scalar,
     RawConst, ConstValue,
     InterpResult, InterpErrorInfo, InterpError, GlobalId, InterpretCx, StackPopCleanup,
-    Allocation, AllocId, MemoryKind,
+    Allocation, AllocId, MemoryKind, Machine,
     snapshot, RefTracking, intern_const_alloc_recursive,
 };
 
@@ -143,12 +143,12 @@ fn op_to_const<'tcx>(
 }
 
 // Returns a pointer to where the result lives
-fn eval_body_using_ecx<'mir, 'tcx>(
-    ecx: &mut CompileTimeEvalContext<'mir, 'tcx>,
+fn eval_body_using_ecx<'mir, 'tcx, M: Machine<'mir, 'tcx>>(
+    ecx: &mut InterpretCx<'mir, 'tcx, M>,
     cid: GlobalId<'tcx>,
     body: &'mir mir::Body<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
-) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
+) -> InterpResult<'tcx, MPlaceTy<'tcx, M::PointerTag>> {
     debug!("eval_body_using_ecx: {:?}, {:?}", cid, param_env);
     let tcx = ecx.tcx.tcx;
     let layout = ecx.layout_of(body.return_ty().subst(tcx, cid.instance.substs))?;
@@ -171,11 +171,11 @@ fn eval_body_using_ecx<'mir, 'tcx>(
     ecx.run()?;
 
     // Intern the result
-    intern_const_alloc_recursive(
+    M::intern_alloc(
         ecx,
         cid.instance.def_id(),
         ret,
-        param_env,
+        param_env
     )?;
 
     debug!("eval_body_using_ecx done: {:?}", *ret);
@@ -466,6 +466,16 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
     #[inline(always)]
     fn stack_pop(_ecx: &mut InterpretCx<'mir, 'tcx, Self>, _extra: ()) -> InterpResult<'tcx> {
         Ok(())
+    }
+
+    #[inline(always)]
+    fn intern_alloc(
+        ecx: &mut InterpretCx<'mir, 'tcx, Self>,
+        def_id: DefId,
+        ret: MPlaceTy<'tcx>,
+        param_env: ParamEnv<'tcx>,
+    ) -> InterpResult<'tcx> {
+        intern_const_alloc_recursive( ecx, def_id, ret, param_env)
     }
 }
 

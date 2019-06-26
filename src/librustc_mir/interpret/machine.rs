@@ -7,13 +7,15 @@ use std::hash::Hash;
 
 use rustc::hir::def_id::DefId;
 use rustc::mir;
-use rustc::ty::{self, query::TyCtxtAt};
+use rustc::ty::{self, ParamEnv, query::TyCtxtAt};
 
 use super::{
     Allocation, AllocId, InterpResult, Scalar, AllocationExtra,
     InterpretCx, PlaceTy, OpTy, ImmTy, MemoryKind, Pointer,
     InterpErrorInfo, InterpError
 };
+
+use crate::interpret::place::MPlaceTy;
 
 /// Whether this kind of memory is allowed to leak
 pub trait MayLeak: Copy {
@@ -226,5 +228,14 @@ pub trait Machine<'mir, 'tcx>: Sized {
         _extra: &Self::MemoryExtra,
     ) -> InterpResult<'tcx, u64> {
         Err(InterpErrorInfo::from(InterpError::ReadPointerAsBytes))
+    }
+
+    fn intern_alloc(
+        _ecx: &mut InterpretCx<'mir, 'tcx, Self>,
+        _def_id: DefId,
+        _ret: MPlaceTy<'tcx, Self::PointerTag>,
+        _param_env: ParamEnv<'tcx>,
+    ) -> InterpResult<'tcx> {
+        Ok(())
     }
 }
