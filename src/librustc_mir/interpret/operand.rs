@@ -443,7 +443,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpretCx<'mir, 'tcx, M> {
     // Evaluate a place with the goal of reading from it.  This lets us sometimes
     // avoid allocations.
     pub(super) fn eval_place_to_op(
-        &self,
+        &mut self,
         mir_place: &mir::Place<'tcx>,
         layout: Option<TyLayout<'tcx>>,
     ) -> InterpResult<'tcx, OpTy<'tcx, M::PointerTag>> {
@@ -483,7 +483,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpretCx<'mir, 'tcx, M> {
     /// If you already know the layout, you can save two table lookups
     /// by passing it in here.
     pub fn eval_operand(
-        &self,
+        &mut self,
         mir_op: &mir::Operand<'tcx>,
         layout: Option<TyLayout<'tcx>>,
     ) -> InterpResult<'tcx, OpTy<'tcx, M::PointerTag>> {
@@ -502,7 +502,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpretCx<'mir, 'tcx, M> {
 
     /// Evaluate a bunch of operands at once
     pub(super) fn eval_operands(
-        &self,
+        &mut self,
         ops: &[mir::Operand<'tcx>],
     ) -> InterpResult<'tcx, Vec<OpTy<'tcx, M::PointerTag>>> {
         ops.into_iter()

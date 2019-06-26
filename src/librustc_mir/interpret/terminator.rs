@@ -42,7 +42,8 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpretCx<'mir, 'tcx, M> {
                 ref targets,
                 ..
             } => {
-                let discr = self.read_immediate(self.eval_operand(discr, None)?)?;
+                let discr_op = self.eval_operand(discr, None)?;
+                let discr = self.read_immediate(discr_op)?;
                 trace!("SwitchInt({:?})", *discr);
 
                 // Branch to the `otherwise` case by default, if no match is found.
@@ -129,7 +130,8 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpretCx<'mir, 'tcx, M> {
                 target,
                 ..
             } => {
-                let cond_val = self.read_immediate(self.eval_operand(cond, None)?)?
+                let cond_op = self.eval_operand(cond, None)?;
+                let cond_val = self.read_immediate(cond_op)?
                     .to_scalar()?.to_bool()?;
                 if expected == cond_val {
                     self.goto_block(Some(target))?;
@@ -138,10 +140,12 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpretCx<'mir, 'tcx, M> {
                     use rustc::mir::interpret::InterpError::*;
                     return match *msg {
                         BoundsCheck { ref len, ref index } => {
-                            let len = self.read_immediate(self.eval_operand(len, None)?)
+                            let len_op = self.eval_operand(len, None)?;
+                            let len = self.read_immediate(len_op)
                                 .expect("can't eval len").to_scalar()?
                                 .to_bits(self.memory().pointer_size())? as u64;
-                            let index = self.read_immediate(self.eval_operand(index, None)?)
+                            let index_op = self.eval_operand(index, None)?;
+                            let index = self.read_immediate(index_op)
                                 .expect("can't eval index").to_scalar()?
                                 .to_bits(self.memory().pointer_size())? as u64;
                             err!(BoundsCheck { len, index })

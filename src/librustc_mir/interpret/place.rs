@@ -553,7 +553,7 @@ where
     /// Evaluate statics and promoteds to an `MPlace`. Used to share some code between
     /// `eval_place` and `eval_place_to_op`.
     pub(super) fn eval_static_to_mplace(
-        &self,
+        &mut self,
         place_static: &mir::Static<'tcx>
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, M::PointerTag>> {
         use rustc::mir::StaticKind;
