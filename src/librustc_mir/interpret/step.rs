@@ -41,6 +41,13 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpretCx<'mir, 'tcx, M> {
         Ok(())
     }
 
+    pub fn run_frame(&mut self) -> InterpResult<'tcx> {
+        let frame = self.cur_frame();
+
+        while self.step()? && self.cur_frame() >= frame {}
+        Ok(())
+    }
+
     /// Returns `true` as long as there are more things to do.
     ///
     /// This is used by [priroda](https://github.com/oli-obk/priroda)
