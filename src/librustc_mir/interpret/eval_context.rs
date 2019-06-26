@@ -136,8 +136,7 @@ impl<'tcx, Tag: Copy + 'static> LocalState<'tcx, Tag> {
     pub fn access(&self) -> InterpResult<'tcx, Operand<Tag>> {
         match self.value {
             LocalValue::Dead => err!(DeadLocal),
-            LocalValue::Uninitialized =>
-                bug!("The type checker should prevent reading from a never-written local"),
+            LocalValue::Uninitialized => err!(UninitializedLocal),
             LocalValue::Live(val) => Ok(val),
         }
     }

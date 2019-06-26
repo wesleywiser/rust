@@ -290,6 +290,7 @@ impl<'mir, 'tcx> ConstPropagator<'mir, 'tcx> {
                     | InvalidPointerMath
                     | ReadUndefBytes(_)
                     | DeadLocal
+                    | UninitializedLocal
                     | InvalidBoolOp(_)
                     | DerefFunctionPointer
                     | ExecuteMemory

@@ -258,6 +258,7 @@ pub enum InterpError<'tcx, O> {
     InvalidPointerMath,
     ReadUndefBytes(Size),
     DeadLocal,
+    UninitializedLocal,
     InvalidBoolOp(mir::BinOp),
     Unimplemented(String),
     DerefFunctionPointer,
@@ -358,6 +359,8 @@ impl<'tcx, O> InterpError<'tcx, O> {
                 "attempted to read undefined bytes",
             DeadLocal =>
                 "tried to access a dead local variable",
+            UninitializedLocal =>
+                "tried to access an uninitialized local variable",
             InvalidBoolOp(_) =>
                 "invalid boolean operation",
             Unimplemented(ref msg) => msg,
