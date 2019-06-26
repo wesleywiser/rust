@@ -74,7 +74,7 @@ impl MirPass for ConstProp {
                 body.basic_blocks().clone(),
                 Default::default(),
                 ClearCrossCrate::Clear,
-                Default::default(),
+                promoted.clone(),
                 None,
                 body.local_decls.clone(),
                 Default::default(),

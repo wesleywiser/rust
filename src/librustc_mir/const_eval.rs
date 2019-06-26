@@ -143,7 +143,7 @@ fn op_to_const<'tcx>(
 }
 
 // Returns a pointer to where the result lives
-fn eval_body_using_ecx<'mir, 'tcx, M: Machine<'mir, 'tcx>>(
+pub(crate) fn eval_body_using_ecx<'mir, 'tcx, M: Machine<'mir, 'tcx>>(
     ecx: &mut InterpretCx<'mir, 'tcx, M>,
     cid: GlobalId<'tcx>,
     body: &'mir mir::Body<'tcx>,

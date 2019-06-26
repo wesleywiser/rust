@@ -17,6 +17,8 @@ use super::{
     RawConst, Immediate, ImmTy, ScalarMaybeUndef, Operand, OpTy, MemoryKind, LocalValue
 };
 
+use crate::const_eval::eval_body_using_ecx;
+
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct MemPlace<Tag=(), Id=AllocId> {
     /// A place may have an integral pointer for ZSTs, and since it might
@@ -561,10 +563,17 @@ where
         Ok(match place_static.kind {
             StaticKind::Promoted(promoted) => {
                 let instance = self.frame().instance;
-                self.const_eval_raw(GlobalId {
+                let cid = GlobalId {
                     instance,
                     promoted: Some(promoted),
-                })?
+                };
+
+                eval_body_using_ecx(
+                    self,
+                    cid,
+                    &self.frame().body.promoted[promoted],
+                    self.param_env,
+                )?
             }
 
             StaticKind::Static(def_id) => {
