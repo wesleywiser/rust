@@ -125,6 +125,9 @@ rustc_queries! {
             }
         }
 
+        query promoted_mir_inner(key: DefId)
+            -> (&'tcx Steal<&'tcx mir::Body<'tcx>>, &'tcx Steal<&'tcx [mir::Body<'tcx>]>) { }
+
         query promoted_mir(key: DefId) -> &'tcx IndexVec<mir::Promoted, mir::Body<'tcx>> { }
     }
 

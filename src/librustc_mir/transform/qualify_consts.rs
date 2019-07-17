@@ -25,6 +25,7 @@ use syntax::feature_gate::{emit_feature_err, GateIssue};
 use syntax::symbol::sym;
 use syntax_pos::{Span, DUMMY_SP};
 
+use std::cell::Cell;
 use std::fmt;
 use std::ops::{Deref, Index, IndexMut};
 use std::usize;
@@ -1505,10 +1506,20 @@ fn mir_const_qualif(tcx: TyCtxt<'_>, def_id: DefId) -> (u8, &BitSet<Local>) {
     Checker::new(tcx, def_id, body, Mode::Const).check_const()
 }
 
-pub struct QualifyAndPromoteConstants;
+pub struct QualifyAndPromoteConstants<'tcx> {
+    promotions: Cell<Option<IndexVec<Promoted, Body<'tcx>>>>,
+}
 
-impl MirPass for QualifyAndPromoteConstants {
-    fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, src: MirSource<'tcx>, body: &mut Body<'tcx>) {
+impl<'tcx> Default for QualifyAndPromoteConstants<'tcx> {
+    fn default() -> Self {
+        QualifyAndPromoteConstants {
+            promotions: Cell::new(None),
+        }
+    }
+}
+
+impl<'tcx> MirPass<'tcx> for QualifyAndPromoteConstants<'tcx> {
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, src: MirSource<'tcx>, body: &mut Body<'tcx>) {
         // There's not really any point in promoting errorful MIR.
         if body.return_ty().references_error() {
             tcx.sess.delay_span_bug(body.span, "QualifyAndPromoteConstants: MIR had errors");
@@ -1584,7 +1595,9 @@ impl MirPass for QualifyAndPromoteConstants {
             };
 
             // Do the actual promotion, now that we know what's viable.
-            promote_consts::promote_candidates(body, tcx, temps, candidates);
+            self.promotions.set(
+                Some(promote_consts::promote_candidates(body, tcx, temps, candidates))
+            );
         } else {
             if !body.control_flow_destroyed.is_empty() {
                 let mut locals = body.vars_iter();
@@ -1653,6 +1666,8 @@ impl MirPass for QualifyAndPromoteConstants {
                     _ => {}
                 }
             }
+
+            warn!("RETURNING EMPTY INDEX_VEC");
         }
 
         // Statics must be Sync.

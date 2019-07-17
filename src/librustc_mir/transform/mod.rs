@@ -48,6 +48,7 @@ pub(crate) fn provide(providers: &mut Providers<'_>) {
         optimized_mir,
         is_mir_available,
         promoted_mir,
+        promoted_mir_inner,
         ..*providers
     };
 }
@@ -138,12 +139,12 @@ pub fn default_name<T: ?Sized>() -> Cow<'static, str> {
 /// A streamlined trait that you can implement to create a pass; the
 /// pass will be named after the type, and it will consist of a main
 /// loop that goes over each available MIR and applies `run_pass`.
-pub trait MirPass {
+pub trait MirPass<'tcx> {
     fn name(&self) -> Cow<'_, str> {
         default_name::<Self>()
     }
 
-    fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, source: MirSource<'tcx>, body: &mut Body<'tcx>);
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, source: MirSource<'tcx>, body: &mut Body<'tcx>);
 }
 
 pub fn run_passes(
@@ -151,7 +152,7 @@ pub fn run_passes(
     body: &mut Body<'tcx>,
     instance: InstanceDef<'tcx>,
     mir_phase: MirPhase,
-    passes: &[&dyn MirPass],
+    passes: &[&dyn MirPass<'tcx>],
 ) {
     let phase_index = mir_phase.phase_index();
 
@@ -165,7 +166,7 @@ pub fn run_passes(
             promoted,
         };
         let mut index = 0;
-        let mut run_pass = |pass: &dyn MirPass| {
+        let mut run_pass = |pass: &dyn MirPass<'tcx>| {
             let run_hooks = |body: &_, index, is_after| {
                 dump_mir::on_mir_pass(tcx, &format_args!("{:03}-{:03}", phase_index, index),
                                       &pass.name(), source, body, is_after);
@@ -217,9 +218,10 @@ fn mir_validated(tcx: TyCtxt<'tcx>, def_id: DefId) -> &'tcx Steal<Body<'tcx>> {
     }
 
     let mut body = tcx.mir_const(def_id).steal();
+    let qualify_and_promote_pass = qualify_consts::QualifyAndPromoteConstants::default();
     run_passes(tcx, &mut body, InstanceDef::Item(def_id), MirPhase::Validated, &[
         // What we need to run borrowck etc.
-        &qualify_consts::QualifyAndPromoteConstants,
+        &qualify_and_promote_pass,
         &simplify::SimplifyCfg::new("qualify-consts"),
     ]);
     tcx.alloc_steal_mir(body)
@@ -302,4 +304,9 @@ fn optimized_mir(tcx: TyCtxt<'_>, def_id: DefId) -> &Body<'_> {
 fn promoted_mir<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> &'tcx IndexVec<Promoted, Body<'tcx>> {
     let body = tcx.optimized_mir(def_id);
     &body.promoted
+}
+
+fn promoted_mir_inner<'tcx>(_tcx: TyCtxt<'tcx>, _def_id: DefId) ->
+    (&'tcx Steal<&'tcx Body<'tcx>>, &'tcx Steal<&'tcx [Body<'tcx>]>) {
+    panic!("not implemented")
 }

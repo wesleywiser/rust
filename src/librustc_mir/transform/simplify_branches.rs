@@ -14,12 +14,12 @@ impl SimplifyBranches {
     }
 }
 
-impl MirPass for SimplifyBranches {
+impl<'tcx> MirPass<'tcx> for SimplifyBranches {
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed(&self.label)
     }
 
-    fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, _src: MirSource<'tcx>, body: &mut Body<'tcx>) {
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, _src: MirSource<'tcx>, body: &mut Body<'tcx>) {
         for block in body.basic_blocks_mut() {
             let terminator = block.terminator_mut();
             terminator.kind = match terminator.kind {

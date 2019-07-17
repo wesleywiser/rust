@@ -9,8 +9,8 @@ use crate::transform::{MirPass, MirSource};
 
 pub struct Lower128Bit;
 
-impl MirPass for Lower128Bit {
-    fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, _src: MirSource<'tcx>, body: &mut Body<'tcx>) {
+impl<'tcx> MirPass<'tcx> for Lower128Bit {
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, _src: MirSource<'tcx>, body: &mut Body<'tcx>) {
         let debugging_override = tcx.sess.opts.debugging_opts.lower_128bit_ops;
         let target_default = tcx.sess.host.options.i128_lowering;
         if !debugging_override.unwrap_or(target_default) {

@@ -36,8 +36,8 @@ use crate::util::patch::MirPatch;
 
 pub struct UniformArrayMoveOut;
 
-impl MirPass for UniformArrayMoveOut {
-    fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, _src: MirSource<'tcx>, body: &mut Body<'tcx>) {
+impl<'tcx> MirPass<'tcx> for UniformArrayMoveOut {
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, _src: MirSource<'tcx>, body: &mut Body<'tcx>) {
         let mut patch = MirPatch::new(body);
         {
             let mut visitor = UniformArrayMoveOutVisitor{body, patch: &mut patch, tcx};
@@ -158,8 +158,8 @@ impl<'a, 'tcx> UniformArrayMoveOutVisitor<'a, 'tcx> {
 
 pub struct RestoreSubsliceArrayMoveOut;
 
-impl MirPass for RestoreSubsliceArrayMoveOut {
-    fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, _src: MirSource<'tcx>, body: &mut Body<'tcx>) {
+impl<'tcx> MirPass<'tcx> for RestoreSubsliceArrayMoveOut {
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, _src: MirSource<'tcx>, body: &mut Body<'tcx>) {
         let mut patch = MirPatch::new(body);
         {
             let mut visitor = RestoreDataCollector {

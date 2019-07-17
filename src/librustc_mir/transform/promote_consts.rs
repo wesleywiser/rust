@@ -290,7 +290,7 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
         new_temp
     }
 
-    fn promote_candidate(mut self, candidate: Candidate) {
+    fn promote_candidate(mut self, candidate: Candidate) -> Option<Body<'tcx>> {
         let mut operand = {
             let promoted = &mut self.promoted;
             let promoted_id = Promoted::new(self.source.promoted.len());
@@ -338,7 +338,7 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
                         // a function requiring a constant argument and as that constant value
                         // providing a value whose computation contains another call to a function
                         // requiring a constant argument.
-                        TerminatorKind::Goto { .. } => return,
+                        TerminatorKind::Goto { .. } => return None,
                         _ => bug!()
                     }
                 }
@@ -353,7 +353,7 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
 
         let span = self.promoted.span;
         self.assign(RETURN_PLACE, Rvalue::Use(operand), span);
-        self.source.promoted.push(self.promoted);
+        Some(self.promoted)
     }
 }
 
@@ -374,9 +374,11 @@ pub fn promote_candidates<'tcx>(
     tcx: TyCtxt<'tcx>,
     mut temps: IndexVec<Local, TempState>,
     candidates: Vec<Candidate>,
-) {
+) -> IndexVec<Promoted, Body<'tcx>> {
     // Visit candidates in reverse, in case they're nested.
     debug!("promote_candidates({:?})", candidates);
+
+    let mut promotions = IndexVec::new();
 
     for candidate in candidates.into_iter().rev() {
         match candidate {
@@ -421,7 +423,10 @@ pub fn promote_candidates<'tcx>(
             temps: &mut temps,
             keep_original: false
         };
-        promoter.promote_candidate(candidate);
+
+        if let Some(promoted) = promoter.promote_candidate(candidate) {
+            promotions.push(promoted);
+        }
     }
 
     // Eliminate assignments to, and drops of promoted temps.
@@ -449,4 +454,6 @@ pub fn promote_candidates<'tcx>(
             _ => {}
         }
     }
+
+    promotions
 }
