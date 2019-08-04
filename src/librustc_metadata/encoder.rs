@@ -8,6 +8,7 @@ use rustc::hir::def_id::{CrateNum, CRATE_DEF_INDEX, DefIndex, DefId, LocalDefId,
 use rustc::hir::GenericParamKind;
 use rustc::hir::map::definitions::DefPathTable;
 use rustc_data_structures::fingerprint::Fingerprint;
+use rustc_data_structures::indexed_vec::IndexVec;
 use rustc::middle::dependency_format::Linkage;
 use rustc::middle::exported_symbols::{ExportedSymbol, SymbolExportLevel,
                                       metadata_symbol_name};
@@ -605,6 +606,7 @@ impl EncodeContext<'tcx> {
             predicates_defined_on: None,
 
             mir: self.encode_optimized_mir(def_id),
+            promoted_mir: self.encode_promoted_mir(def_id),
         }
     }
 
@@ -659,6 +661,7 @@ impl EncodeContext<'tcx> {
             predicates_defined_on: None,
 
             mir: self.encode_optimized_mir(def_id),
+            promoted_mir: self.encode_promoted_mir(def_id),
         }
     }
 
@@ -695,7 +698,8 @@ impl EncodeContext<'tcx> {
             predicates: None,
             predicates_defined_on: None,
 
-            mir: None
+            mir: None,
+            promoted_mir: None,
         }
     }
 
@@ -730,6 +734,7 @@ impl EncodeContext<'tcx> {
             predicates_defined_on: None,
 
             mir: None,
+            promoted_mir: None,
         }
     }
 
@@ -790,6 +795,7 @@ impl EncodeContext<'tcx> {
             predicates_defined_on: None,
 
             mir: self.encode_optimized_mir(def_id),
+            promoted_mir: self.encode_promoted_mir(def_id),
         }
     }
 
@@ -906,6 +912,7 @@ impl EncodeContext<'tcx> {
             predicates_defined_on: None,
 
             mir: self.encode_optimized_mir(def_id),
+            promoted_mir: self.encode_promoted_mir(def_id),
         }
     }
 
@@ -1005,6 +1012,7 @@ impl EncodeContext<'tcx> {
             predicates_defined_on: None,
 
             mir: if mir { self.encode_optimized_mir(def_id) } else { None },
+            promoted_mir: if mir { self.encode_promoted_mir(def_id) } else { None },
         }
     }
 
@@ -1030,6 +1038,16 @@ impl EncodeContext<'tcx> {
         if self.tcx.mir_keys(LOCAL_CRATE).contains(&def_id) {
             let mir = self.tcx.optimized_mir(def_id);
             Some(self.lazy(&mir))
+        } else {
+            None
+        }
+    }
+
+    fn encode_promoted_mir(&mut self, def_id: DefId) -> Option<Lazy<IndexVec<mir::Promoted, mir::Body<'tcx>>>> {
+        debug!("EncodeContext::encode_promoted_mir({:?})", def_id);
+        if self.tcx.mir_keys(LOCAL_CRATE).contains(&def_id) {
+            let promoted = self.tcx.promoted_mir(def_id);
+            Some(self.lazy(&promoted))
         } else {
             None
         }
@@ -1185,6 +1203,20 @@ impl EncodeContext<'tcx> {
             hir::ItemKind::Use(..) => bug!("cannot encode info for item {:?}", item),
         };
 
+        let mir = match item.node {
+            hir::ItemKind::Static(..) | hir::ItemKind::Const(..) => true,
+            hir::ItemKind::Fn(_, header, ..) => {
+                let generics = tcx.generics_of(def_id);
+                let needs_inline =
+                    (generics.requires_monomorphization(tcx) ||
+                        tcx.codegen_fn_attrs(def_id).requests_inline()) &&
+                        !self.metadata_output_only();
+                let always_encode_mir = self.tcx.sess.opts.debugging_opts.always_encode_mir;
+                needs_inline || header.constness == hir::Constness::Const || always_encode_mir
+            }
+            _ => false,
+        };
+
         Entry {
             kind,
             visibility: self.lazy(&ty::Visibility::from_hir(&item.vis, item.hir_id, tcx)),
@@ -1284,29 +1316,8 @@ impl EncodeContext<'tcx> {
                 _ => None, // not *wrong* for other kinds of items, but not needed
             },
 
-            mir: match item.node {
-                hir::ItemKind::Static(..) => {
-                    self.encode_optimized_mir(def_id)
-                }
-                hir::ItemKind::Const(..) => self.encode_optimized_mir(def_id),
-                hir::ItemKind::Fn(_, header, ..) => {
-                    let generics = tcx.generics_of(def_id);
-                    let needs_inline =
-                        (generics.requires_monomorphization(tcx) ||
-                         tcx.codegen_fn_attrs(def_id).requests_inline()) &&
-                            !self.metadata_output_only();
-                    let always_encode_mir = self.tcx.sess.opts.debugging_opts.always_encode_mir;
-                    if needs_inline
-                        || header.constness == hir::Constness::Const
-                        || always_encode_mir
-                    {
-                        self.encode_optimized_mir(def_id)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            },
+            mir: if mir { self.encode_optimized_mir(def_id) } else { None },
+            promoted_mir: if mir { self.encode_promoted_mir(def_id) } else { None },
         }
     }
 
@@ -1333,6 +1344,7 @@ impl EncodeContext<'tcx> {
             predicates: None,
             predicates_defined_on: None,
             mir: None,
+            promoted_mir: None,
         }
     }
 
@@ -1359,6 +1371,7 @@ impl EncodeContext<'tcx> {
             predicates_defined_on: None,
 
             mir: None,
+            promoted_mir: None,
         }
     }
 
@@ -1419,6 +1432,7 @@ impl EncodeContext<'tcx> {
             predicates_defined_on: None,
 
             mir: self.encode_optimized_mir(def_id),
+            promoted_mir: self.encode_promoted_mir(def_id),
         }
     }
 
@@ -1447,6 +1461,7 @@ impl EncodeContext<'tcx> {
             predicates_defined_on: None,
 
             mir: self.encode_optimized_mir(def_id),
+            promoted_mir: self.encode_promoted_mir(def_id),
         }
     }
 
@@ -1642,6 +1657,7 @@ impl EncodeContext<'tcx> {
             predicates_defined_on: None,
 
             mir: None,
+            promoted_mir: None,
         }
     }
 }
