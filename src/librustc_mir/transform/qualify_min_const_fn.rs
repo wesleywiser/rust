@@ -264,7 +264,7 @@ fn check_place(
         }
 
         match place_base {
-            PlaceBase::Static(box Static { kind: StaticKind::Static(_), .. }) => {
+            PlaceBase::Static(box Static { kind: StaticKind::Static, .. }) => {
                 Err((span, "cannot access `static` items in const fn".into()))
             }
             PlaceBase::Local(_)

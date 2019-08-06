@@ -661,7 +661,7 @@ impl<'a, 'tcx> MirVisitor<'tcx> for MirNeighborCollector<'a, 'tcx> {
                         _context: mir::visit::PlaceContext,
                         location: Location) {
         match place_base {
-            PlaceBase::Static(box Static { kind: StaticKind::Static(def_id), .. }) => {
+            PlaceBase::Static(box Static { kind: StaticKind::Static, def_id, .. }) => {
                 debug!("visiting static {:?} @ {:?}", def_id, location);
 
                 let tcx = self.tcx;

@@ -401,7 +401,6 @@ impl Inliner<'tcx> {
 
                 let mut local_map = IndexVec::with_capacity(callee_body.local_decls.len());
                 let mut scope_map = IndexVec::with_capacity(callee_body.source_scopes.len());
-                let promoted_map = IndexVec::with_capacity(self.tcx.promoted_mir(callsite.callee).len());
 
                 for mut scope in callee_body.source_scopes.iter().cloned() {
                     if scope.parent_scope.is_none() {
@@ -426,11 +425,6 @@ impl Inliner<'tcx> {
                     let idx = caller_body.local_decls.push(local);
                     local_map.push(idx);
                 }
-
-                //TODO fixme
-                //promoted_map.extend(
-                //    self.tcx.promoted_mir(callsite.callee).iter().cloned().map(|p| caller_body.promoted.push(p))
-                //);
 
                 // If the call is something like `a[*i] = f(i)`, where
                 // `i : &mut usize`, then just duplicating the `a[*i]`
@@ -492,7 +486,6 @@ impl Inliner<'tcx> {
                     args: &args,
                     local_map,
                     scope_map,
-                    promoted_map,
                     _callsite: callsite,
                     destination: dest,
                     return_block,
@@ -649,7 +642,6 @@ struct Integrator<'a, 'tcx> {
     args: &'a [Local],
     local_map: IndexVec<Local, Local>,
     scope_map: IndexVec<SourceScope, SourceScope>,
-    promoted_map: IndexVec<Promoted, Promoted>,
     _callsite: CallSite<'tcx>,
     destination: Place<'tcx>,
     return_block: BasicBlock,
@@ -697,13 +689,13 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Integrator<'a, 'tcx> {
                 // Return pointer; update the place itself
                 *place = self.destination.clone();
             },
-            Place::Base(
-                PlaceBase::Static(box Static { kind: StaticKind::Promoted(promoted), .. })
-            ) => {
-                if let Some(p) = self.promoted_map.get(*promoted).cloned() {
-                    *promoted = p;
-                }
-            },
+            //Place::Base(
+            //    PlaceBase::Static(box Static { kind: StaticKind::Promoted(promoted), .. })
+            //) => {
+            //    if let Some(p) = self.promoted_map.get(*promoted).cloned() {
+            //        *promoted = p;
+            //    }
+            //},
             _ => self.super_place(place, _ctxt, _location)
         }
     }

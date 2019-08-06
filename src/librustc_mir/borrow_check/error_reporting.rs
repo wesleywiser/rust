@@ -156,7 +156,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
             Place::Base(PlaceBase::Static(box Static{ kind: StaticKind::Promoted(_), .. })) => {
                 buf.push_str("promoted");
             }
-            Place::Base(PlaceBase::Static(box Static{ kind: StaticKind::Static(def_id), .. })) => {
+            Place::Base(PlaceBase::Static(box Static{ kind: StaticKind::Static, def_id, .. })) => {
                 buf.push_str(&self.infcx.tcx.item_name(def_id).to_string());
             }
             Place::Projection(ref proj) => {
@@ -367,7 +367,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
     /// Checks if a place is a thread-local static.
     pub fn is_place_thread_local(&self, place: &Place<'tcx>) -> bool {
         if let Place::Base(
-            PlaceBase::Static(box Static{ kind: StaticKind::Static(def_id), .. })
+            PlaceBase::Static(box Static{ kind: StaticKind::Static, def_id, .. })
         ) = place {
             let attrs = self.infcx.tcx.get_attrs(*def_id);
             let is_thread_local = attrs.iter().any(|attr| attr.check_name(sym::thread_local));

@@ -1450,7 +1450,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
             Place::Base(PlaceBase::Static(box Static{ kind: StaticKind::Promoted(_), .. })) => {
                 (true, false)
             }
-            Place::Base(PlaceBase::Static(box Static{ kind: StaticKind::Static(_), .. })) => {
+            Place::Base(PlaceBase::Static(box Static{ kind: StaticKind::Static, .. })) => {
                 // Thread-locals might be dropped after the function exits, but
                 // "true" statics will never be.
                 (true, self.is_place_thread_local(&root_place))
@@ -2115,7 +2115,7 @@ impl<'cx, 'tcx> MirBorrowckCtxt<'cx, 'tcx> {
                     place,
                     is_local_mutation_allowed,
                 }),
-            Place::Base(PlaceBase::Static(box Static{ kind: StaticKind::Static(def_id), .. })) => {
+            Place::Base(PlaceBase::Static(box Static{ kind: StaticKind::Static, def_id, .. })) => {
                 if !self.infcx.tcx.is_mutable_static(def_id) {
                     Err(place)
                 } else {

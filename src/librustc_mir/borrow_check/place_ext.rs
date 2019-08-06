@@ -48,7 +48,7 @@ impl<'tcx> PlaceExt<'tcx> for Place<'tcx> {
                 }
                 PlaceBase::Static(box Static{ kind: StaticKind::Promoted(_), .. }) =>
                     false,
-                PlaceBase::Static(box Static{ kind: StaticKind::Static(def_id), .. }) => {
+                PlaceBase::Static(box Static{ kind: StaticKind::Static, def_id, .. }) => {
                     tcx.is_mutable_static(*def_id)
                 }
             };

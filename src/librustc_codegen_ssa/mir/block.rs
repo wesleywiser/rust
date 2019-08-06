@@ -609,14 +609,14 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         mir::Operand::Copy(
                             Place::Base(
                                 PlaceBase::Static(
-                                    box Static { kind: StaticKind::Promoted(promoted), ty }
+                                    box Static { kind: StaticKind::Promoted(promoted), ty, def_id: _ }
                                 )
                             )
                         ) |
                         mir::Operand::Move(
                             Place::Base(
                                 PlaceBase::Static(
-                                    box Static { kind: StaticKind::Promoted(promoted), ty }
+                                    box Static { kind: StaticKind::Promoted(promoted), ty, def_id: _ }
                                 )
                             )
                         ) => {

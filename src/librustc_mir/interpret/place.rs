@@ -571,11 +571,11 @@ where
                 })?
             }
 
-            StaticKind::Static(def_id) => {
+            StaticKind::Static => {
                 let ty = place_static.ty;
                 assert!(!ty.needs_subst());
                 let layout = self.layout_of(ty)?;
-                let instance = ty::Instance::mono(*self.tcx, def_id);
+                let instance = ty::Instance::mono(*self.tcx, place_static.def_id);
                 let cid = GlobalId {
                     instance,
                     promoted: None

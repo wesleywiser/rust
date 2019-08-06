@@ -122,7 +122,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
             Place::Base(PlaceBase::Static(box Static { kind: StaticKind::Promoted(_), .. })) =>
                 unreachable!(),
 
-            Place::Base(PlaceBase::Static(box Static { kind: StaticKind::Static(def_id), .. })) => {
+            Place::Base(PlaceBase::Static(box Static { kind: StaticKind::Static, def_id, .. })) => {
                 if let Place::Base(PlaceBase::Static(_)) = access_place {
                     item_msg = format!("immutable static item `{}`", access_place_desc.unwrap());
                     reason = String::new();

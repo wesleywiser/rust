@@ -451,7 +451,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             }
             mir::Place::Base(
                 mir::PlaceBase::Static(
-                    box mir::Static { ty, kind: mir::StaticKind::Promoted(promoted) }
+                    box mir::Static { ty, kind: mir::StaticKind::Promoted(promoted), def_id: _ }
                 )
             ) => {
                 let param_env = ty::ParamEnv::reveal_all();
@@ -482,7 +482,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             }
             mir::Place::Base(
                 mir::PlaceBase::Static(
-                    box mir::Static { ty, kind: mir::StaticKind::Static(def_id) }
+                    box mir::Static { ty, kind: mir::StaticKind::Static, def_id }
                 )
             ) => {
                 // NB: The layout of a static may be unsized as is the case when working

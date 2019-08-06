@@ -410,12 +410,12 @@ impl Qualif for IsNotPromotable {
     fn in_static(cx: &ConstCx<'_, 'tcx>, static_: &Static<'tcx>) -> bool {
         match static_.kind {
             StaticKind::Promoted(_) => unreachable!(),
-            StaticKind::Static(def_id) => {
+            StaticKind::Static => {
                 // Only allow statics (not consts) to refer to other statics.
                 let allowed = cx.mode == Mode::Static || cx.mode == Mode::StaticMut;
 
                 !allowed ||
-                    cx.tcx.get_attrs(def_id).iter().any(
+                    cx.tcx.get_attrs(static_.def_id).iter().any(
                         |attr| attr.check_name(sym::thread_local)
                     )
             }
@@ -976,7 +976,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Checker<'a, 'tcx> {
             PlaceBase::Static(box Static{ kind: StaticKind::Promoted(_), .. }) => {
                 unreachable!()
             }
-            PlaceBase::Static(box Static{ kind: StaticKind::Static(def_id), .. }) => {
+            PlaceBase::Static(box Static{ kind: StaticKind::Static, def_id, .. }) => {
                 if self.tcx
                         .get_attrs(*def_id)
                         .iter()
@@ -1596,7 +1596,7 @@ impl<'tcx> MirPass<'tcx> for QualifyAndPromoteConstants<'tcx> {
 
             // Do the actual promotion, now that we know what's viable.
             self.promoted.set(
-                Some(promote_consts::promote_candidates(body, tcx, temps, candidates))
+                Some(promote_consts::promote_candidates(def_id, body, tcx, temps, candidates))
             );
         } else {
             if !body.control_flow_destroyed.is_empty() {

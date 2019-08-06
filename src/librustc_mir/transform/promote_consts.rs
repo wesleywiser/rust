@@ -12,6 +12,7 @@
 //! initialization and can otherwise silence errors, if
 //! move analysis runs after promotion on broken MIR.
 
+use rustc::hir::def_id::DefId;
 use rustc::mir::*;
 use rustc::mir::visit::{PlaceContext, MutatingUseContext, MutVisitor, Visitor};
 use rustc::mir::traversal::ReversePostorder;
@@ -290,7 +291,7 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
         new_temp
     }
 
-    fn promote_candidate(mut self, candidate: Candidate, next_promoted_id: usize) -> Option<Body<'tcx>> {
+    fn promote_candidate(mut self, def_id: DefId, candidate: Candidate, next_promoted_id: usize) -> Option<Body<'tcx>> {
         let mut operand = {
             let promoted = &mut self.promoted;
             let promoted_id = Promoted::new(next_promoted_id);
@@ -298,7 +299,8 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
                 promoted.span = span;
                 promoted.local_decls[RETURN_PLACE] = LocalDecl::new_return_place(ty, span);
                 Place::Base(
-                    PlaceBase::Static(box Static{ kind: StaticKind::Promoted(promoted_id), ty })
+                    PlaceBase::Static(
+                        box Static { kind: StaticKind::Promoted(promoted_id), ty, def_id })
                 )
             };
             let (blocks, local_decls) = self.source.basic_blocks_and_local_decls_mut();
@@ -370,6 +372,7 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Promoter<'a, 'tcx> {
 }
 
 pub fn promote_candidates<'tcx>(
+    def_id: DefId,
     body: &mut Body<'tcx>,
     tcx: TyCtxt<'tcx>,
     mut temps: IndexVec<Local, TempState>,
@@ -423,7 +426,7 @@ pub fn promote_candidates<'tcx>(
             keep_original: false
         };
 
-        if let Some(promoted) = promoter.promote_candidate(candidate, promotions.len()) {
+        if let Some(promoted) = promoter.promote_candidate(def_id, candidate, promotions.len()) {
             promotions.push(promoted);
         }
     }
