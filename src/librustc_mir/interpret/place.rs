@@ -586,7 +586,7 @@ where
 
         Ok(match place_static.kind {
             StaticKind::Promoted(promoted, _) => {
-                let instance = self.frame().instance;
+                let instance = ty::Instance::mono(*self.tcx, place_static.def_id);
                 self.const_eval_raw(GlobalId {
                     instance,
                     promoted: Some(promoted),
