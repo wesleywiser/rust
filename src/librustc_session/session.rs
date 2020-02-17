@@ -49,6 +49,13 @@ pub struct OptimizationFuel {
     out_of_fuel: bool,
 }
 
+#[derive(Clone, Copy)]
+pub enum CtfeBacktrace {
+    Disabled,
+    Capture,
+    Immediate,
+}
+
 /// Represents the data associated with a compilation
 /// session for a single crate.
 pub struct Session {
@@ -136,6 +143,8 @@ pub struct Session {
     /// Path for libraries that will take preference over libraries shipped by Rust.
     /// Used by windows-gnu targets to priortize system mingw-w64 libraries.
     pub system_library_path: OneThread<RefCell<Option<Option<PathBuf>>>>,
+
+    pub ctfe_backtrace: Lock<CtfeBacktrace>,
 }
 
 pub struct PerfStats {
@@ -1036,6 +1045,12 @@ fn build_session_(
         sopts.debugging_opts.time_passes,
     );
 
+    let ctfe_backtrace = Lock::new(match env::var("RUSTC_CTFE_BACKTRACE") {
+        Ok(ref val) if val == "immediate" => CtfeBacktrace::Immediate,
+        Ok(ref val) if val != "0" => CtfeBacktrace::Capture,
+        _ => CtfeBacktrace::Disabled,
+    });
+
     let sess = Session {
         target: target_cfg,
         host,
@@ -1073,6 +1088,7 @@ fn build_session_(
         trait_methods_not_found: Lock::new(Default::default()),
         confused_type_with_std_module: Lock::new(Default::default()),
         system_library_path: OneThread::new(RefCell::new(Default::default())),
+        ctfe_backtrace,
     };
 
     validate_commandline_args_with_session_available(&sess);
