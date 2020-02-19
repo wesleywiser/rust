@@ -4,6 +4,7 @@ use crate::hir::map::definitions::DefPathData;
 use crate::mir;
 use crate::ty::layout::{Align, LayoutError, Size};
 use crate::ty::query::TyCtxtAt;
+use crate::ty::tls;
 use crate::ty::{self, layout, Ty};
 
 use backtrace::Backtrace;
@@ -245,6 +246,25 @@ impl<'tcx> From<InterpError<'tcx>> for InterpErrorInfo<'tcx> {
             // Matching `RUST_BACKTRACE` -- we treat "0" the same as "not present".
             Ok(ref val) if val != "0" => {
                 let mut backtrace = Backtrace::new_unresolved();
+
+                if val == "2" {
+                    // print query stack
+                    tls::with_context_opt(|ctxt| {
+                        if let Some(ctxt) = ctxt {
+                            let mut s = String::new();
+                            let mut query = ctxt.query.clone();
+
+                            while let Some(q) = query {
+                                s.push_str(q.info.query.name());
+                                s.push_str(", ");
+
+                                query = q.parent.clone();
+                            }
+
+                            eprintln!("{}", s);
+                        }
+                    })
+                }
 
                 if val == "immediate" {
                     // Print it now.
