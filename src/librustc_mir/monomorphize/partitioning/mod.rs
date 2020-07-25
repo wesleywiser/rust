@@ -93,6 +93,7 @@
 //! inlining, even when they are not marked `#[inline]`.
 
 mod default;
+mod debug;
 mod merging;
 
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -143,6 +144,7 @@ fn get_partitioner<'tcx>(tcx: TyCtxt<'tcx>) -> Box<dyn Partitioner<'tcx>> {
 
     match strategy {
         "default" => Box::new(default::DefaultPartitioning),
+        "new" => Box::new(debug::DebugPartioning),
         _ => tcx.sess.fatal("unknown partitioning strategy"),
     }
 }
