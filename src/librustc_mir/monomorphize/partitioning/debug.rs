@@ -1,6 +1,5 @@
 use rustc_middle::mir::mono::{CodegenUnit, InstantiationMode, Visibility, MonoItem, Linkage};
-use super::{default::mono_item_linkage_and_visibility, Partitioner, merging, MonoItemPlacement};
-use rustc_middle::ty::TyCtxt;
+use super::{default::mono_item_linkage_and_visibility, Partitioner, merging, MonoItemPlacement, PartitioningCx};
 use rustc_data_structures::{fx::FxHashMap, stable_set::FxHashSet};
 use rustc_span::Symbol;
 use crate::monomorphize::collector::InliningMap;
@@ -13,7 +12,7 @@ const TARGET_CGU_SIZE: usize = 2000;
 impl<'tcx> Partitioner<'tcx> for DebugPartioning {
     fn place_root_mono_items(
         &mut self,
-        tcx: TyCtxt<'tcx>,
+        cx: &PartitioningCx<'_, 'tcx>,
         mono_items: &mut dyn Iterator<Item = MonoItem<'tcx>>,
     ) -> super::PreInliningPartitioning<'tcx> {
         let mut roots = FxHashSet::default();
@@ -24,7 +23,7 @@ impl<'tcx> Partitioner<'tcx> for DebugPartioning {
         codegen_units.push(CodegenUnit::new(Symbol::intern("cgu_0")));
 
         for mono_item in mono_items {
-            match mono_item.instantiation_mode(tcx) {
+            match mono_item.instantiation_mode(cx.tcx) {
                 InstantiationMode::GloballyShared { .. } => {},
                 InstantiationMode::LocalCopy => continue,
             }
@@ -34,10 +33,10 @@ impl<'tcx> Partitioner<'tcx> for DebugPartioning {
                 estimated_size = 0;
             }
 
-            estimated_size += mono_item.size_estimate(tcx);
+            estimated_size += mono_item.size_estimate(cx.tcx);
 
             let mut can_be_internalized = true;
-            let (linkage, visibility) = mono_item_linkage_and_visibility(tcx, &mono_item, &mut can_be_internalized, false);
+            let (linkage, visibility) = mono_item_linkage_and_visibility(cx.tcx, &mono_item, &mut can_be_internalized, false);
             if visibility == Visibility::Hidden && can_be_internalized {
                 internalization_candidates.insert(mono_item);
             }
@@ -56,18 +55,17 @@ impl<'tcx> Partitioner<'tcx> for DebugPartioning {
 
     fn merge_codegen_units(
         &mut self,
-        tcx: TyCtxt<'tcx>,
+        cx: &PartitioningCx<'_, 'tcx>,
         initial_partitioning: &mut super::PreInliningPartitioning<'tcx>,
-        target_cgu_count: usize,
     ) {
         // TODO: split big CGUs?
-        merging::merge_codegen_units(tcx, initial_partitioning, target_cgu_count);
+        merging::merge_codegen_units(cx.tcx, initial_partitioning, cx.target_cgu_count);
     }
 
     fn place_inlined_mono_items(
         &mut self,
+        cx: &PartitioningCx<'_, 'tcx>,
         initial_partitioning: super::PreInliningPartitioning<'tcx>,
-        inlining_map: &crate::monomorphize::collector::InliningMap<'tcx>,
     ) -> super::PostInliningPartitioning<'tcx> {
         let mut new_partitioning = Vec::new();
         let mut mono_item_placements = FxHashMap::default();
@@ -84,7 +82,7 @@ impl<'tcx> Partitioner<'tcx> for DebugPartioning {
             // Collect all items that need to be available in this codegen unit.
             let mut reachable = FxHashSet::default();
             for root in old_codegen_unit.items().keys() {
-                follow_inlining(*root, inlining_map, &mut reachable);
+                follow_inlining(*root, cx.inlining_map, &mut reachable);
             }
 
             let mut new_codegen_unit = CodegenUnit::new(old_codegen_unit.name());
@@ -158,9 +156,8 @@ impl<'tcx> Partitioner<'tcx> for DebugPartioning {
 
     fn internalize_symbols(
         &mut self,
-        _tcx: TyCtxt<'tcx>,
+        cx: &PartitioningCx<'_, 'tcx>,
         partitioning: &mut super::PostInliningPartitioning<'tcx>,
-        inlining_map: &crate::monomorphize::collector::InliningMap<'tcx>,
     ) {
         // TODO: It might be good to track how many duplicated symbols we internalize
         // since that means we have the same code in multiple cgus which hurts compile time.
@@ -181,7 +178,7 @@ impl<'tcx> Partitioner<'tcx> for DebugPartioning {
         // Build a map from every monomorphization to all the monomorphizations that
         // reference it.
         let mut accessor_map: FxHashMap<MonoItem<'tcx>, Vec<MonoItem<'tcx>>> = Default::default();
-        inlining_map.iter_accesses(|accessor, accessees| {
+        cx.inlining_map.iter_accesses(|accessor, accessees| {
             for accessee in accessees {
                 accessor_map.entry(*accessee).or_default().push(accessor);
             }
