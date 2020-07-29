@@ -1,11 +1,11 @@
 use std::cmp;
 
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_middle::mir::mono::{CodegenUnit, CodegenUnitNameBuilder};
+use rustc_middle::mir::mono::{CodegenUnit, CodegenUnitNameBuilder, MonoItem};
 use rustc_span::symbol::{Symbol, SymbolStr};
 
-use crate::monomorphize::partitioning::PreInliningPartitioning;
+use crate::monomorphize::{collector::InliningMap, partitioning::PreInliningPartitioning};
 use super::PartitioningCx;
 
 pub fn merge_codegen_units<'tcx>(
@@ -29,11 +29,40 @@ pub fn merge_codegen_units<'tcx>(
     // This map keeps track of what got merged into what.
     let mut cgu_contents: FxHashMap<Symbol, Vec<SymbolStr>> =
         codegen_units.iter().map(|cgu| (cgu.name(), vec![cgu.name().as_str()])).collect();
+    
+    fn follow_inlining<'tcx>(
+        mono_item: MonoItem<'tcx>,
+        inlining_map: &InliningMap<'tcx>,
+        visited: &mut FxHashSet<MonoItem<'tcx>>,
+    ) {
+        if !visited.insert(mono_item) {
+            return;
+        }
+
+        inlining_map.with_inlining_candidates(mono_item, |target| {
+            follow_inlining(target, inlining_map, visited);
+        });
+    }
+
+    let get_inlined_cgu_size = |cgu: &CodegenUnit<'tcx>| {
+        // Calculate the size of this item based on the total size of all the MonoItems it will
+        // bring into this cgu.
+        let mut dependent_mono_items = FxHashSet::default();
+
+        for (mono_item, _) in cgu.items() {
+            follow_inlining(*mono_item, cx.inlining_map, &mut dependent_mono_items);
+        }
+
+        let total_cost: usize = 
+            dependent_mono_items.into_iter().map(|item| item.size_estimate(cx.tcx)).sum();
+        
+        total_cost
+    };
 
     // Merge the two smallest codegen units until the target size is reached.
     while codegen_units.len() > cx.target_cgu_count {
         // Sort small cgus to the back
-        codegen_units.sort_by_cached_key(|cgu| cmp::Reverse(cgu.size_estimate()));
+        codegen_units.sort_by_cached_key(|cgu| cmp::Reverse(get_inlined_cgu_size(cgu)));
         let mut smallest = codegen_units.pop().unwrap();
         let second_smallest = codegen_units.last_mut().unwrap();
 
