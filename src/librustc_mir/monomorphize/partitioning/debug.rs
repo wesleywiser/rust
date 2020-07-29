@@ -33,7 +33,16 @@ impl<'tcx> Partitioner<'tcx> for DebugPartioning {
                 estimated_size = 0;
             }
 
-            estimated_size += mono_item.size_estimate(cx.tcx);
+            // Calculate the size of this item based on the total size of all the MonoItems it will
+            // bring into this cgu.
+            let mut dependent_mono_items = FxHashSet::default();
+
+            follow_inlining(mono_item, cx.inlining_map, &mut dependent_mono_items);
+
+            let total_cost: usize = 
+                dependent_mono_items.into_iter().map(|item| item.size_estimate(cx.tcx)).sum();
+
+            estimated_size += total_cost;
 
             let mut can_be_internalized = true;
             let (linkage, visibility) = mono_item_linkage_and_visibility(cx.tcx, &mono_item, &mut can_be_internalized, false);
@@ -44,6 +53,20 @@ impl<'tcx> Partitioner<'tcx> for DebugPartioning {
             let cgu = codegen_units.last_mut().expect("there must be at least one cgu");
             cgu.items_mut().insert(mono_item, (linkage, visibility));
             roots.insert(mono_item);
+
+            fn follow_inlining<'tcx>(
+                mono_item: MonoItem<'tcx>,
+                inlining_map: &InliningMap<'tcx>,
+                visited: &mut FxHashSet<MonoItem<'tcx>>,
+            ) {
+                if !visited.insert(mono_item) {
+                    return;
+                }
+
+                inlining_map.with_inlining_candidates(mono_item, |target| {
+                    follow_inlining(target, inlining_map, visited);
+                });
+            }
         }
 
         super::PreInliningPartitioning {
@@ -59,7 +82,7 @@ impl<'tcx> Partitioner<'tcx> for DebugPartioning {
         initial_partitioning: &mut super::PreInliningPartitioning<'tcx>,
     ) {
         // TODO: split big CGUs?
-        merging::merge_codegen_units(cx.tcx, initial_partitioning, cx.target_cgu_count);
+        merging::merge_codegen_units(cx, initial_partitioning);
     }
 
     fn place_inlined_mono_items(
