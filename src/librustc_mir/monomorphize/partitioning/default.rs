@@ -101,7 +101,7 @@ impl<'tcx> Partitioner<'tcx> for DefaultPartitioning {
         cx: &PartitioningCx<'_, 'tcx>,
         initial_partitioning: &mut PreInliningPartitioning<'tcx>,
     ) {
-        merging::merge_codegen_units(cx.tcx, initial_partitioning, cx.target_cgu_count);
+        merging::merge_codegen_units(cx, initial_partitioning);
     }
 
     fn place_inlined_mono_items(

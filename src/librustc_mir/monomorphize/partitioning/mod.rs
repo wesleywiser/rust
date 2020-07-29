@@ -108,7 +108,7 @@ use rustc_span::symbol::Symbol;
 use crate::monomorphize::collector::InliningMap;
 use crate::monomorphize::collector::{self, MonoItemCollectionMode};
 
-struct PartitioningCx<'a, 'tcx> {
+pub struct PartitioningCx<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     target_cgu_count: usize,
     inlining_map: &'a InliningMap<'tcx>,
