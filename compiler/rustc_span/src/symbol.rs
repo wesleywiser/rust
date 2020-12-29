@@ -707,6 +707,7 @@ symbols! {
         minnumf32,
         minnumf64,
         mips_target_feature,
+        mir_shim,
         misc,
         module,
         module_path,

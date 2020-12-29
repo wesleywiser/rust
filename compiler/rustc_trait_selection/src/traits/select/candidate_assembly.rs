@@ -513,6 +513,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             |impl_def_id| {
                 self.infcx.probe(|_| {
                     if let Ok(_substs) = self.match_impl(impl_def_id, obligation) {
+                        debug!("pushing {:?}", impl_def_id);
                         candidates.vec.push(ImplCandidate(impl_def_id));
                     }
                 });

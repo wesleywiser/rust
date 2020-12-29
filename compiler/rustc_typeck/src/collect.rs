@@ -2539,6 +2539,8 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, id: DefId) -> CodegenFnAttrs {
             }
         } else if tcx.sess.check_name(attr, sym::rustc_allocator_nounwind) {
             codegen_fn_attrs.flags |= CodegenFnAttrFlags::RUSTC_ALLOCATOR_NOUNWIND;
+        } else if tcx.sess.check_name(attr, sym::mir_shim) {
+            codegen_fn_attrs.flags |= CodegenFnAttrFlags::RUSTC_MIR_SHIM;
         } else if tcx.sess.check_name(attr, sym::naked) {
             codegen_fn_attrs.flags |= CodegenFnAttrFlags::NAKED;
         } else if tcx.sess.check_name(attr, sym::no_mangle) {

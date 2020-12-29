@@ -66,6 +66,7 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
         }
         ty::InstanceDef::DropGlue(def_id, ty) => build_drop_shim(tcx, def_id, ty),
         ty::InstanceDef::CloneShim(def_id, ty) => build_clone_shim(tcx, def_id, ty),
+        ty::InstanceDef::PartialOrdShim(def_id, ty) => build_partial_ord_shim(tcx, def_id, ty),
         ty::InstanceDef::Virtual(..) => {
             bug!("InstanceDef::Virtual ({:?}) is for direct calls only", instance)
         }
@@ -644,6 +645,16 @@ impl CloneShimBuilder<'tcx> {
 
         self.block(vec![], TerminatorKind::Return, false);
     }
+}
+
+fn build_partial_ord_shim<'tcx>(_tcx: TyCtxt<'tcx>, _def_id: DefId, self_ty: Ty<'tcx>) -> Body<'tcx> {
+    if let ty::AdtDef(adt) = self_ty.kind() {
+        if adt.is_struct() {
+            
+        }
+    }
+
+    panic!("build_partial_ord_shim: TODO");
 }
 
 /// Builds a "call" shim for `instance`. The shim calls the function specified by `call_kind`,

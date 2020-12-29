@@ -86,6 +86,7 @@ bitflags! {
         /// #[cmse_nonsecure_entry]: with a TrustZone-M extension, declare a
         /// function as an entry function from Non-Secure code.
         const CMSE_NONSECURE_ENTRY      = 1 << 14;
+        const RUSTC_MIR_SHIM            = 1 << 15;
     }
 }
 

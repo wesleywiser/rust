@@ -20,7 +20,8 @@ pub fn expand_deriving_partial_ord(
     macro_rules! md {
         ($name:expr, $op:expr, $equal:expr) => {{
             let inline = cx.meta_word(span, sym::inline);
-            let attrs = vec![cx.attribute(inline)];
+            let mir_shim = cx.meta_word(span, sym::mir_shim);
+            let attrs = vec![cx.attribute(inline), cx.attribute(mir_shim)];
             MethodDef {
                 name: $name,
                 generics: Bounds::empty(),
@@ -46,7 +47,8 @@ pub fn expand_deriving_partial_ord(
     ));
 
     let inline = cx.meta_word(span, sym::inline);
-    let attrs = vec![cx.attribute(inline)];
+    let mir_shim = cx.meta_word(span, sym::mir_shim);
+    let attrs = vec![cx.attribute(inline), cx.attribute(mir_shim)];
 
     let partial_cmp_def = MethodDef {
         name: sym::partial_cmp,

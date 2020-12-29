@@ -1,6 +1,7 @@
 use rustc_errors::ErrorReported;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_infer::infer::TyCtxtInferExt;
+use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::ty::subst::SubstsRef;
 use rustc_middle::ty::{self, Instance, TyCtxt, TypeFoldable};
 use rustc_span::{sym, DUMMY_SP};
@@ -116,6 +117,8 @@ fn resolve_associated_item<'tcx>(
     let trait_ref = ty::TraitRef::from_method(tcx, trait_id, rcvr_substs);
     let vtbl = tcx.codegen_fulfill_obligation((param_env, ty::Binder::bind(trait_ref)))?;
 
+    trace!("resolve_associated_item: vtbl={:?}", vtbl);
+
     // Now that we know which impl is being used, we can dispatch to
     // the actual function:
     Ok(match vtbl {
@@ -214,7 +217,18 @@ fn resolve_associated_item<'tcx>(
                 }
             }
 
-            Some(ty::Instance::new(leaf_def.item.def_id, substs))
+            let attrs = tcx.codegen_fn_attrs(leaf_def.item.def_id);
+            debug!("attrs = {:?}", attrs.flags);
+
+            if attrs.flags.contains(CodegenFnAttrFlags::RUSTC_MIR_SHIM) && std::env::var("DEW_IT").is_ok() {
+                // TODO validate this is actually a partialord method
+                Some(ty::Instance {
+                    def: ty::InstanceDef::PartialOrdShim(trait_item.def_id, trait_ref.self_ty()),
+                    substs,
+                })
+            } else {
+                Some(ty::Instance::new(leaf_def.item.def_id, substs))
+            }
         }
         traits::ImplSource::Generator(generator_data) => Some(Instance {
             def: ty::InstanceDef::Item(ty::WithOptConstParam::unknown(
@@ -267,6 +281,14 @@ fn resolve_associated_item<'tcx>(
                     let substs = tcx.erase_regions(rcvr_substs);
                     Some(ty::Instance::new(def_id, substs))
                 }
+            } else if Some(trait_ref.def_id) == tcx.lang_items().partial_ord_trait() {
+                //let name = tcx.item_name(def_id);
+                let self_ty = trait_ref.self_ty();
+
+                Some(ty::Instance {
+                    def: ty::InstanceDef::PartialOrdShim(def_id, self_ty),
+                    substs: rcvr_substs,
+                })                
             } else {
                 None
             }

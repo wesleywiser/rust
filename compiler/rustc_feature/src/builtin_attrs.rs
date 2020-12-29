@@ -449,6 +449,7 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         template!(NameValueStr: "transparent|semitransparent|opaque"),
         "used internally for testing macro hygiene",
     ),
+    ungated!(mir_shim, AssumedUsed, template!(Word)),
 
     // ==========================================================================
     // Internal attributes, Diagnostics related:
