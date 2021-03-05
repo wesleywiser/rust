@@ -31,30 +31,40 @@ pub fn merge_codegen_units<'tcx>(
     let mut cgu_contents: FxHashMap<Symbol, Vec<SymbolStr>> =
         codegen_units.iter().map(|cgu| (cgu.name(), vec![cgu.name().as_str()])).collect();
 
-    // Merge the two smallest codegen units until the target size is reached.
-    while codegen_units.len() > cx.target_cgu_count {
-        // Sort small cgus to the back
-        codegen_units.sort_by_cached_key(|cgu| cmp::Reverse(cgu.size_estimate()));
-        let mut smallest = codegen_units.pop().unwrap();
-        let second_smallest = codegen_units.last_mut().unwrap();
+    // Sort smallest to largest
+    codegen_units.sort_by_cached_key(|cgu| cgu.size_estimate());
 
-        // Move the mono-items from `smallest` to `second_smallest`
-        second_smallest.modify_size_estimate(smallest.size_estimate());
-        for (k, v) in smallest.items_mut().drain() {
-            second_smallest.items_mut().insert(k, v);
+    // Split the largest `cx.target_cgu_count` cgus into the result vector
+    let mut merged_cgus = if cx.target_cgu_count > codegen_units.len() {
+        std::mem::take(codegen_units)
+    } else {
+        codegen_units.split_off(codegen_units.len() - cx.target_cgu_count)
+    };
+
+    // Merge codegen units together greedily until the target size is reached.
+    while codegen_units.len() > 0 {
+        // Sort small cgus to the back
+        merged_cgus.sort_by_cached_key(|cgu| cmp::Reverse(cgu.size_estimate()));
+        let mut largest = codegen_units.pop().unwrap();
+
+        // Find the smallest cgu in the merged set
+        let smallest_merged = merged_cgus.last_mut().unwrap();
+
+        // Move the mono-items from `largest` to `smallest_merged`
+        smallest_merged.modify_size_estimate(largest.size_estimate());
+        for (k, v) in largest.items_mut().drain() {
+            smallest_merged.items_mut().insert(k, v);
         }
 
-        // Record that `second_smallest` now contains all the stuff that was in
-        // `smallest` before.
-        let mut consumed_cgu_names = cgu_contents.remove(&smallest.name()).unwrap();
-        cgu_contents.get_mut(&second_smallest.name()).unwrap().extend(consumed_cgu_names.drain(..));
+        // Record that `smallest_merged` now contains all the stuff that was in
+        // `largest` before.
+        let mut consumed_cgu_names = cgu_contents.remove(&largest.name()).unwrap();
+        cgu_contents.get_mut(&smallest_merged.name()).unwrap().extend(consumed_cgu_names.drain(..));
 
-        debug!(
-            "CodegenUnit {} merged into CodegenUnit {}",
-            smallest.name(),
-            second_smallest.name()
-        );
+        debug!("CodegenUnit {} merged into CodegenUnit {}", largest.name(), smallest_merged.name());
     }
+
+    *codegen_units = merged_cgus;
 
     let cgu_name_builder = &mut CodegenUnitNameBuilder::new(cx.tcx);
 
