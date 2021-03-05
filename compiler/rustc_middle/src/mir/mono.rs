@@ -47,6 +47,14 @@ pub enum MonoItem<'tcx> {
 }
 
 impl<'tcx> MonoItem<'tcx> {
+    pub fn def_id(&self) -> DefId {
+        match self {
+            MonoItem::Fn(instance) => instance.def_id(),
+            MonoItem::Static(def_id) => *def_id,
+            MonoItem::GlobalAsm(item) => item.def_id.to_def_id(),
+        }
+    }
+
     pub fn size_estimate(&self, tcx: TyCtxt<'tcx>) -> usize {
         match *self {
             MonoItem::Fn(instance) => {
@@ -279,7 +287,9 @@ impl<'tcx> CodegenUnit<'tcx> {
         human_readable_name.hash(&mut hasher);
         let hash: u128 = hasher.finish();
         let hash = hash & ((1u128 << 80) - 1);
-        base_n::encode(hash, base_n::CASE_INSENSITIVE)
+        let mangled = base_n::encode(hash, base_n::CASE_INSENSITIVE);
+        eprintln!("mangling cgu name {} as {}", human_readable_name, mangled);
+        mangled
     }
 
     pub fn estimate_size(&mut self, tcx: TyCtxt<'tcx>) {

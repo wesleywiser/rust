@@ -1,4 +1,5 @@
 use std::cmp;
+use std::fmt::Write;
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::LOCAL_CRATE;
@@ -81,8 +82,20 @@ pub fn merge_codegen_units<'tcx>(
             })
             .collect();
 
+        let mut stats = String::with_capacity(if cx.tcx.sess.opts.debugging_opts.cgu_merge_stats {
+            1024
+        } else {
+            0
+        });
+
         for cgu in codegen_units.iter_mut() {
             if let Some(new_cgu_name) = new_cgu_names.get(&cgu.name()) {
+                if cx.tcx.sess.opts.debugging_opts.cgu_merge_stats {
+                    cgu.estimate_size(cx.tcx);
+                    writeln!(stats, "CGU {} - size: {}", new_cgu_name, cgu.size_estimate())
+                        .expect("failed to write to String!");
+                }
+
                 if cx.tcx.sess.opts.debugging_opts.human_readable_cgu_names {
                     cgu.set_name(Symbol::intern(&new_cgu_name));
                 } else {
@@ -92,7 +105,20 @@ pub fn merge_codegen_units<'tcx>(
                     let new_cgu_name = CodegenUnit::mangle_name(&new_cgu_name);
                     cgu.set_name(Symbol::intern(&new_cgu_name));
                 }
+            } else {
+                if cx.tcx.sess.opts.debugging_opts.cgu_merge_stats {
+                    cgu.estimate_size(cx.tcx);
+                    writeln!(stats, "CGU {} - size: {}", cgu.name(), cgu.size_estimate())
+                        .expect("failed to write to String!");
+                }
             }
+        }
+
+        if cx.tcx.sess.opts.debugging_opts.cgu_merge_stats {
+            let crate_name = cx.tcx.sess.opts.crate_name.as_deref().unwrap_or("unknown crate");
+
+            std::fs::write(format!("{} cgu merging stats.txt", crate_name), stats)
+                .expect("failed to write to cgu merging stats file");
         }
     } else {
         // If we are compiling non-incrementally we just generate simple CGU
