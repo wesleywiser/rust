@@ -2180,7 +2180,7 @@ fn trimmed_def_paths(tcx: TyCtxt<'_>, crate_num: CrateNum) -> FxHashMap<DefId, S
     if let TrimmedDefPaths::GoodPath = tcx.sess.opts.trimmed_def_paths {
         // For good paths causing this bug, the `rustc_middle::ty::print::with_no_trimmed_paths`
         // wrapper can be used to suppress this query, in exchange for full paths being formatted.
-        //tcx.sess.delay_good_path_bug("trimmed_def_paths constructed");
+        tcx.sess.delay_good_path_bug("trimmed_def_paths constructed");
     }
 
     let unique_symbols_rev: &mut FxHashMap<(Namespace, Symbol), Option<DefId>> =

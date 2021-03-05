@@ -178,20 +178,20 @@ pub fn partition<'tcx>(
 
     initial_partitioning.codegen_units.iter_mut().for_each(|cgu| cgu.estimate_size(tcx));
 
-    debug_dump(tcx, "INITIAL PARTITIONING", initial_partitioning.codegen_units.iter());
+    debug_dump(tcx, "INITIAL PARTITIONING:", initial_partitioning.codegen_units.iter());
 
     // Split until we have more evenly sized codegen units
     {
         let _prof_timer = tcx.prof.generic_activity("cgu_partitioning_split_cgus");
         partitioner.split_codegen_units(cx, &mut initial_partitioning);
-        debug_dump(tcx, "POST SPLITTING", initial_partitioning.codegen_units.iter());
+        debug_dump(tcx, "POST SPLITTING: ", initial_partitioning.codegen_units.iter());
     }
 
     // Merge until we have at most `max_cgu_count` codegen units.
     {
         let _prof_timer = tcx.prof.generic_activity("cgu_partitioning_merge_cgus");
         partitioner.merge_codegen_units(cx, &mut initial_partitioning);
-        debug_dump(tcx, "POST MERGING", initial_partitioning.codegen_units.iter());
+        debug_dump(tcx, "POST MERGING:", initial_partitioning.codegen_units.iter());
     }
 
     // In the next step, we use the inlining map to determine which additional
@@ -205,7 +205,7 @@ pub fn partition<'tcx>(
 
     post_inlining.codegen_units.iter_mut().for_each(|cgu| cgu.estimate_size(tcx));
 
-    debug_dump(tcx, "POST INLINING", post_inlining.codegen_units.iter());
+    debug_dump(tcx, "POST INLINING:", post_inlining.codegen_units.iter());
 
     // Next we try to make as many symbols "internal" as possible, so LLVM has
     // more freedom to optimize.
@@ -261,10 +261,7 @@ where
             let _ =
                 writeln!(s, "CodegenUnit {} estimated size {} :", cgu.name(), cgu.size_estimate());
 
-            let mut items: Vec<_> = cgu.items().iter().collect();
-            items.sort_by_cached_key(|&(item, _)| item.def_id());
-
-            for (mono_item, linkage) in items {
+            for (mono_item, linkage) in cgu.items() {
                 let symbol_name = mono_item.symbol_name(tcx).name;
                 let symbol_hash_start = symbol_name.rfind('h');
                 let symbol_hash = symbol_hash_start.map_or("<no hash>", |i| &symbol_name[i..]);
@@ -285,11 +282,7 @@ where
         std::mem::take(s)
     };
 
-    let file_name =
-        format!("{} {}.txt", tcx.sess.opts.crate_name.as_deref().unwrap_or("unknown crate"), label);
-
-    //debug!("{}", dump());
-    std::fs::write(file_name, dump()).expect("couldn't write file");
+    debug!("{}", dump());
 }
 
 #[inline(never)] // give this a place in the profiler
