@@ -121,6 +121,12 @@ trait Partitioner<'tcx> {
         mono_items: &mut dyn Iterator<Item = MonoItem<'tcx>>,
     ) -> PreInliningPartitioning<'tcx>;
 
+    fn split_codegen_units(
+        &mut self,
+        cx: &PartitioningCx<'_, 'tcx>,
+        initial_partitioning: &mut PreInliningPartitioning<'tcx>
+    );
+
     fn merge_codegen_units(
         &mut self,
         cx: &PartitioningCx<'_, 'tcx>,
@@ -173,6 +179,13 @@ pub fn partition<'tcx>(
     initial_partitioning.codegen_units.iter_mut().for_each(|cgu| cgu.estimate_size(tcx));
 
     debug_dump(tcx, "INITIAL PARTITIONING:", initial_partitioning.codegen_units.iter());
+
+    // Split until we have more evenly sized codegen units
+    {
+        let _prof_timer = tcx.prof.generic_activity("cgu_partitioning_split_cgus");
+        partitioner.split_codegen_units(cx, &mut initial_partitioning);
+        debug_dump(tcx, "POST SPLITTING: ", initial_partitioning.codegen_units.iter());
+    }
 
     // Merge until we have at most `max_cgu_count` codegen units.
     {

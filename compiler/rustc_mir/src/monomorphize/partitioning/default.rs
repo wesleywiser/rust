@@ -98,6 +98,76 @@ impl<'tcx> Partitioner<'tcx> for DefaultPartitioning {
         }
     }
 
+    fn split_codegen_units(
+        &mut self,
+        cx: &PartitioningCx<'_, 'tcx>,
+        initial_partitioning: &mut PreInliningPartitioning<'tcx>,
+    ) {
+        let codegen_units = &mut initial_partitioning.codegen_units;
+        
+        let mut codegen_unit_names: FxHashSet<Symbol> = codegen_units.iter().map(|cgu| cgu.name()).collect();
+
+        // Early abort
+        if codegen_units.len() == 0 || codegen_units.len() <= cx.target_cgu_count {
+            return;
+        }
+
+        codegen_units.sort_by_cached_key(|cgu| cgu.name().as_str());
+
+        codegen_units.sort_by_cached_key(|cgu| cgu.size_estimate());
+
+        // get the middle cgu by size
+        let max_target_size = codegen_units[codegen_units.len() / 2].size_estimate() * 10;
+
+        let cgu_can_be_split = |cgu: &CodegenUnit<'_>| cgu.size_estimate() > max_target_size && cgu.items().len() > 1;
+
+        let mut i = 0;
+
+        while codegen_units.iter().any(cgu_can_be_split) {
+            let mut new_cgus = Vec::new();
+
+            for cgu in codegen_units.iter_mut().rev() {
+                if cgu.size_estimate() <= max_target_size {
+                    break;
+                }
+
+                if !cgu_can_be_split(cgu) {
+                    continue;
+                }
+
+                let cgu_name = Symbol::intern(&format!("{}{}{}", cgu.name().as_str(), "-split-", i));
+                i += 1;
+
+                if !codegen_unit_names.insert(cgu_name) {
+                    bug!("generated a cgu name that already existed: {}", cgu_name);
+                }
+
+                let mut split_cgu = CodegenUnit::new(cgu_name);
+
+                let mut count = cgu.items().len() / 2;
+                while count != 0 {
+                    count -= 1;
+
+                    let key = *cgu.items().keys().next().unwrap();
+                    let value = cgu.items_mut().remove(&key).unwrap();
+                    split_cgu.items_mut().insert(key, value);
+                }
+
+                cgu.estimate_size(cx.tcx);
+                split_cgu.estimate_size(cx.tcx);
+
+                assert!(cgu.items().len() > 0);
+                assert!(split_cgu.items().len() > 0);
+
+                new_cgus.push(split_cgu);
+            }
+
+            codegen_units.extend(new_cgus.drain(..));
+
+            codegen_units.sort_by_cached_key(|cgu| cgu.size_estimate());
+        }
+    }
+
     fn merge_codegen_units(
         &mut self,
         cx: &PartitioningCx<'_, 'tcx>,
