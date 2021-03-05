@@ -4,7 +4,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, CRATE_DEF_INDEX, LOCAL_CRATE};
 use rustc_hir::definitions::DefPathDataName;
-use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+use rustc_middle::{middle::codegen_fn_attrs::CodegenFnAttrFlags, ty::{TypeFlags, walk::TypeWalker}};
 use rustc_middle::middle::exported_symbols::SymbolExportLevel;
 use rustc_middle::mir::mono::{CodegenUnit, CodegenUnitNameBuilder, Linkage, Visibility};
 use rustc_middle::mir::mono::{InstantiationMode, MonoItem};
@@ -48,7 +48,11 @@ impl<'tcx> Partitioner<'tcx> for DefaultPartitioning {
                 InstantiationMode::LocalCopy => continue,
             }
 
+            info!("mono_item = {:?}", mono_item);
             let characteristic_def_id = characteristic_def_id_of_mono_item(cx.tcx, mono_item);
+            info!("characteristic_def_id = {:?}", characteristic_def_id);
+            let extra_def_id = extra_def_id_of_mono_item(cx.tcx, mono_item);
+            info!("extra_def_id = {:?}", extra_def_id);
             let is_volatile = is_incremental_build && mono_item.is_generic_fn();
 
             let codegen_unit_name = match characteristic_def_id {
@@ -56,6 +60,7 @@ impl<'tcx> Partitioner<'tcx> for DefaultPartitioning {
                     cx.tcx,
                     cgu_name_builder,
                     def_id,
+                    extra_def_id,
                     is_volatile,
                     cgu_name_cache,
                 ),
@@ -263,6 +268,100 @@ impl<'tcx> Partitioner<'tcx> for DefaultPartitioning {
     }
 }
 
+fn extra_def_id_of_mono_item<'tcx>(
+    _tcx: TyCtxt<'tcx>,
+    mono_item: MonoItem<'tcx>,
+) -> Option<DefId> {
+    match mono_item {
+        MonoItem::Fn(instance) => {
+            let def_id = match instance.def {
+                ty::InstanceDef::Item(def) => def.did,
+                InstanceDef::Intrinsic(_)
+                | InstanceDef::VtableShim(_)
+                | InstanceDef::ReifyShim(_)
+                | InstanceDef::FnPtrShim(_, _)
+                | InstanceDef::Virtual(_, _)
+                | InstanceDef::ClosureOnceShim { .. }
+                | InstanceDef::DropGlue(_, _)
+                | InstanceDef::CloneShim(_, _) => return None,
+            };
+            
+            // If this is a local function, then we don't need an extra DefId for it.
+            if def_id.is_local() {
+                return None;
+            }
+
+            // If the function is generic, then check if any of its type parameters
+            // are local and return the first one that is.
+            instance.substs.types().find_map(|ty| {
+                for arg in ty.walk() {
+                    match arg.unpack() {
+                        ty::substs::GenericArgKind::Type(ty) => {
+                            if !ty.flags().contains(TypeFlags::NEEDS_SUBST) {
+                                match ty.kind() {
+                                    ty::TyKind::Adt(adt, _) => return Some(adt.did),
+                                    ty::TyKind::Tuple(substs) => {
+                                        
+                                    }
+                                }
+                            }
+                        },
+                        ty::subst::GenericArgKind::Lifetime(_)
+                        | ty::subst::GenericArgKind::Const(_) => {}
+                    }
+                }
+
+                None
+            })
+
+            
+
+            // instance.substs.iter().find_map(|arg| match arg.unpack() {
+            //     ty::subst::GenericArgKind::Type(ty) => {
+            //         match ty.kind() {
+            //             ty::TyKind::Adt(adt, _) => if adt.did.is_local() { Some(adt.did) } else { None },
+            //             ty::TyKind::Tuple(substs) => {
+
+            //             }
+            //             ty::TyKind::Array(_, _)
+            //             | ty::TyKind::Slice(_)
+            //             | ty::TyKind::Ref(_, _, _)
+            //             | ty::TyKind::FnDef(_, _)
+            //             | ty::TyKind::FnPtr(_)
+            //             | ty::TyKind::Dynamic(_, _)
+            //             | ty::TyKind::Closure(_, _)
+            //             | ty::TyKind::Generator(_, _, _)
+            //             | ty::TyKind::GeneratorWitness(_)
+            //             | ty::TyKind::Never
+            //             | ty::TyKind::Projection(_)
+            //             | ty::TyKind::Opaque(_, _)
+            //             | ty::TyKind::Param(_)
+            //             | ty::TyKind::Bound(_, _)
+            //             | ty::TyKind::Placeholder(_)
+            //             | ty::TyKind::Infer(_)
+            //             | ty::TyKind::Error(_)
+            //             | ty::TyKind::Bool
+            //             | ty::TyKind::Char
+            //             | ty::TyKind::Int(_)
+            //             | ty::TyKind::Uint(_)
+            //             | ty::TyKind::Float(_)
+            //             | ty::TyKind::Foreign(_)
+            //             | ty::TyKind::Str
+            //             | ty::TyKind::RawPtr(_) => None
+            //         }
+            //         //match ty.ty_adt_def() {
+            //         //    Some(adt) if adt.did.is_local() => Some(adt.did),
+            //         //    _ => None
+            //         //}
+            //     },
+            //     ty::subst::GenericArgKind::Lifetime(_)
+            //     | ty::subst::GenericArgKind::Const(_) => None,
+            // })
+        },
+        MonoItem::GlobalAsm(_) | MonoItem::Static(_) => None,
+    }
+}
+
 fn characteristic_def_id_of_mono_item<'tcx>(
     tcx: TyCtxt<'tcx>,
     mono_item: MonoItem<'tcx>,
@@ -322,6 +421,7 @@ fn compute_codegen_unit_name(
     tcx: TyCtxt<'_>,
     name_builder: &mut CodegenUnitNameBuilder<'_>,
     def_id: DefId,
+    extra_def_id: Option<DefId>,
     volatile: bool,
     cache: &mut CguNameCache,
 ) -> Symbol {
@@ -352,13 +452,20 @@ fn compute_codegen_unit_name(
 
     let cgu_def_id = cgu_def_id.unwrap();
 
-    *cache.entry((cgu_def_id, volatile)).or_insert_with(|| {
+    *cache.entry((cgu_def_id, volatile, extra_def_id)).or_insert_with(|| {
         let def_path = tcx.def_path(cgu_def_id);
+        
+        let extra_def_path = extra_def_id.map(|def_id| tcx.def_path(def_id));
+        let extra_def_path_data = extra_def_path.map(|def_path| def_path.data).unwrap_or_default();
 
-        let components = def_path.data.iter().map(|part| match part.data.name() {
-            DefPathDataName::Named(name) => name,
-            DefPathDataName::Anon { .. } => unreachable!(),
-        });
+        let components = def_path
+            .data
+            .iter()
+            .chain(extra_def_path_data.iter())
+            .map(|part| match part.data.name() {
+                DefPathDataName::Named(name) => name,
+                DefPathDataName::Anon { namespace } => namespace, //{ .. } => unreachable!("extra_def_path = {:?}", extra_def_id),
+            });
 
         let volatile_suffix = volatile.then_some("volatile");
 
@@ -384,7 +491,7 @@ fn mono_item_linkage_and_visibility(
     (Linkage::External, vis)
 }
 
-type CguNameCache = FxHashMap<(DefId, bool), Symbol>;
+type CguNameCache = FxHashMap<(DefId, bool, Option<DefId>), Symbol>;
 
 fn mono_item_visibility(
     tcx: TyCtxt<'tcx>,
