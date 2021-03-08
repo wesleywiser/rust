@@ -498,15 +498,15 @@ impl Inliner<'tcx> {
 
         if let InlineAttr::Always = callee_attrs.inline {
             if self.tcx.sess.mir_opt_level() == 1 {
-                if cost <= 25 {
+                if cost <= 50 {
                     debug!(
-                        "INLINING {:?} because inline(always) and [cost={} <= threshold=25]",
+                        "INLINING {:?} because inline(always) and [cost={} <= threshold=50]",
                         callsite, cost
                     );
                     Ok(())
                 } else {
                     debug!(
-                        "NOT inlining {:?} because inline(always) but [cost={} > threshold=25]",
+                        "NOT inlining {:?} because inline(always) but [cost={} > threshold=50]",
                         callsite, cost
                     );
                     Err("cost above threshold")
