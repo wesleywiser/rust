@@ -707,7 +707,8 @@ impl BorrowKind {
 
 rustc_index::newtype_index! {
     pub struct Local {
-        derive [HashStable]
+        //derive [HashStable],
+        ENCODABLE = custom
         DEBUG_FORMAT = "_{}",
         const RETURN_PLACE = 0,
     }
@@ -716,6 +717,34 @@ rustc_index::newtype_index! {
 impl Atom for Local {
     fn index(self) -> usize {
         Idx::index(self)
+    }
+}
+
+impl<D: ::rustc_serialize::Decoder> ::rustc_serialize::Decodable<D> for Local {
+    fn decode(d: &mut D) -> Result<Self, D::Error> {
+        let leading_byte = d.read_u8()?;
+
+        if likely!(leading_byte < 255u8) {
+            Ok(Self::from_u32(leading_byte as u32))
+        } else {
+            d.read_u32().map(Self::from_u32)
+        }
+    }
+}
+impl<E: ::rustc_serialize::Encoder> ::rustc_serialize::Encodable<E> for Local {
+    fn encode(&self, e: &mut E) -> Result<(), E::Error> {
+        if likely!(self.private < 255u32) {
+            e.emit_u8(self.private as u8)
+        } else {
+            e.emit_u8(255u8)?;
+            e.emit_u32(self.private)
+        }
+    }
+}
+
+impl<CTX> rustc_data_structures::stable_hasher::HashStable<CTX> for Local {
+    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut rustc_data_structures::stable_hasher::StableHasher) {
+        self.private.hash_stable(hcx, hasher);
     }
 }
 
@@ -1152,7 +1181,8 @@ rustc_index::newtype_index! {
     /// [`CriticalCallEdges`]: ../../rustc_mir/transform/add_call_guards/enum.AddCallGuards.html#variant.CriticalCallEdges
     /// [guide-mir]: https://rustc-dev-guide.rust-lang.org/mir/
     pub struct BasicBlock {
-        derive [HashStable]
+        //derive [HashStable]
+        ENCODABLE = custom
         DEBUG_FORMAT = "bb{}",
         const START_BLOCK = 0,
     }
@@ -1161,6 +1191,34 @@ rustc_index::newtype_index! {
 impl BasicBlock {
     pub fn start_location(self) -> Location {
         Location { block: self, statement_index: 0 }
+    }
+}
+
+impl<D: ::rustc_serialize::Decoder> ::rustc_serialize::Decodable<D> for BasicBlock {
+    fn decode(d: &mut D) -> Result<Self, D::Error> {
+        let leading_byte = d.read_u8()?;
+
+        if likely!(leading_byte < 255u8) {
+            Ok(Self::from_u32(leading_byte as u32))
+        } else {
+            d.read_u32().map(Self::from_u32)
+        }
+    }
+}
+impl<E: ::rustc_serialize::Encoder> ::rustc_serialize::Encodable<E> for BasicBlock {
+    fn encode(&self, e: &mut E) -> Result<(), E::Error> {
+        if likely!(self.private < 255u32) {
+            e.emit_u8(self.private as u8)
+        } else {
+            e.emit_u8(255u8)?;
+            e.emit_u32(self.private)
+        }
+    }
+}
+
+impl<CTX> rustc_data_structures::stable_hasher::HashStable<CTX> for BasicBlock {
+    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut rustc_data_structures::stable_hasher::StableHasher) {
+        self.private.hash_stable(hcx, hasher);
     }
 }
 

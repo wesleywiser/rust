@@ -17,7 +17,7 @@ use rustc_hir::lang_items;
 use rustc_hir::{AnonConst, GenericParamKind};
 use rustc_index::bit_set::GrowableBitSet;
 use rustc_index::vec::Idx;
-use rustc_middle::{hir::map::Map, mir::{Local, visit}};
+use rustc_middle::{hir::map::Map, mir::{BasicBlock, BasicBlockData, Local, visit, visit::Visitor as MirVisitor}};
 use rustc_middle::middle::cstore::{EncodedMetadata, ForeignModule, LinkagePreference, NativeLib};
 use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::middle::exported_symbols::{
@@ -33,6 +33,7 @@ use rustc_span::hygiene::{ExpnDataEncodeMode, HygieneEncodeContext, MacroKind};
 use rustc_span::symbol::{sym, Ident, Symbol};
 use rustc_span::{self, ExternalSource, FileName, SourceFile, Span, SyntaxContext};
 use rustc_target::abi::VariantIdx;
+use std::fmt::Write;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -838,26 +839,63 @@ fn should_encode_mir(tcx: TyCtxt<'_>, def_id: LocalDefId) -> (bool, bool) {
 
 struct MirStatisticsVisitor {
     local_use_counts: IndexVec<Local, u64>,
+    basic_block_numbers: IndexVec<BasicBlock, u64>,
     enabled: bool,
 }
 
 impl MirStatisticsVisitor {
     fn new(enabled: bool) -> Self {
-        Self { local_use_counts: IndexVec::new(), enabled }
+        Self { 
+            local_use_counts: IndexVec::new(),
+            basic_block_numbers: IndexVec::new(),
+            enabled
+        }
     }
 
-    fn visit<'tcx>(&mut self, body: &rustc_middle::mir::Body<'tcx>) -> &rustc_middle::mir::Body<'tcx> {
-        visit::Visitor::visit_body(&mut self, self.visit_body(body));
+    fn visit<'a, 'tcx>(&mut self, body: &'a rustc_middle::mir::Body<'tcx>) -> &'a rustc_middle::mir::Body<'tcx> {
+        if self.enabled {
+            self.visit_body(body);
+        }
         body
+    }
+
+    fn dump_results<'tcx>(&self, tcx: TyCtxt<'tcx>) {
+        if self.enabled {
+            let crate_name = tcx.sess.opts.crate_name.as_deref().unwrap_or("unknown_crate");
+
+            let mut contents = String::with_capacity(1024);
+            contents.push_str("local,count\r");
+
+            for (local, count) in self.local_use_counts.iter_enumerated() {
+                writeln!(contents, "_{},{}", local.as_u32(), count).unwrap();
+            }
+
+            contents.push_str("\r\r\r\r\r\r\r");
+
+            contents.push_str("basic_block,count\r");
+            for (block, count) in self.basic_block_numbers.iter_enumerated() {
+                writeln!(contents, "bb{},{}", block.as_u32(), count).unwrap();
+            }
+
+            std::fs::write(
+                format!("{}_mir_stats.txt", crate_name), 
+                &contents
+            ).expect("failed to write MIR stats file");
+        }
     }
 }
 
 impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for MirStatisticsVisitor {
     fn visit_local(&mut self, local: &Local, _context: visit::PlaceContext, _location: mir::Location) {
-        if self.enabled {
-            self.local_use_counts.ensure_contains_elem(*local, || 0);
-            self.local_use_counts[*local] += 1;
-        }
+        self.local_use_counts.ensure_contains_elem(*local, || 0);
+        self.local_use_counts[*local] += 1;
+    }
+
+    fn visit_basic_block_data(&mut self, block:BasicBlock, data: &BasicBlockData< 'tcx>) {
+        self.basic_block_numbers.ensure_contains_elem(block, || 0);
+        self.basic_block_numbers[block] += 1;
+
+        self.super_basic_block_data(block, data);
     }
 }
 
@@ -1239,7 +1277,7 @@ impl EncodeContext<'a, 'tcx> {
         // Sort everything to ensure a stable order for diagnotics.
         keys_and_jobs.sort_by_key(|&(def_id, _, _)| def_id);
 
-        let mut mir_stats = MirStatisticsVisitor::new(self.tcx.sess.opts.debugging_opts.mir_statistics);
+        let mut mir_stats = MirStatisticsVisitor::new(true);
 
         for (def_id, encode_const, encode_opt) in keys_and_jobs.into_iter() {
             debug_assert!(encode_const || encode_opt);
@@ -1263,6 +1301,8 @@ impl EncodeContext<'a, 'tcx> {
                 record!(self.tables.unused_generic_params[def_id.to_def_id()] <- unused);
             }
         }
+
+        mir_stats.dump_results(self.tcx);
     }
 
     // Encodes the inherent implementations of a structure, enumeration, or trait.
