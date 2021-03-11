@@ -17,7 +17,7 @@ use rustc_hir::lang_items;
 use rustc_hir::{AnonConst, GenericParamKind};
 use rustc_index::bit_set::GrowableBitSet;
 use rustc_index::vec::Idx;
-use rustc_middle::hir::map::Map;
+use rustc_middle::{hir::map::Map, mir::{Local, visit}};
 use rustc_middle::middle::cstore::{EncodedMetadata, ForeignModule, LinkagePreference, NativeLib};
 use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::middle::exported_symbols::{
@@ -836,6 +836,31 @@ fn should_encode_mir(tcx: TyCtxt<'_>, def_id: LocalDefId) -> (bool, bool) {
     }
 }
 
+struct MirStatisticsVisitor {
+    local_use_counts: IndexVec<Local, u64>,
+    enabled: bool,
+}
+
+impl MirStatisticsVisitor {
+    fn new(enabled: bool) -> Self {
+        Self { local_use_counts: IndexVec::new(), enabled }
+    }
+
+    fn visit<'tcx>(&mut self, body: &rustc_middle::mir::Body<'tcx>) -> &rustc_middle::mir::Body<'tcx> {
+        visit::Visitor::visit_body(&mut self, self.visit_body(body));
+        body
+    }
+}
+
+impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for MirStatisticsVisitor {
+    fn visit_local(&mut self, local: &Local, _context: visit::PlaceContext, _location: mir::Location) {
+        if self.enabled {
+            self.local_use_counts.ensure_contains_elem(*local, || 0);
+            self.local_use_counts[*local] += 1;
+        }
+    }
+}
+
 impl EncodeContext<'a, 'tcx> {
     fn encode_def_ids(&mut self) {
         if self.is_proc_macro {
@@ -1213,15 +1238,18 @@ impl EncodeContext<'a, 'tcx> {
             .collect::<Vec<_>>();
         // Sort everything to ensure a stable order for diagnotics.
         keys_and_jobs.sort_by_key(|&(def_id, _, _)| def_id);
+
+        let mut mir_stats = MirStatisticsVisitor::new(self.tcx.sess.opts.debugging_opts.mir_statistics);
+
         for (def_id, encode_const, encode_opt) in keys_and_jobs.into_iter() {
             debug_assert!(encode_const || encode_opt);
 
             debug!("EntryBuilder::encode_mir({:?})", def_id);
             if encode_opt {
-                record!(self.tables.mir[def_id.to_def_id()] <- self.tcx.optimized_mir(def_id));
+                record!(self.tables.mir[def_id.to_def_id()] <- mir_stats.visit(self.tcx.optimized_mir(def_id)));
             }
             if encode_const {
-                record!(self.tables.mir_for_ctfe[def_id.to_def_id()] <- self.tcx.mir_for_ctfe(def_id));
+                record!(self.tables.mir_for_ctfe[def_id.to_def_id()] <- mir_stats.visit(self.tcx.mir_for_ctfe(def_id)));
 
                 let abstract_const = self.tcx.mir_abstract_const(def_id);
                 if let Ok(Some(abstract_const)) = abstract_const {
