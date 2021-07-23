@@ -103,8 +103,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let mut candidates =
             arm_candidates.iter_mut().map(|(_, candidate)| candidate).collect::<Vec<_>>();
 
+        let match_expr_start = span.shrink_to_lo().to(scrutinee.span);
+
         let fake_borrow_temps =
-            self.lower_match_tree(block, scrutinee_span, match_has_guard, &mut candidates);
+            self.lower_match_tree(block, scrutinee_span, match_expr_start, match_has_guard, &mut candidates);
 
         self.lower_match_arms(
             destination,
@@ -184,6 +186,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         &mut self,
         block: BasicBlock,
         scrutinee_span: Span,
+        match_start_span: Span,
         match_has_guard: bool,
         candidates: &mut [&mut Candidate<'pat, 'tcx>],
     ) -> Vec<(Place<'tcx>, Local)> {
@@ -196,7 +199,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
         // This will generate code to test scrutinee_place and
         // branch to the appropriate arm block
-        self.match_candidates(scrutinee_span, block, &mut otherwise, candidates, &mut fake_borrows);
+        self.match_candidates(match_start_span, block, &mut otherwise, candidates, &mut fake_borrows);
 
         if let Some(otherwise_block) = otherwise {
             // See the doc comment on `match_candidates` for why we may have an
@@ -494,7 +497,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     ) -> BlockAnd<()> {
         let mut candidate = Candidate::new(initializer.clone(), &irrefutable_pat, false);
         let fake_borrow_temps =
-            self.lower_match_tree(block, irrefutable_pat.span, false, &mut [&mut candidate]);
+            self.lower_match_tree(block, irrefutable_pat.span, irrefutable_pat.span, false, &mut [&mut candidate]);
         // For matches and function arguments, the place that is being matched
         // can be set when creating the variables. But the place for
         // let PATTERN = ... might not even exist until we do the assignment.
@@ -1577,7 +1580,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             target_blocks
         };
 
-        self.perform_test(block, match_place, &test, make_target_blocks);
+        self.perform_test(span, block, match_place, &test, make_target_blocks);
     }
 
     /// Determine the fake borrows that are needed from a set of places that
@@ -1822,6 +1825,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         Candidate::new(scrutinee_place_builder.clone(), &wildcard, false);
                     let fake_borrow_temps = self.lower_match_tree(
                         block,
+                        pat.span,
                         pat.span,
                         false,
                         &mut [&mut guard_candidate, &mut otherwise_candidate],

@@ -17,6 +17,7 @@ use rustc_middle::thir::*;
 use rustc_middle::ty::subst::{GenericArg, Subst};
 use rustc_middle::ty::util::IntTypeExt;
 use rustc_middle::ty::{self, adjustment::PointerCast, Ty, TyCtxt};
+use rustc_span::Span;
 use rustc_span::def_id::DefId;
 use rustc_span::symbol::{sym, Symbol};
 use rustc_target::abi::VariantIdx;
@@ -151,6 +152,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
     pub(super) fn perform_test(
         &mut self,
+        span: Span,
         block: BasicBlock,
         place_builder: PlaceBuilder<'tcx>,
         test: &Test<'tcx>,
@@ -172,7 +174,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             test
         );
 
-        let source_info = self.source_info(test.span);
+        let source_info = self.source_info(span);
         match test.kind {
             TestKind::Switch { adt_def, ref variants } => {
                 let target_blocks = make_target_blocks(self);
