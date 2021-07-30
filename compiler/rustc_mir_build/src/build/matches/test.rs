@@ -152,7 +152,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
     pub(super) fn perform_test(
         &mut self,
-        span: Span,
+        match_expr_start: Span,
+        scrutinee_span: Span,
         block: BasicBlock,
         place_builder: PlaceBuilder<'tcx>,
         test: &Test<'tcx>,
@@ -174,7 +175,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             test
         );
 
-        let source_info = self.source_info(span);
+        let source_info = self.source_info(test.span);//span);
         match test.kind {
             TestKind::Switch { adt_def, ref variants } => {
                 let target_blocks = make_target_blocks(self);
@@ -208,10 +209,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 debug!("num_enum_variants: {}, variants: {:?}", num_enum_variants, variants);
                 let discr_ty = adt_def.repr.discr_type().to_ty(tcx);
                 let discr = self.temp(discr_ty, test.span);
-                self.cfg.push_assign(block, source_info, discr, Rvalue::Discriminant(place));
+                self.cfg.push_assign(block, self.source_info(scrutinee_span)/*test.span)*/, discr, Rvalue::Discriminant(place));
                 self.cfg.terminate(
                     block,
-                    source_info,
+                    //source_info,
+                    self.source_info(match_expr_start),
                     TerminatorKind::SwitchInt {
                         discr: Operand::Move(discr),
                         switch_ty: discr_ty,

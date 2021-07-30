@@ -93,6 +93,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         scrutinee: &Expr<'tcx>,
         arms: &[ArmId],
     ) -> BlockAnd<()> {
+        debug!("match_expr(span={:?})", span);
         let scrutinee_span = scrutinee.span;
         let scrutinee_place =
             unpack!(block = self.lower_scrutinee(block, scrutinee, scrutinee_span,));
@@ -199,7 +200,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
         // This will generate code to test scrutinee_place and
         // branch to the appropriate arm block
-        self.match_candidates(match_start_span, block, &mut otherwise, candidates, &mut fake_borrows);
+        self.match_candidates(match_start_span, scrutinee_span, block, &mut otherwise, candidates, &mut fake_borrows);
 
         if let Some(otherwise_block) = otherwise {
             // See the doc comment on `match_candidates` for why we may have an
@@ -956,6 +957,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn match_candidates<'pat>(
         &mut self,
         span: Span,
+        scrutinee_span: Span,
         start_block: BasicBlock,
         otherwise_block: &mut Option<BasicBlock>,
         candidates: &mut [&mut Candidate<'pat, 'tcx>],
@@ -985,6 +987,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 }
                 self.match_simplified_candidates(
                     span,
+                    scrutinee_span,
                     start_block,
                     otherwise_block,
                     &mut *new_candidates,
@@ -993,6 +996,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             } else {
                 self.match_simplified_candidates(
                     span,
+                    scrutinee_span,
                     start_block,
                     otherwise_block,
                     candidates,
@@ -1005,6 +1009,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn match_simplified_candidates(
         &mut self,
         span: Span,
+        scrutinee_span: Span,
         start_block: BasicBlock,
         otherwise_block: &mut Option<BasicBlock>,
         candidates: &mut [&mut Candidate<'_, 'tcx>],
@@ -1050,6 +1055,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         // Test for the remaining candidates.
         self.test_candidates_with_or(
             span,
+            scrutinee_span,
             unmatched_candidates,
             block,
             otherwise_block,
@@ -1220,6 +1226,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn test_candidates_with_or(
         &mut self,
         span: Span,
+        scrutinee_span: Span,
         candidates: &mut [&mut Candidate<'_, 'tcx>],
         block: BasicBlock,
         otherwise_block: &mut Option<BasicBlock>,
@@ -1232,7 +1239,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         match *first_candidate.match_pairs[0].pattern.kind {
             PatKind::Or { .. } => (),
             _ => {
-                self.test_candidates(span, candidates, block, otherwise_block, fake_borrows);
+                self.test_candidates(span, scrutinee_span, candidates, block, otherwise_block, fake_borrows);
                 return;
             }
         }
@@ -1265,6 +1272,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
         self.match_candidates(
             span,
+            scrutinee_span,
             remainder_start,
             otherwise_block,
             remaining_candidates,
@@ -1293,6 +1301,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             otherwise
         };
         self.match_candidates(
+            or_span,
             or_span,
             candidate.pre_binding_block.unwrap(),
             otherwise,
@@ -1460,6 +1469,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn test_candidates<'pat, 'b, 'c>(
         &mut self,
         span: Span,
+        scrutinee_span: Span,
         mut candidates: &'b mut [&'c mut Candidate<'pat, 'tcx>],
         block: BasicBlock,
         otherwise_block: &mut Option<BasicBlock>,
@@ -1554,6 +1564,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         let candidate_start = this.cfg.start_new_block();
                         this.match_candidates(
                             span,
+                            scrutinee_span,
                             candidate_start,
                             remainder_start,
                             &mut *candidates,
@@ -1570,6 +1581,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let remainder_start = remainder_start.unwrap_or_else(|| this.cfg.start_new_block());
                 this.match_candidates(
                     span,
+                    scrutinee_span,
                     remainder_start,
                     otherwise_block,
                     candidates,
@@ -1580,7 +1592,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             target_blocks
         };
 
-        self.perform_test(span, block, match_place, &test, make_target_blocks);
+        self.perform_test(span, scrutinee_span, block, match_place, &test, make_target_blocks);
     }
 
     /// Determine the fake borrows that are needed from a set of places that
