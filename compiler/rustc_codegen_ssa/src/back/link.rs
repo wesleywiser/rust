@@ -36,6 +36,7 @@ use regex::Regex;
 use tempfile::Builder as TempFileBuilder;
 
 use std::ffi::OsString;
+use std::lazy::OnceCell;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
 use std::{ascii, char, env, fmt, fs, io, mem, str};
@@ -2115,6 +2116,8 @@ fn add_upstream_rust_crates<'a, B: ArchiveBuilder<'a>>(
         group_end = None;
     }
 
+    let search_path = OnceCell::new();
+
     let mut compiler_builtins = None;
 
     for &cnum in deps.iter() {
@@ -2152,13 +2155,33 @@ fn add_upstream_rust_crates<'a, B: ArchiveBuilder<'a>>(
                     // Skip if this library is the same as the last.
                     let mut last = None;
                     for lib in &codegen_results.crate_info.native_libraries[&cnum] {
-                        if lib.name.is_some()
-                            && relevant_lib(sess, lib)
-                            && matches!(lib.kind, NativeLibKind::Static { bundle: Some(false), .. })
-                            && last != lib.name
+                        if let (
+                            Some(lib_name),
+                            NativeLibKind::Static { bundle: Some(false), whole_archive },
+                        ) = (lib.name, lib.kind)
                         {
-                            cmd.link_staticlib(lib.name.unwrap(), lib.verbatim.unwrap_or(false));
-                            last = lib.name;
+                            let verbatim = lib.verbatim.unwrap_or(false);
+                            if relevant_lib(sess, lib) && last != lib.name {
+                                if whole_archive == Some(true) {
+                                    cmd.link_whole_staticlib(
+                                        lib_name,
+                                        verbatim,
+                                        search_path.get_or_init(|| archive_search_paths(sess)),
+                                    );
+                                } else {
+                                    cmd.link_staticlib(lib_name, verbatim);
+                                }
+                                last = lib.name;
+                            }
+                        } else if let NativeLibKind::Static {
+                            bundle: None | Some(true),
+                            whole_archive: Some(true),
+                        } = lib.kind
+                        {
+                            bug!(
+                                "Combining `+bundle` with `+whole-archive` is not allowed. This \
+                                should have been caught by an earlier validation step already."
+                            );
                         }
                     }
                 }
