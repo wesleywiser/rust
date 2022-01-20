@@ -11,6 +11,9 @@ use rustc_hir::def_id::DefIdSet;
 use rustc_llvm::RustString;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mir::coverage::CodeRegion;
+use rustc_middle::ty;
+use rustc_middle::ty::ParamEnv;
+use rustc_middle::ty::Ty;
 use rustc_middle::ty::TyCtxt;
 
 use std::ffi::CString;
@@ -76,9 +79,13 @@ pub fn finalize<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>) {
         let coverage_mapping_buffer = llvm::build_byte_buffer(|coverage_mapping_buffer| {
             mapgen.write_coverage_mapping(expressions, counter_regions, coverage_mapping_buffer);
         });
-        debug_assert!(
+
+        // This is an `assert!`, not a `debug_assert!` because if this constraint is violated,
+        // llvm-cov will fail in a particularly unhelpful way ("Truncated coverage data").
+        assert!(
             !coverage_mapping_buffer.is_empty(),
-            "Every `FunctionCoverage` should have at least one counter"
+            "Every `FunctionCoverage` should have at least one counter: {}",
+            mangled_function_name
         );
 
         function_data.push((mangled_function_name, source_hash, is_used, coverage_mapping_buffer));
@@ -289,6 +296,7 @@ fn add_unused_functions<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>) {
         .filter_map(|local_def_id| {
             let def_id = local_def_id.to_def_id();
             let kind = tcx.def_kind(def_id);
+
             // `mir_keys` will give us `DefId`s for all kinds of things, not
             // just "functions", like consts, statics, etc. Filter those out.
             // If `ignore_unused_generics` was specified, filter out any
@@ -303,7 +311,56 @@ fn add_unused_functions<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>) {
             {
                 return None;
             }
-            Some(local_def_id.to_def_id())
+
+            let has_uninhabited_types = |tys: &[Ty<'tcx>]| {
+                for ty in tys {
+                    if tcx.conservative_is_privately_uninhabited(ParamEnv::empty().and(ty)) {
+                        debug!("skipping unused function {:?} which cannot be invoked", def_id);
+                        return true;
+                    }
+                }
+
+                return false;
+            };
+
+            // Some functions take arguments or return values whose type is uninhabited. By
+            // definition such functions can never be called so we omit them from coverage reports.
+            // Note: Using `skip_binder` is ok here because we don't care about higher-ranked
+            // lifetimes or types, we just want to know if any of the concrete types in the
+            // signature are uninhabited. Generic functions could potentially be instantiated with
+            // an uninhabited type but that's ok because we've already taken care of instrumenting
+            // all instantiated functions and are only interested in dead functions at this point.
+            match tcx.type_of(def_id).kind() {
+                ty::FnDef(..) => {
+                    if has_uninhabited_types(tcx.fn_sig(def_id).skip_binder().inputs_and_output) {
+                        return None;
+                    }
+                }
+                ty::Closure(_, substs) => {
+                    let closure_substs = substs.as_closure();
+                    if has_uninhabited_types(closure_substs.sig().skip_binder().inputs_and_output)
+                        || has_uninhabited_types(&[closure_substs.tupled_upvars_ty()])
+                    {
+                        return None;
+                    }
+                }
+                ty::Generator(_, substs, _) => {
+                    let gen_substs = substs.as_generator();
+                    let gen_sig = gen_substs.sig();
+
+                    if has_uninhabited_types(&[
+                        gen_sig.resume_ty,
+                        gen_sig.return_ty,
+                        gen_sig.yield_ty,
+                        gen_substs.tupled_upvars_ty(),
+                    ]) {
+                        return None;
+                    }
+                }
+                _ => unreachable!(),
+            };
+
+            Some(def_id)
         })
         .collect();
 
