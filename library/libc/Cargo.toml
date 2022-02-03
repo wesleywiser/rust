@@ -30,6 +30,3 @@ extra_traits = []
 const-extern-fn = []
 # use_std is deprecated, use `std` instead
 use_std = [ 'std' ]
-
-[workspace]
-members = ["libc-test"]
