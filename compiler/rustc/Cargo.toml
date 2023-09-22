@@ -21,6 +21,7 @@ optional = true
 features = ['unprefixed_malloc_on_supported_platforms']
 
 [features]
+dbghelp_no_symbolize = ['rustc_driver_impl/dbghelp_no_symbolize']
 jemalloc = ['jemalloc-sys']
 llvm = ['rustc_driver_impl/llvm']
 max_level_info = ['rustc_driver_impl/max_level_info']

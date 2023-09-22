@@ -544,6 +544,16 @@ change-id = 115898
 # producing a `.pdb` file.
 #split-debuginfo = if linux { off } else if windows { packed } else if apple { unpacked }
 
+# When rustc uses dbghelp.dll to capture a backtrace, should we skip trying to symbolize?
+# Usually, it's fine to allow the attempt to resolve debug symbols as they will either be
+# found or not. However, rustc might run in environments where we know its PDBs will not
+# be located and the extra filesystem accesses are undesirable such as inside a build
+# sandbox. In that case, setting this option to `true` will instruct dbghelp.dll not to
+# attempt to load debug symbols when capturing a backtrace.
+#
+# This option only has an effect on Windows platforms.
+#dbghelp-no-symbolize = false
+
 # Whether or not `panic!`s generate backtraces (RUST_BACKTRACE)
 #backtrace = true
 

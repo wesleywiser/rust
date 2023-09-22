@@ -217,6 +217,7 @@ pub struct Config {
     pub rust_debuginfo_level_tools: DebuginfoLevel,
     pub rust_debuginfo_level_tests: DebuginfoLevel,
     pub rust_split_debuginfo: SplitDebuginfo,
+    pub rustc_dbghelp_no_symbolize: bool,
     pub rust_rpath: bool,
     pub rustc_parallel: bool,
     pub rustc_default_linker: Option<String>,
@@ -985,6 +986,7 @@ define_config! {
         debuginfo_level_tools: Option<DebuginfoLevel> = "debuginfo-level-tools",
         debuginfo_level_tests: Option<DebuginfoLevel> = "debuginfo-level-tests",
         split_debuginfo: Option<String> = "split-debuginfo",
+        dbghelp_no_symbolize: Option<bool> = "dbghelp-no-symbolize",
         run_dsymutil: Option<bool> = "run-dsymutil",
         backtrace: Option<bool> = "backtrace",
         incremental: Option<bool> = "incremental",
@@ -1364,6 +1366,7 @@ impl Config {
         let mut debuginfo_level_std = None;
         let mut debuginfo_level_tools = None;
         let mut debuginfo_level_tests = None;
+        let mut dbghelp_no_symbolize = None;
         let mut optimize = None;
         let mut omit_git_hash = None;
 
@@ -1405,6 +1408,7 @@ impl Config {
                 .map(SplitDebuginfo::from_str)
                 .map(|v| v.expect("invalid value for rust.split_debuginfo"))
                 .unwrap_or(SplitDebuginfo::default_for_platform(&config.build.triple));
+            dbghelp_no_symbolize = rust.dbghelp_no_symbolize;
             optimize = rust.optimize;
             omit_git_hash = rust.omit_git_hash;
             config.rust_new_symbol_mangling = rust.new_symbol_mangling;
@@ -1684,6 +1688,8 @@ impl Config {
         config.rust_debuginfo_level_std = with_defaults(debuginfo_level_std);
         config.rust_debuginfo_level_tools = with_defaults(debuginfo_level_tools);
         config.rust_debuginfo_level_tests = debuginfo_level_tests.unwrap_or(DebuginfoLevel::None);
+
+        config.rustc_dbghelp_no_symbolize = dbghelp_no_symbolize.unwrap_or(false);
 
         let download_rustc = config.download_rustc_commit.is_some();
         // See https://github.com/rust-lang/compiler-team/issues/326

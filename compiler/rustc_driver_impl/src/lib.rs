@@ -1480,9 +1480,34 @@ pub fn init_env_logger(handler: &EarlyErrorHandler, env: &str) {
     }
 }
 
+/// If the dbghelp-no-symbolize feature is enabled in config.toml, we will turn off loading debug
+/// symbols when collecting backtraces inside rustc. This is useful in environments like build
+/// sandboxes which monitor filesystem accesses and do not expect to see these files being loaded.
+#[cfg(all(windows, feature = "dbghelp_no_symbolize"))]
+fn disable_dbghelp_symbolize() {
+    use windows::Win32::System::LibraryLoader::{LoadLibraryA, GetProcAddress};
+    use windows::Win32::System::Diagnostics::Debug::{IMAGEHLP_EXTENDED_OPTIONS, SYMOPT_EX_NEVERLOADSYMBOLS};
+    use windows::Win32::Foundation::BOOL;
+    use windows::s;
+
+    // We use LoadLibrary and GetProcAddress because `SymSetExtendedOption` is new in Win 10 v1709
+    // and we technically support back to Windows 7 as a host-tools target.
+    unsafe {
+        if let Ok(dll) = LoadLibraryA(s!("dbghelp.dll")) {
+            if let Some(proc) = GetProcAddress(dll, s!("SymSetExtendedOption")) {
+                let f: unsafe extern "system" fn(IMAGEHLP_EXTENDED_OPTIONS, BOOL) -> BOOL = std::mem::transmute(proc);
+                f(SYMOPT_EX_NEVERLOADSYMBOLS, true.into());
+            }
+        }
+    }
+}
+
 pub fn main() -> ! {
     let start_time = Instant::now();
     let start_rss = get_resident_set_size();
+
+    #[cfg(all(windows, feature = "dbghelp_no_symbolize"))]
+    disable_dbghelp_symbolize();
 
     let handler = EarlyErrorHandler::new(ErrorOutputType::default());
 

@@ -795,6 +795,10 @@ impl Build {
             features.push("max_level_info");
         }
 
+        if self.config.rustc_dbghelp_no_symbolize {
+            features.push("dbghelp_no_symbolize");
+        }
+
         features.join(" ")
     }
 

@@ -64,6 +64,7 @@ features = [
 ]
 
 [features]
+dbghelp_no_symbolize = []
 llvm = ['rustc_interface/llvm']
 max_level_info = ['rustc_log/max_level_info']
 rustc_use_parallel_compiler = [
