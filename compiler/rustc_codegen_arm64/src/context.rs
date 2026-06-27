@@ -79,6 +79,9 @@ pub enum TypeData {
     Ptr,
     Array(Type, u64),
     Vector(Type, u64),
+    /// A scalar pair (e.g. `(T, bool)`, a fat pointer, an overflow result) held immediately as two
+    /// fields. Stored so the builder can pack/unpack pairs for the `PassMode::Pair` ABI.
+    Pair(Type, Type),
     /// Any aggregate (struct/union/scalar-pair) — only its size/align matter to the baseline, which
     /// addresses fields by byte offset.
     Aggregate { size: u64, align: u64 },
@@ -89,6 +92,12 @@ pub enum TypeData {
 struct Interner<T: Clone + Eq + std::hash::Hash> {
     items: Vec<T>,
     dedup: FxHashMap<T, u32>,
+}
+
+/// Round `value` up to a multiple of `align` (which is treated as at least 1).
+fn align_up_u64(value: u64, align: u64) -> u64 {
+    let align = align.max(1);
+    value.div_ceil(align) * align
 }
 
 impl<T: Clone + Eq + std::hash::Hash> Default for Interner<T> {
@@ -203,8 +212,31 @@ impl<'tcx> CodegenCx<'tcx> {
                 let (es, _) = self.type_size_align(elem);
                 (es * count, es * count)
             }
+            TypeData::Pair(a, b) => {
+                let (sa, aa) = self.type_size_align(a);
+                let (sb, ab) = self.type_size_align(b);
+                let align = aa.max(ab).max(1);
+                let off1 = align_up_u64(sa, ab.max(1));
+                (align_up_u64(off1 + sb, align), align)
+            }
             TypeData::Aggregate { size, align } => (size, align),
             TypeData::Func { .. } | TypeData::Void => (0, 1),
+        }
+    }
+
+    /// The byte offset and backend type of field `idx` (0 or 1) of a [`TypeData::Pair`].
+    pub fn pair_field(&self, pair_ty: Type, idx: usize) -> (u64, Type) {
+        match self.type_data(pair_ty) {
+            TypeData::Pair(a, b) => {
+                if idx == 0 {
+                    (0, a)
+                } else {
+                    let (sa, _) = self.type_size_align(a);
+                    let (_, ab) = self.type_size_align(b);
+                    (align_up_u64(sa, ab.max(1)), b)
+                }
+            }
+            other => panic!("pair_field on non-pair type {other:?}"),
         }
     }
 

@@ -7,7 +7,7 @@
 use std::fmt::Write;
 
 use crate::mach::inst::{
-    AddSub, CondSel, DataProc2, FpOp2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex,
+    AddSub, CondSel, DataProc2, FpOp1, FpOp2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex,
 };
 use crate::mach::module::{DataSection, MachModule};
 use crate::mach::reg::{FpSize, OperandSize, Vreg};
@@ -173,6 +173,18 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
                 ),
             );
         }
+        Inst::MulHigh { signed, rd, rn, rm } => {
+            let mnem = if signed { "smulh" } else { "umulh" };
+            line(
+                out,
+                &format!(
+                    "{mnem} {}, {}, {}",
+                    rd.name_zr(OperandSize::S64),
+                    rn.name_zr(OperandSize::S64),
+                    rm.name_zr(OperandSize::S64)
+                ),
+            );
+        }
         Inst::DataProc2 { op, size, rd, rn, rm } => {
             let mnem = match op {
                 DataProc2::Udiv => "udiv",
@@ -258,6 +270,42 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
                 FpOp2::Fdiv => "fdiv",
             };
             line(out, &format!("{mnem} {}, {}, {}", vname(rd, size), vname(rn, size), vname(rm, size)));
+        }
+        Inst::FpDataProc1 { op, size, rd, rn } => {
+            let mnem = match op {
+                FpOp1::Fabs => "fabs",
+                FpOp1::Fneg => "fneg",
+                FpOp1::Fsqrt => "fsqrt",
+            };
+            line(out, &format!("{mnem} {}, {}", vname(rd, size), vname(rn, size)));
+        }
+        Inst::FmovFromGpr { size, rd, rn } => {
+            let gpr_size = match size {
+                FpSize::S32 => OperandSize::S32,
+                FpSize::S64 => OperandSize::S64,
+            };
+            line(out, &format!("fmov {}, {}", vname(rd, size), rn.name_zr(gpr_size)));
+        }
+        Inst::LoadStoreFpUImm { load, size, rt, rn, offset } => {
+            let mnem = if load { "ldr" } else { "str" };
+            line(
+                out,
+                &format!("{mnem} {}, [{}, #{offset}]", vname(rt, size), rn.name(OperandSize::S64)),
+            );
+        }
+        Inst::FpCmp { size, rn, rm } => {
+            line(out, &format!("fcmp {}, {}", vname(rn, size), vname(rm, size)));
+        }
+        Inst::IntToFp { signed, fp, int, rd, rn } => {
+            let mnem = if signed { "scvtf" } else { "ucvtf" };
+            line(out, &format!("{mnem} {}, {}", vname(rd, fp), rn.name_zr(int)));
+        }
+        Inst::FpToInt { signed, fp, int, rd, rn } => {
+            let mnem = if signed { "fcvtzs" } else { "fcvtzu" };
+            line(out, &format!("{mnem} {}, {}", rd.name_zr(int), vname(rn, fp)));
+        }
+        Inst::FpCvt { from, to, rd, rn } => {
+            line(out, &format!("fcvt {}, {}", vname(rd, to), vname(rn, from)));
         }
     }
 }

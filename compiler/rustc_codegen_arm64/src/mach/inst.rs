@@ -164,6 +164,8 @@ pub enum Inst {
     Madd { size: OperandSize, rd: Gpr, rn: Gpr, rm: Gpr, ra: Gpr },
     /// `msub rd, rn, rm, ra` (basis for `rem`).
     Msub { size: OperandSize, rd: Gpr, rn: Gpr, rm: Gpr, ra: Gpr },
+    /// `umulh`/`smulh rd, rn, rm` — the high 64 bits of a 64x64-bit multiply.
+    MulHigh { signed: bool, rd: Gpr, rn: Gpr, rm: Gpr },
     /// `udiv`/`sdiv`/`lslv`/`lsrv`/`asrv rd, rn, rm`.
     DataProc2 { op: DataProc2, size: OperandSize, rd: Gpr, rn: Gpr, rm: Gpr },
 
@@ -205,8 +207,23 @@ pub enum Inst {
     /// `add rd, rn, #:lo12:<sym>` — records a `PageOff12` relocation (the `@PAGEOFF` add).
     AddLo { rd: Gpr, rn: Gpr, sym: SymRef },
 
-    /// `fmov`/`fadd`/`fsub`/`fmul`/`fdiv` two-operand FP (placeholder for the FP batch).
+    /// `fadd`/`fsub`/`fmul`/`fdiv` two-operand FP.
     FpDataProc2 { op: FpOp2, size: FpSize, rd: Vreg, rn: Vreg, rm: Vreg },
+    /// `fneg`/`fabs`/`fsqrt` one-operand FP.
+    FpDataProc1 { op: FpOp1, size: FpSize, rd: Vreg, rn: Vreg },
+    /// `fmov rd, rn` moving a general register's raw bits into a scalar FP register (used to
+    /// materialize floating-point constants).
+    FmovFromGpr { size: FpSize, rd: Vreg, rn: Gpr },
+    /// `ldr`/`str` of a scalar FP register with an unsigned, scaled 12-bit immediate offset.
+    LoadStoreFpUImm { load: bool, size: FpSize, rt: Vreg, rn: Gpr, offset: u32 },
+    /// `fcmp rn, rm` — floating-point compare, setting the NZCV flags.
+    FpCmp { size: FpSize, rn: Vreg, rm: Vreg },
+    /// `scvtf`/`ucvtf` — integer (in a GPR) to floating-point conversion.
+    IntToFp { signed: bool, fp: FpSize, int: OperandSize, rd: Vreg, rn: Gpr },
+    /// `fcvtzs`/`fcvtzu` — floating-point to integer, rounding toward zero (saturating in hardware).
+    FpToInt { signed: bool, fp: FpSize, int: OperandSize, rd: Gpr, rn: Vreg },
+    /// `fcvt` — floating-point precision conversion (`f32`<->`f64`).
+    FpCvt { from: FpSize, to: FpSize, rd: Vreg, rn: Vreg },
 }
 
 /// Two-operand floating-point opcode.
@@ -216,6 +233,14 @@ pub enum FpOp2 {
     Fsub,
     Fmul,
     Fdiv,
+}
+
+/// One-operand floating-point opcode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FpOp1 {
+    Fabs,
+    Fneg,
+    Fsqrt,
 }
 
 impl Inst {
@@ -290,6 +315,10 @@ impl Inst {
                     | (ra.encoding() << 10)
                     | (rn.encoding() << 5)
                     | rd.encoding()
+            }
+            Inst::MulHigh { signed, rd, rn, rm } => {
+                let base: u32 = if signed { 0x9B40_7C00 } else { 0x9BC0_7C00 };
+                base | (rm.encoding() << 16) | (rn.encoding() << 5) | rd.encoding()
             }
             Inst::DataProc2 { op, size, rd, rn, rm } => {
                 let opcode: u32 = match op {
@@ -403,6 +432,79 @@ impl Inst {
                     | (0b10 << 10)
                     | (rn.encoding() << 5)
                     | rd.encoding()
+            }
+            Inst::FpDataProc1 { op, size, rd, rn } => {
+                let opcode: u32 = match op {
+                    FpOp1::Fabs => 0b000001,
+                    FpOp1::Fneg => 0b000010,
+                    FpOp1::Fsqrt => 0b000011,
+                };
+                (0b00011110 << 24)
+                    | (size.ftype() << 22)
+                    | (1 << 21)
+                    | (opcode << 15)
+                    | (0b10000 << 10)
+                    | (rn.encoding() << 5)
+                    | rd.encoding()
+            }
+            Inst::FmovFromGpr { size, rd, rn } => {
+                let base: u32 = match size {
+                    FpSize::S64 => 0x9E67_0000,
+                    FpSize::S32 => 0x1E27_0000,
+                };
+                base | (rn.encoding() << 5) | rd.encoding()
+            }
+            Inst::LoadStoreFpUImm { load, size, rt, rn, offset } => {
+                let base: u32 = match (load, size) {
+                    (false, FpSize::S64) => 0xFD00_0000,
+                    (true, FpSize::S64) => 0xFD40_0000,
+                    (false, FpSize::S32) => 0xBD00_0000,
+                    (true, FpSize::S32) => 0xBD40_0000,
+                };
+                let scale = match size {
+                    FpSize::S32 => 4,
+                    FpSize::S64 => 8,
+                };
+                debug_assert!(offset % scale == 0, "unaligned scaled FP offset");
+                let scaled = offset / scale;
+                debug_assert!(scaled < (1 << 12), "FP offset out of range for unsigned-imm form");
+                base | (scaled << 10) | (rn.encoding() << 5) | rt.encoding()
+            }
+            Inst::FpCmp { size, rn, rm } => {
+                let base: u32 = match size {
+                    FpSize::S64 => 0x1E60_2000,
+                    FpSize::S32 => 0x1E20_2000,
+                };
+                base | (rm.encoding() << 16) | (rn.encoding() << 5)
+            }
+            Inst::IntToFp { signed, fp, int, rd, rn } => {
+                let opcode: u32 = if signed { 0b010 } else { 0b011 };
+                (int.sf() << 31)
+                    | (0b11110 << 24)
+                    | (fp.ftype() << 22)
+                    | (1 << 21)
+                    | (opcode << 16)
+                    | (rn.encoding() << 5)
+                    | rd.encoding()
+            }
+            Inst::FpToInt { signed, fp, int, rd, rn } => {
+                let opcode: u32 = if signed { 0b000 } else { 0b001 };
+                (int.sf() << 31)
+                    | (0b11110 << 24)
+                    | (fp.ftype() << 22)
+                    | (1 << 21)
+                    | (0b11 << 19)
+                    | (opcode << 16)
+                    | (rn.encoding() << 5)
+                    | rd.encoding()
+            }
+            Inst::FpCvt { from, to, rd, rn } => {
+                let base: u32 = match (from, to) {
+                    (FpSize::S64, FpSize::S32) => 0x1E62_4000,
+                    (FpSize::S32, FpSize::S64) => 0x1E22_C000,
+                    _ => panic!("unsupported fcvt {from:?} -> {to:?}"),
+                };
+                base | (rn.encoding() << 5) | rd.encoding()
             }
         }
     }
@@ -594,6 +696,130 @@ mod tests {
             }
             .encode(),
             0xF94007E0
+        );
+    }
+
+    #[test]
+    fn fp_encodings() {
+        // fadd d16, d16, d17
+        assert_eq!(
+            Inst::FpDataProc2 { op: FpOp2::Fadd, size: FpSize::S64, rd: V16, rn: V16, rm: V17 }
+                .encode(),
+            0x1E712A10
+        );
+        // fsub d16, d16, d17
+        assert_eq!(
+            Inst::FpDataProc2 { op: FpOp2::Fsub, size: FpSize::S64, rd: V16, rn: V16, rm: V17 }
+                .encode(),
+            0x1E713A10
+        );
+        // fmul d16, d16, d17
+        assert_eq!(
+            Inst::FpDataProc2 { op: FpOp2::Fmul, size: FpSize::S64, rd: V16, rn: V16, rm: V17 }
+                .encode(),
+            0x1E710A10
+        );
+        // fdiv d16, d16, d17
+        assert_eq!(
+            Inst::FpDataProc2 { op: FpOp2::Fdiv, size: FpSize::S64, rd: V16, rn: V16, rm: V17 }
+                .encode(),
+            0x1E711A10
+        );
+        // fadd s16, s16, s17
+        assert_eq!(
+            Inst::FpDataProc2 { op: FpOp2::Fadd, size: FpSize::S32, rd: V16, rn: V16, rm: V17 }
+                .encode(),
+            0x1E312A10
+        );
+        // fneg d16, d16
+        assert_eq!(
+            Inst::FpDataProc1 { op: FpOp1::Fneg, size: FpSize::S64, rd: V16, rn: V16 }.encode(),
+            0x1E614210
+        );
+        // fneg s16, s16
+        assert_eq!(
+            Inst::FpDataProc1 { op: FpOp1::Fneg, size: FpSize::S32, rd: V16, rn: V16 }.encode(),
+            0x1E214210
+        );
+        // fmov d0, x9
+        assert_eq!(Inst::FmovFromGpr { size: FpSize::S64, rd: V0, rn: X9 }.encode(), 0x9E670120);
+        // fmov s0, w9
+        assert_eq!(Inst::FmovFromGpr { size: FpSize::S32, rd: V0, rn: X9 }.encode(), 0x1E270120);
+        // str d0, [sp, #8]
+        assert_eq!(
+            Inst::LoadStoreFpUImm { load: false, size: FpSize::S64, rt: V0, rn: SP, offset: 8 }
+                .encode(),
+            0xFD0007E0
+        );
+        // ldr d0, [sp, #8]
+        assert_eq!(
+            Inst::LoadStoreFpUImm { load: true, size: FpSize::S64, rt: V0, rn: SP, offset: 8 }
+                .encode(),
+            0xFD4007E0
+        );
+        // str s0, [sp, #4]
+        assert_eq!(
+            Inst::LoadStoreFpUImm { load: false, size: FpSize::S32, rt: V0, rn: SP, offset: 4 }
+                .encode(),
+            0xBD0007E0
+        );
+        // fcmp d0, d1
+        assert_eq!(Inst::FpCmp { size: FpSize::S64, rn: V0, rm: V1 }.encode(), 0x1E612000);
+        // scvtf d0, x9
+        assert_eq!(
+            Inst::IntToFp { signed: true, fp: FpSize::S64, int: OperandSize::S64, rd: V0, rn: X9 }
+                .encode(),
+            0x9E620120
+        );
+        // ucvtf d0, x9
+        assert_eq!(
+            Inst::IntToFp { signed: false, fp: FpSize::S64, int: OperandSize::S64, rd: V0, rn: X9 }
+                .encode(),
+            0x9E630120
+        );
+        // scvtf s0, w9
+        assert_eq!(
+            Inst::IntToFp { signed: true, fp: FpSize::S32, int: OperandSize::S32, rd: V0, rn: X9 }
+                .encode(),
+            0x1E220120
+        );
+        // fcvtzs x9, d0
+        assert_eq!(
+            Inst::FpToInt { signed: true, fp: FpSize::S64, int: OperandSize::S64, rd: X9, rn: V0 }
+                .encode(),
+            0x9E780009
+        );
+        // fcvtzu x9, d0
+        assert_eq!(
+            Inst::FpToInt { signed: false, fp: FpSize::S64, int: OperandSize::S64, rd: X9, rn: V0 }
+                .encode(),
+            0x9E790009
+        );
+        // fcvtzs w9, s0
+        assert_eq!(
+            Inst::FpToInt { signed: true, fp: FpSize::S32, int: OperandSize::S32, rd: X9, rn: V0 }
+                .encode(),
+            0x1E380009
+        );
+        // fcvt s0, d0
+        assert_eq!(
+            Inst::FpCvt { from: FpSize::S64, to: FpSize::S32, rd: V0, rn: V0 }.encode(),
+            0x1E624000
+        );
+        // fcvt d0, s0
+        assert_eq!(
+            Inst::FpCvt { from: FpSize::S32, to: FpSize::S64, rd: V0, rn: V0 }.encode(),
+            0x1E22C000
+        );
+        // umulh x9, x10, x11
+        assert_eq!(
+            Inst::MulHigh { signed: false, rd: X9, rn: X10, rm: X11 }.encode(),
+            0x9BCB7D49
+        );
+        // smulh x9, x10, x11
+        assert_eq!(
+            Inst::MulHigh { signed: true, rd: X9, rn: X10, rm: X11 }.encode(),
+            0x9B4B7D49
         );
     }
 }

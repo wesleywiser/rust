@@ -38,8 +38,15 @@ impl<'tcx> CodegenCx<'tcx> {
                 let elem = self.scalar_backend_type(element, false);
                 self.intern_type(TypeData::Vector(elem, count))
             }
-            // Scalar pairs, memory aggregates and scalable vectors are addressed by byte offset, so
-            // only their size/align matter to the baseline lowering.
+            // A scalar pair packs its two fields into one backend type so the builder can split it
+            // across the `PassMode::Pair` registers (and load/store both halves from memory).
+            BackendRepr::ScalarPair(a, b) => {
+                let a_ty = self.scalar_backend_type(a, immediate);
+                let b_ty = self.scalar_backend_type(b, immediate);
+                self.intern_type(TypeData::Pair(a_ty, b_ty))
+            }
+            // Memory aggregates and scalable vectors are addressed by byte offset, so only their
+            // size/align matter to the baseline lowering.
             _ => self.intern_type(TypeData::Aggregate {
                 size: layout.size.bytes(),
                 align: layout.align.abi.bytes(),
@@ -113,7 +120,7 @@ impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
             TypeData::Ptr => TypeKind::Pointer,
             TypeData::Array(..) => TypeKind::Array,
             TypeData::Vector(..) => TypeKind::Vector,
-            TypeData::Aggregate { .. } => TypeKind::Struct,
+            TypeData::Pair(..) | TypeData::Aggregate { .. } => TypeKind::Struct,
             TypeData::Func { .. } => TypeKind::Function,
         }
     }
@@ -168,9 +175,33 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn cast_backend_type(&self, ty: &CastTarget) -> Type {
-        let size = ty.size(self);
-        let align = ty.align(self);
-        self.intern_type(TypeData::Aggregate { size: size.bytes(), align: align.bytes() })
+        // Flatten the cast target into the sequence of registers it occupies. A two-register cast
+        // (e.g. a 16-byte aggregate returned in `x0:x1`, or an HFA in `v0:v1`) maps to a `Pair` so
+        // the builder splits it across the return/argument registers; longer casts fall back to an
+        // opaque aggregate addressed by byte offset.
+        let mut regs: Vec<Reg> = ty.prefix.iter().copied().collect();
+        let unit_size = ty.rest.unit.size.bytes().max(1);
+        let total = ty.rest.total.bytes();
+        for _ in 0..(total / unit_size) {
+            regs.push(ty.rest.unit);
+        }
+        let rem = total % unit_size;
+        if rem != 0 {
+            regs.push(Reg { kind: RegKind::Integer, size: rustc_abi::Size::from_bytes(rem) });
+        }
+        match regs.len() {
+            1 => self.reg_backend_type(&regs[0]),
+            2 => {
+                let a = self.reg_backend_type(&regs[0]);
+                let b = self.reg_backend_type(&regs[1]);
+                self.intern_type(TypeData::Pair(a, b))
+            }
+            _ => {
+                let size = ty.size(self);
+                let align = ty.align(self);
+                self.intern_type(TypeData::Aggregate { size: size.bytes(), align: align.bytes() })
+            }
+        }
     }
 
     fn fn_decl_backend_type(&self, _fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Type {

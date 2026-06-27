@@ -34,9 +34,13 @@ use rustc_target::spec::{HasTargetSpec, Target};
 use crate::context::{BasicBlock, CodegenCx, Function, Type, TypeData, Value};
 use crate::mach::func::MachFunction;
 use crate::mach::inst::{
-    AddSub, CondSel, DataProc2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex, SymRef,
+    AddSub, CondSel, DataProc2, FpOp1, FpOp2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex,
+    SymRef,
 };
-use crate::mach::reg::{Cond, Gpr, OperandSize, FP, LR, SP, X0, X9, X10, ZR};
+use crate::mach::reg::{
+    Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V16, V17, X0, X1, X2, X9, X10, X12, X13,
+    ZR,
+};
 
 /// Bump allocator for a function's stack frame. Slots are assigned at increasing offsets above the
 /// reserved outgoing-argument area; the frame size is rounded to 16 bytes at finalization.
@@ -277,42 +281,79 @@ fn mem_size(cx: &CodegenCx<'_>, ty: Type) -> MemSize {
     }
 }
 
-/// Compute the incoming register and backend type of each physical parameter (baseline: integer
-/// args in `x0..x7`, indirect return pointer in `x8`). Floating-point and stack-passed arguments
-/// are not yet handled.
+/// Whether a backend type is a floating-point scalar (passed/returned in the SIMD&FP registers).
+fn type_is_float(cx: &CodegenCx<'_>, ty: Type) -> bool {
+    matches!(cx.type_data(ty), TypeData::Float(_))
+}
+
+/// Floating-point operand size for a float backend type (`f32` -> single, otherwise double).
+fn fp_size(cx: &CodegenCx<'_>, ty: Type) -> FpSize {
+    match cx.type_data(ty) {
+        TypeData::Float(32) => FpSize::S32,
+        _ => FpSize::S64,
+    }
+}
+
+/// The incoming physical register class of a parameter in the baseline ABI.
+enum ParamReg {
+    /// Integer/pointer argument in `x0..x7` (or the indirect-return pointer in `x8`).
+    Gpr(Gpr),
+    /// Floating-point argument in `v0..v7`.
+    Fp(Vreg),
+}
+
+/// Assign one scalar parameter to the next integer or floating-point register.
+fn push_scalar_param(
+    cx: &CodegenCx<'_>,
+    params: &mut Vec<(ParamReg, Type)>,
+    ngrn: &mut u8,
+    nsrn: &mut u8,
+    ty: Type,
+) {
+    if type_is_float(cx, ty) {
+        params.push((ParamReg::Fp(Vreg::from_encoding(*nsrn)), ty));
+        *nsrn += 1;
+    } else {
+        params.push((ParamReg::Gpr(Gpr::from_encoding(*ngrn)), ty));
+        *ngrn += 1;
+    }
+}
+
+/// Compute the incoming register and backend type of each physical parameter, following the
+/// baseline AAPCS64 split: integer/pointer arguments fill `x0..x7`, floating-point arguments fill
+/// `v0..v7`, and an indirect-return (sret) pointer arrives in `x8`. Stack-passed arguments (once
+/// the register banks are exhausted) are not yet handled.
 fn build_param_list<'tcx>(
     cx: &CodegenCx<'tcx>,
     fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
-) -> Vec<(Gpr, Type)> {
+) -> Vec<(ParamReg, Type)> {
     let mut params = Vec::new();
     let ptr = cx.intern_type(TypeData::Ptr);
     if fn_abi.ret.is_indirect() {
         // The indirect-return (sret) pointer arrives in x8.
-        params.push((Gpr::from_encoding(8), ptr));
+        params.push((ParamReg::Gpr(Gpr::from_encoding(8)), ptr));
     }
     let mut ngrn: u8 = 0;
+    let mut nsrn: u8 = 0;
     for arg in fn_abi.args.iter() {
         match arg.mode {
             PassMode::Ignore => {}
             PassMode::Direct(_) => {
                 let ty = cx.immediate_backend_type(arg.layout);
-                params.push((Gpr::from_encoding(ngrn), ty));
-                ngrn += 1;
+                push_scalar_param(cx, &mut params, &mut ngrn, &mut nsrn, ty);
             }
             PassMode::Pair(..) => {
                 let a = cx.scalar_pair_element_backend_type(arg.layout, 0, true);
                 let b = cx.scalar_pair_element_backend_type(arg.layout, 1, true);
-                params.push((Gpr::from_encoding(ngrn), a));
-                ngrn += 1;
-                params.push((Gpr::from_encoding(ngrn), b));
-                ngrn += 1;
+                push_scalar_param(cx, &mut params, &mut ngrn, &mut nsrn, a);
+                push_scalar_param(cx, &mut params, &mut ngrn, &mut nsrn, b);
             }
             PassMode::Indirect { .. } => {
-                params.push((Gpr::from_encoding(ngrn), ptr));
+                params.push((ParamReg::Gpr(Gpr::from_encoding(ngrn)), ptr));
                 ngrn += 1;
             }
             PassMode::Cast { .. } => {
-                params.push((Gpr::from_encoding(ngrn), cx.intern_type(TypeData::Int(64))));
+                params.push((ParamReg::Gpr(Gpr::from_encoding(ngrn)), cx.intern_type(TypeData::Int(64))));
                 ngrn += 1;
             }
         }
@@ -327,14 +368,24 @@ fn setup_params(cx: &CodegenCx<'_>, fb: &mut FunctionBuild, block: BasicBlock) {
     for (reg, ty) in build_param_list(cx, fn_abi) {
         let (size, align) = cx.type_size_align(ty);
         let off = fb.frame.alloc(size, align) as u32;
-        fb.blocks[block.0 as usize].push(Inst::LoadStoreUImm {
-            load: false,
-            signed: false,
-            size: mem_size(cx, ty),
-            rt: reg,
-            rn: SP,
-            offset: off,
-        });
+        let inst = match reg {
+            ParamReg::Gpr(reg) => Inst::LoadStoreUImm {
+                load: false,
+                signed: false,
+                size: mem_size(cx, ty),
+                rt: reg,
+                rn: SP,
+                offset: off,
+            },
+            ParamReg::Fp(reg) => Inst::LoadStoreFpUImm {
+                load: false,
+                size: fp_size(cx, ty),
+                rt: reg,
+                rn: SP,
+                offset: off,
+            },
+        };
+        fb.blocks[block.0 as usize].push(inst);
         fb.param_slots.push(Value::Slot { off, ty });
     }
 }
@@ -397,6 +448,58 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         Value::Slot { off, ty }
     }
 
+    /// Load a floating-point value into the SIMD&FP register `vreg`.
+    fn materialize_fp(&mut self, val: Value, vreg: Vreg) {
+        let ty = val.ty();
+        let size = fp_size(self.cx, ty);
+        match val {
+            Value::Slot { off, .. } => {
+                self.emit(Inst::LoadStoreFpUImm { load: true, size, rt: vreg, rn: SP, offset: off });
+            }
+            Value::Const { bits, .. } => {
+                // Load the raw IEEE-754 bit pattern into a scratch GPR, then move it across.
+                let gpr_size = match size {
+                    FpSize::S32 => OperandSize::S32,
+                    FpSize::S64 => OperandSize::S64,
+                };
+                self.load_imm(X9, bits, gpr_size);
+                self.emit(Inst::FmovFromGpr { size, rd: vreg, rn: X9 });
+            }
+            Value::Undef { .. } => {
+                self.emit(Inst::FmovFromGpr { size, rd: vreg, rn: ZR });
+            }
+            Value::Sym { .. } => {
+                // A symbol address is never a floating-point value; treat as zero defensively.
+                self.emit(Inst::FmovFromGpr { size, rd: vreg, rn: ZR });
+            }
+        }
+    }
+
+    /// Store the SIMD&FP register `vreg` into a fresh frame slot, returning a [`Value::Slot`].
+    fn spill_fp(&mut self, vreg: Vreg, ty: Type) -> Value {
+        let (size, align) = self.cx.type_size_align(ty);
+        let off = self.alloc_slot(size, align) as u32;
+        self.emit(Inst::LoadStoreFpUImm {
+            load: false,
+            size: fp_size(self.cx, ty),
+            rt: vreg,
+            rn: SP,
+            offset: off,
+        });
+        Value::Slot { off, ty }
+    }
+
+    /// Emit a two-operand FP op: materialize both operands into scratch FP registers, compute into
+    /// `v16`, and spill.
+    fn fp_alu(&mut self, op: FpOp2, lhs: Value, rhs: Value) -> Value {
+        let ty = lhs.ty();
+        let size = fp_size(self.cx, ty);
+        self.materialize_fp(lhs, V16);
+        self.materialize_fp(rhs, V17);
+        self.emit(Inst::FpDataProc2 { op, size, rd: V16, rn: V16, rm: V17 });
+        self.spill_fp(V16, ty)
+    }
+
     /// Emit a register-register ALU op: materialize both operands, compute into `x9`, spill.
     fn alu_rrr(
         &mut self,
@@ -451,6 +554,27 @@ fn int_pred_to_cond(pred: IntPredicate) -> Cond {
         IntPredicate::IntSGE => Cond::Ge,
         IntPredicate::IntSLT => Cond::Lt,
         IntPredicate::IntSLE => Cond::Le,
+    }
+}
+
+/// AArch64 condition for a floating-point predicate after `fcmp` (which sets NZCV so that an
+/// unordered result, i.e. a NaN operand, has C=1, V=1). These are the single-condition mappings;
+/// Rust's surface float comparisons only emit `OEQ`/`OGT`/`OGE`/`OLT`/`OLE`/`UNE`.
+fn real_pred_to_cond(pred: RealPredicate) -> Cond {
+    match pred {
+        RealPredicate::RealOEQ => Cond::Eq,
+        RealPredicate::RealOGT => Cond::Gt,
+        RealPredicate::RealOGE => Cond::Ge,
+        RealPredicate::RealOLT => Cond::Mi,
+        RealPredicate::RealOLE => Cond::Ls,
+        RealPredicate::RealUNE => Cond::Ne,
+        RealPredicate::RealUGT => Cond::Hi,
+        RealPredicate::RealUGE => Cond::Pl,
+        RealPredicate::RealULT => Cond::Lt,
+        RealPredicate::RealULE => Cond::Le,
+        RealPredicate::RealORD => Cond::Vc,
+        RealPredicate::RealUNO => Cond::Vs,
+        other => todo!("rustc_codegen_arm64: float predicate {other:?}"),
     }
 }
 
@@ -659,7 +783,25 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.emit(Inst::Ret { rn: LR });
     }
     fn ret(&mut self, v: Value) {
-        self.materialize(v, X0);
+        if let TypeData::Pair(..) = self.cx.type_data(v.ty()) {
+            // `PassMode::Pair`: return field 0 in x0/v0 and field 1 in x1/v1 (per field class).
+            let fields = [self.extract_value(v, 0), self.extract_value(v, 1)];
+            let mut ngrn: u8 = 0;
+            let mut nsrn: u8 = 0;
+            for f in fields {
+                if type_is_float(self.cx, f.ty()) {
+                    self.materialize_fp(f, Vreg::from_encoding(nsrn));
+                    nsrn += 1;
+                } else {
+                    self.materialize(f, Gpr::from_encoding(ngrn));
+                    ngrn += 1;
+                }
+            }
+        } else if type_is_float(self.cx, v.ty()) {
+            self.materialize_fp(v, V0);
+        } else {
+            self.materialize(v, X0);
+        }
         self.emit(Inst::Ret { rn: LR });
     }
     fn br(&mut self, dest: BasicBlock) {
@@ -702,15 +844,19 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         &mut self,
         _llty: Type,
         _fn_attrs: Option<&CodegenFnAttrs>,
-        _fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
-        _llfn: Value,
-        _args: &[Value],
-        _then: BasicBlock,
+        fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
+        llfn: Value,
+        args: &[Value],
+        then: BasicBlock,
         _catch: BasicBlock,
         _funclet: Option<&()>,
         _instance: Option<Instance<'tcx>>,
     ) -> Value {
-        todo!("rustc_codegen_arm64: invoke")
+        // Baseline model: emit the call and fall through to the normal successor. The unwind edge
+        // (`_catch`) is not wired up; an unwind through this call aborts (panic=abort semantics).
+        let ret = self.emit_call_core(fn_abi, llfn, args);
+        self.br(then);
+        ret
     }
     fn unreachable(&mut self) {
         self.emit(Inst::Brk { imm16: 1 });
@@ -821,16 +967,20 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let zero = Value::Const { bits: 0, ty: v.ty() };
         self.sub(zero, v)
     }
-    fn fneg(&mut self, _v: Value) -> Value {
-        todo!("rustc_codegen_arm64: fneg")
+    fn fneg(&mut self, v: Value) -> Value {
+        let ty = v.ty();
+        let size = fp_size(self.cx, ty);
+        self.materialize_fp(v, V16);
+        self.emit(Inst::FpDataProc1 { op: FpOp1::Fneg, size, rd: V16, rn: V16 });
+        self.spill_fp(V16, ty)
     }
     fn not(&mut self, v: Value) -> Value {
         let all_ones = Value::Const { bits: u128::MAX, ty: v.ty() };
         self.xor(v, all_ones)
     }
 
-    fn fadd(&mut self, _lhs: Value, _rhs: Value) -> Value {
-        todo!("rustc_codegen_arm64: fadd")
+    fn fadd(&mut self, lhs: Value, rhs: Value) -> Value {
+        self.fp_alu(FpOp2::Fadd, lhs, rhs)
     }
     fn fadd_fast(&mut self, lhs: Value, rhs: Value) -> Value {
         self.fadd(lhs, rhs)
@@ -838,8 +988,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn fadd_algebraic(&mut self, lhs: Value, rhs: Value) -> Value {
         self.fadd(lhs, rhs)
     }
-    fn fsub(&mut self, _lhs: Value, _rhs: Value) -> Value {
-        todo!("rustc_codegen_arm64: fsub")
+    fn fsub(&mut self, lhs: Value, rhs: Value) -> Value {
+        self.fp_alu(FpOp2::Fsub, lhs, rhs)
     }
     fn fsub_fast(&mut self, lhs: Value, rhs: Value) -> Value {
         self.fsub(lhs, rhs)
@@ -847,8 +997,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn fsub_algebraic(&mut self, lhs: Value, rhs: Value) -> Value {
         self.fsub(lhs, rhs)
     }
-    fn fmul(&mut self, _lhs: Value, _rhs: Value) -> Value {
-        todo!("rustc_codegen_arm64: fmul")
+    fn fmul(&mut self, lhs: Value, rhs: Value) -> Value {
+        self.fp_alu(FpOp2::Fmul, lhs, rhs)
     }
     fn fmul_fast(&mut self, lhs: Value, rhs: Value) -> Value {
         self.fmul(lhs, rhs)
@@ -856,8 +1006,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn fmul_algebraic(&mut self, lhs: Value, rhs: Value) -> Value {
         self.fmul(lhs, rhs)
     }
-    fn fdiv(&mut self, _lhs: Value, _rhs: Value) -> Value {
-        todo!("rustc_codegen_arm64: fdiv")
+    fn fdiv(&mut self, lhs: Value, rhs: Value) -> Value {
+        self.fp_alu(FpOp2::Fdiv, lhs, rhs)
     }
     fn fdiv_fast(&mut self, lhs: Value, rhs: Value) -> Value {
         self.fdiv(lhs, rhs)
@@ -866,6 +1016,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.fdiv(lhs, rhs)
     }
     fn frem(&mut self, _lhs: Value, _rhs: Value) -> Value {
+        // `frem` has no hardware instruction; it requires a call to `fmod`/`fmodf`. Deferred.
         todo!("rustc_codegen_arm64: frem")
     }
     fn frem_fast(&mut self, lhs: Value, rhs: Value) -> Value {
@@ -883,8 +1034,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         rhs: Value,
     ) -> (Value, Value) {
         let signed = ty.is_signed();
-        let size = op_size(self.cx, lhs.ty());
         let val_ty = lhs.ty();
+        if let OverflowOp::Mul = oop {
+            return self.checked_mul(signed, val_ty, lhs, rhs);
+        }
+        let size = op_size(self.cx, lhs.ty());
         let bool_ty = self.cx.intern_type(TypeData::Int(1));
         self.materialize(lhs, X9);
         self.materialize(rhs, X10);
@@ -913,14 +1067,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 });
                 if signed { Cond::Vs } else { Cond::Lo }
             }
-            OverflowOp::Mul => {
-                // FIXME: detect multiplication overflow via `umulh`/`smulh`. For now compute the
-                // low product and report no overflow.
-                self.emit(Inst::Madd { size, rd: X9, rn: X9, rm: X10, ra: ZR });
-                let result = self.spill(X9, val_ty);
-                let overflow = Value::Const { bits: 0, ty: bool_ty };
-                return (result, overflow);
-            }
+            OverflowOp::Mul => unreachable!("multiplication is handled by checked_mul above"),
         };
         // Read the overflow flag into a bool (cset wN, cond == csinc wN, wzr, wzr, invert(cond)).
         self.emit(Inst::CondSel {
@@ -962,6 +1109,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn load(&mut self, ty: Type, ptr: Value, _align: Align) -> Value {
+        if let TypeData::Pair(..) = self.cx.type_data(ty) {
+            return self.load_pair(ty, ptr);
+        }
         self.materialize(ptr, X9);
         self.emit(Inst::LoadStoreUImm {
             load: true,
@@ -1022,6 +1172,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         _align: Align,
         _flags: MemFlags,
     ) -> Value {
+        if let TypeData::Pair(..) = self.cx.type_data(val.ty()) {
+            self.store_pair(val, ptr);
+            return Value::Undef { ty: self.ptr_ty() };
+        }
         self.materialize(ptr, X9);
         self.materialize(val, X10);
         self.emit(Inst::LoadStoreUImm {
@@ -1094,29 +1248,61 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.materialize(val, X9);
         self.spill(X9, dest_ty)
     }
-    fn fptoui_sat(&mut self, _val: Value, _dest_ty: Type) -> Value {
-        todo!("rustc_codegen_arm64: fptoui_sat")
+    fn fptoui_sat(&mut self, val: Value, dest_ty: Type) -> Value {
+        // AArch64 `fcvtzu` already saturates out-of-range values and maps NaN to zero.
+        self.fptoui(val, dest_ty)
     }
-    fn fptosi_sat(&mut self, _val: Value, _dest_ty: Type) -> Value {
-        todo!("rustc_codegen_arm64: fptosi_sat")
+    fn fptosi_sat(&mut self, val: Value, dest_ty: Type) -> Value {
+        // AArch64 `fcvtzs` already saturates out-of-range values and maps NaN to zero.
+        self.fptosi(val, dest_ty)
     }
-    fn fptoui(&mut self, _val: Value, _dest_ty: Type) -> Value {
-        todo!("rustc_codegen_arm64: fptoui")
+    fn fptoui(&mut self, val: Value, dest_ty: Type) -> Value {
+        // FIXME: for destination widths < 32 bits the result saturates to the 32-bit range rather
+        // than the narrow type's range; correct for i32/i64/u32/u64.
+        let fp = fp_size(self.cx, val.ty());
+        let int = op_size(self.cx, dest_ty);
+        self.materialize_fp(val, V16);
+        self.emit(Inst::FpToInt { signed: false, fp, int, rd: X9, rn: V16 });
+        self.spill(X9, dest_ty)
     }
-    fn fptosi(&mut self, _val: Value, _dest_ty: Type) -> Value {
-        todo!("rustc_codegen_arm64: fptosi")
+    fn fptosi(&mut self, val: Value, dest_ty: Type) -> Value {
+        let fp = fp_size(self.cx, val.ty());
+        let int = op_size(self.cx, dest_ty);
+        self.materialize_fp(val, V16);
+        self.emit(Inst::FpToInt { signed: true, fp, int, rd: X9, rn: V16 });
+        self.spill(X9, dest_ty)
     }
-    fn uitofp(&mut self, _val: Value, _dest_ty: Type) -> Value {
-        todo!("rustc_codegen_arm64: uitofp")
+    fn uitofp(&mut self, val: Value, dest_ty: Type) -> Value {
+        // Zero-extend the source to 64 bits so any integer width converts correctly.
+        let i64ty = self.cx.intern_type(TypeData::Int(64));
+        let wide = self.zext(val, i64ty);
+        let fp = fp_size(self.cx, dest_ty);
+        self.materialize(wide, X9);
+        self.emit(Inst::IntToFp { signed: false, fp, int: OperandSize::S64, rd: V16, rn: X9 });
+        self.spill_fp(V16, dest_ty)
     }
-    fn sitofp(&mut self, _val: Value, _dest_ty: Type) -> Value {
-        todo!("rustc_codegen_arm64: sitofp")
+    fn sitofp(&mut self, val: Value, dest_ty: Type) -> Value {
+        // Sign-extend the source to 64 bits so any integer width converts correctly.
+        let i64ty = self.cx.intern_type(TypeData::Int(64));
+        let wide = self.sext(val, i64ty);
+        let fp = fp_size(self.cx, dest_ty);
+        self.materialize(wide, X9);
+        self.emit(Inst::IntToFp { signed: true, fp, int: OperandSize::S64, rd: V16, rn: X9 });
+        self.spill_fp(V16, dest_ty)
     }
-    fn fptrunc(&mut self, _val: Value, _dest_ty: Type) -> Value {
-        todo!("rustc_codegen_arm64: fptrunc")
+    fn fptrunc(&mut self, val: Value, dest_ty: Type) -> Value {
+        let from = fp_size(self.cx, val.ty());
+        let to = fp_size(self.cx, dest_ty);
+        self.materialize_fp(val, V16);
+        self.emit(Inst::FpCvt { from, to, rd: V16, rn: V16 });
+        self.spill_fp(V16, dest_ty)
     }
-    fn fpext(&mut self, _val: Value, _dest_ty: Type) -> Value {
-        todo!("rustc_codegen_arm64: fpext")
+    fn fpext(&mut self, val: Value, dest_ty: Type) -> Value {
+        let from = fp_size(self.cx, val.ty());
+        let to = fp_size(self.cx, dest_ty);
+        self.materialize_fp(val, V16);
+        self.emit(Inst::FpCvt { from, to, rd: V16, rn: V16 });
+        self.spill_fp(V16, dest_ty)
     }
     fn ptrtoint(&mut self, val: Value, dest_ty: Type) -> Value {
         self.retype(val, dest_ty)
@@ -1152,42 +1338,57 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let cond = int_pred_to_cond(op);
         self.emit_icmp(cond, lhs, rhs)
     }
-    fn fcmp(&mut self, _op: RealPredicate, _lhs: Value, _rhs: Value) -> Value {
-        todo!("rustc_codegen_arm64: fcmp")
+    fn fcmp(&mut self, op: RealPredicate, lhs: Value, rhs: Value) -> Value {
+        let size = fp_size(self.cx, lhs.ty());
+        self.materialize_fp(lhs, V16);
+        self.materialize_fp(rhs, V17);
+        self.emit(Inst::FpCmp { size, rn: V16, rm: V17 });
+        let cond = real_pred_to_cond(op);
+        // cset w9, cond  ==  csinc w9, wzr, wzr, invert(cond)
+        self.emit(Inst::CondSel {
+            op: CondSel::Csinc,
+            size: OperandSize::S32,
+            rd: X9,
+            rn: ZR,
+            rm: ZR,
+            cond: cond.invert(),
+        });
+        self.spill(X9, self.cx.intern_type(TypeData::Int(1)))
     }
 
     fn memcpy(
         &mut self,
-        _dst: Value,
+        dst: Value,
         _dst_align: Align,
-        _src: Value,
+        src: Value,
         _src_align: Align,
-        _size: Value,
+        size: Value,
         _flags: MemFlags,
         _tt: Option<rustc_ast::expand::typetree::FncTree>,
     ) {
-        todo!("rustc_codegen_arm64: memcpy")
+        self.libc_mem_call("_memcpy", dst, src, size);
     }
     fn memmove(
         &mut self,
-        _dst: Value,
+        dst: Value,
         _dst_align: Align,
-        _src: Value,
+        src: Value,
         _src_align: Align,
-        _size: Value,
+        size: Value,
         _flags: MemFlags,
     ) {
-        todo!("rustc_codegen_arm64: memmove")
+        self.libc_mem_call("_memmove", dst, src, size);
     }
     fn memset(
         &mut self,
-        _ptr: Value,
-        _fill_byte: Value,
-        _size: Value,
+        ptr: Value,
+        fill_byte: Value,
+        size: Value,
         _align: Align,
         _flags: MemFlags,
     ) {
-        todo!("rustc_codegen_arm64: memset")
+        // `memset(ptr, fill_byte, size)` — same argument registers as the copy helpers.
+        self.libc_mem_call("_memset", ptr, fill_byte, size);
     }
 
     fn vscale(&mut self, _ty: Type) -> Value {
@@ -1230,26 +1431,66 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn vector_splat(&mut self, _num_elts: usize, _elt: Value) -> Value {
         todo!("rustc_codegen_arm64: vector_splat")
     }
-    fn extract_value(&mut self, _agg_val: Value, _idx: u64) -> Value {
-        todo!("rustc_codegen_arm64: extract_value")
+    fn extract_value(&mut self, agg_val: Value, idx: u64) -> Value {
+        // A packed pair lives in a stack slot; field `idx` is a sub-slot at its byte offset.
+        let (off, fty) = self.cx.pair_field(agg_val.ty(), idx as usize);
+        match agg_val {
+            Value::Slot { off: base, .. } => Value::Slot { off: base + off as u32, ty: fty },
+            _ => Value::Undef { ty: fty },
+        }
     }
-    fn insert_value(&mut self, _agg_val: Value, _elt: Value, _idx: u64) -> Value {
-        todo!("rustc_codegen_arm64: insert_value")
+    fn insert_value(&mut self, agg_val: Value, elt: Value, idx: u64) -> Value {
+        let pair_ty = agg_val.ty();
+        let (foff, _) = self.cx.pair_field(pair_ty, idx as usize);
+        // Reuse the aggregate's slot if it already has one, otherwise allocate it.
+        let base = match agg_val {
+            Value::Slot { off, .. } => off,
+            _ => {
+                let (size, align) = self.cx.type_size_align(pair_ty);
+                self.alloc_slot(size, align) as u32
+            }
+        };
+        let field_off = base + foff as u32;
+        if type_is_float(self.cx, elt.ty()) {
+            self.materialize_fp(elt, V16);
+            self.emit(Inst::LoadStoreFpUImm {
+                load: false,
+                size: fp_size(self.cx, elt.ty()),
+                rt: V16,
+                rn: SP,
+                offset: field_off,
+            });
+        } else {
+            self.materialize(elt, X9);
+            self.emit(Inst::LoadStoreUImm {
+                load: false,
+                signed: false,
+                size: mem_size(self.cx, elt.ty()),
+                rt: X9,
+                rn: SP,
+                offset: field_off,
+            });
+        }
+        Value::Slot { off: base, ty: pair_ty }
     }
 
     fn set_personality_fn(&mut self, _personality: Function) {}
     fn cleanup_landing_pad(&mut self, _pers_fn: Function) -> (Value, Value) {
-        todo!("rustc_codegen_arm64: cleanup_landing_pad")
+        // Baseline unwinding model: cleanup landing pads abort rather than run real cleanup. The
+        // landing-pad operands (exception pointer + selector) are never inspected before the
+        // `resume`/terminate aborts, so undefined placeholders suffice.
+        let ptr = self.ptr_ty();
+        let i32_ty = self.cx.intern_type(TypeData::Int(32));
+        (Value::Undef { ty: ptr }, Value::Undef { ty: i32_ty })
     }
-    fn filter_landing_pad(&mut self, _pers_fn: Function) {
-        todo!("rustc_codegen_arm64: filter_landing_pad")
-    }
+    fn filter_landing_pad(&mut self, _pers_fn: Function) {}
     fn resume(&mut self, _exn0: Value, _exn1: Value) {
-        todo!("rustc_codegen_arm64: resume")
+        // An unwind reaching `resume` aborts in the baseline (panic=abort semantics).
+        self.emit(Inst::Brk { imm16: 1 });
     }
     fn cleanup_pad(&mut self, _parent: Option<Value>, _args: &[Value]) {}
     fn cleanup_ret(&mut self, _funclet: &(), _unwind: Option<BasicBlock>) {
-        todo!("rustc_codegen_arm64: cleanup_ret")
+        self.emit(Inst::Brk { imm16: 1 });
     }
     fn catch_pad(&mut self, _parent: Value, _args: &[Value]) {}
     fn catch_switch(
@@ -1258,10 +1499,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         _unwind: Option<BasicBlock>,
         _handlers: &[BasicBlock],
     ) -> Value {
-        todo!("rustc_codegen_arm64: catch_switch")
+        Value::Undef { ty: self.ptr_ty() }
     }
     fn get_funclet_cleanuppad(&self, _funclet: &()) -> Value {
-        todo!("rustc_codegen_arm64: get_funclet_cleanuppad")
+        Value::Undef { ty: self.cx.intern_type(TypeData::Ptr) }
     }
 
     fn atomic_cmpxchg(
@@ -1303,39 +1544,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         _funclet: Option<&()>,
         _callee_instance: Option<Instance<'tcx>>,
     ) -> Value {
-        let indirect_ret = fn_abi.is_some_and(|a| a.ret.is_indirect());
-        // Marshal physical arguments into x0..x7 (integer baseline); sret pointer goes in x8.
-        let mut ngrn: u8 = 0;
-        for (i, &arg) in args.iter().enumerate() {
-            let reg = if indirect_ret && i == 0 {
-                Gpr::from_encoding(8)
-            } else {
-                let r = Gpr::from_encoding(ngrn);
-                ngrn += 1;
-                r
-            };
-            self.materialize(arg, reg);
-        }
-        // Emit the call. Direct calls reference the symbol (BRANCH26 relocation); otherwise the
-        // callee address is materialized and called indirectly.
-        match fn_val {
-            Value::Sym { sym, offset, .. } => {
-                let name = self.cx.sym_name(sym);
-                self.emit(Inst::Bl { sym: SymRef { name, addend: offset } });
-            }
-            other => {
-                self.materialize(other, X9);
-                self.emit(Inst::Blr { rn: X9 });
-            }
-        }
-        // Collect the return value from x0 (integer/pointer baseline).
-        match fn_abi {
-            Some(a) if !a.ret.is_indirect() && !a.ret.is_ignore() => {
-                let ty = self.cx.immediate_backend_type(a.ret.layout);
-                self.spill(X0, ty)
-            }
-            _ => Value::Undef { ty: self.ptr_ty() },
-        }
+        self.emit_call_core(fn_abi, fn_val, args)
     }
     fn tail_call(
         &mut self,
@@ -1366,5 +1575,265 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.emit(Inst::DataProc2 { op: div, size, rd: X11_HACK, rn: X9, rm: X10 });
         self.emit(Inst::Msub { size, rd: X9, rn: X11_HACK, rm: X10, ra: X9 });
         self.spill(X9, ty)
+    }
+
+    /// Emit a call to a libc memory helper with the C signature `(ptr x0, arg x1, size x2)`
+    /// (covers `memcpy`/`memmove`/`memset`). The arguments are loaded into `x0..x2` and the call
+    /// goes through a `bl` to an undefined external symbol the linker resolves against libc.
+    fn libc_mem_call(&mut self, sym: &str, a0: Value, a1: Value, a2: Value) {
+        self.materialize(a0, X0);
+        self.materialize(a1, X1);
+        self.materialize(a2, X2);
+        self.emit(Inst::Bl { sym: SymRef::new(sym) });
+    }
+
+    /// Load a scalar pair from memory at `ptr` into a fresh packed slot, field by field.
+    fn load_pair(&mut self, ty: Type, ptr: Value) -> Value {
+        let (size, align) = self.cx.type_size_align(ty);
+        let base = self.alloc_slot(size, align) as u32;
+        self.materialize(ptr, X9);
+        for idx in 0..2 {
+            let (foff, fty) = self.cx.pair_field(ty, idx);
+            let foff = foff as u32;
+            if type_is_float(self.cx, fty) {
+                let sz = fp_size(self.cx, fty);
+                self.emit(Inst::LoadStoreFpUImm { load: true, size: sz, rt: V16, rn: X9, offset: foff });
+                self.emit(Inst::LoadStoreFpUImm { load: false, size: sz, rt: V16, rn: SP, offset: base + foff });
+            } else {
+                let sz = mem_size(self.cx, fty);
+                self.emit(Inst::LoadStoreUImm { load: true, signed: false, size: sz, rt: X10, rn: X9, offset: foff });
+                self.emit(Inst::LoadStoreUImm { load: false, signed: false, size: sz, rt: X10, rn: SP, offset: base + foff });
+            }
+        }
+        Value::Slot { off: base, ty }
+    }
+
+    /// Store a packed scalar pair `val` (a slot) to memory at `ptr`, field by field.
+    fn store_pair(&mut self, val: Value, ptr: Value) {
+        let ty = val.ty();
+        let Value::Slot { off: sbase, .. } = val else { return };
+        self.materialize(ptr, X9);
+        for idx in 0..2 {
+            let (foff, fty) = self.cx.pair_field(ty, idx);
+            let foff = foff as u32;
+            if type_is_float(self.cx, fty) {
+                let sz = fp_size(self.cx, fty);
+                self.emit(Inst::LoadStoreFpUImm { load: true, size: sz, rt: V16, rn: SP, offset: sbase + foff });
+                self.emit(Inst::LoadStoreFpUImm { load: false, size: sz, rt: V16, rn: X9, offset: foff });
+            } else {
+                let sz = mem_size(self.cx, fty);
+                self.emit(Inst::LoadStoreUImm { load: true, signed: false, size: sz, rt: X10, rn: SP, offset: sbase + foff });
+                self.emit(Inst::LoadStoreUImm { load: false, signed: false, size: sz, rt: X10, rn: X9, offset: foff });
+            }
+        }
+    }
+
+    /// Shared implementation of `call`/`invoke`: marshal arguments into the ABI registers, emit the
+    /// branch-and-link (direct or indirect), and collect the return value.
+    fn emit_call_core(
+        &mut self,
+        fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
+        fn_val: Value,
+        args: &[Value],
+    ) -> Value {
+        let indirect_ret = fn_abi.is_some_and(|a| a.ret.is_indirect());
+        // Marshal physical arguments into the integer (`x0..x7`) and floating-point (`v0..v7`)
+        // register banks; an sret pointer goes in x8.
+        let mut ngrn: u8 = 0;
+        let mut nsrn: u8 = 0;
+        for (i, &arg) in args.iter().enumerate() {
+            if indirect_ret && i == 0 {
+                self.materialize(arg, Gpr::from_encoding(8));
+            } else if type_is_float(self.cx, arg.ty()) {
+                self.materialize_fp(arg, Vreg::from_encoding(nsrn));
+                nsrn += 1;
+            } else {
+                self.materialize(arg, Gpr::from_encoding(ngrn));
+                ngrn += 1;
+            }
+        }
+        // Emit the call. Direct calls reference the symbol (BRANCH26 relocation); otherwise the
+        // callee address is materialized and called indirectly.
+        match fn_val {
+            Value::Sym { sym, offset, .. } => {
+                let name = self.cx.sym_name(sym);
+                self.emit(Inst::Bl { sym: SymRef { name, addend: offset } });
+            }
+            other => {
+                self.materialize(other, X9);
+                self.emit(Inst::Blr { rn: X9 });
+            }
+        }
+        // Collect the return value from x0 / v0 (scalar baseline).
+        match fn_abi {
+            Some(a) if !a.ret.is_indirect() && !a.ret.is_ignore() => {
+                let ty = self.cx.immediate_backend_type(a.ret.layout);
+                match self.cx.type_data(ty) {
+                    TypeData::Pair(fa, fb) => {
+                        // `PassMode::Pair`: field 0 comes back in x0/v0, field 1 in x1/v1; pack
+                        // them into a fresh slot.
+                        let (size, align) = self.cx.type_size_align(ty);
+                        let base = self.alloc_slot(size, align) as u32;
+                        let mut ngrn: u8 = 0;
+                        let mut nsrn: u8 = 0;
+                        for (idx, fty) in [(0usize, fa), (1usize, fb)] {
+                            let (foff, _) = self.cx.pair_field(ty, idx);
+                            let field_off = base + foff as u32;
+                            if type_is_float(self.cx, fty) {
+                                self.emit(Inst::LoadStoreFpUImm {
+                                    load: false,
+                                    size: fp_size(self.cx, fty),
+                                    rt: Vreg::from_encoding(nsrn),
+                                    rn: SP,
+                                    offset: field_off,
+                                });
+                                nsrn += 1;
+                            } else {
+                                self.emit(Inst::LoadStoreUImm {
+                                    load: false,
+                                    signed: false,
+                                    size: mem_size(self.cx, fty),
+                                    rt: Gpr::from_encoding(ngrn),
+                                    rn: SP,
+                                    offset: field_off,
+                                });
+                                ngrn += 1;
+                            }
+                        }
+                        Value::Slot { off: base, ty }
+                    }
+                    _ if type_is_float(self.cx, ty) => self.spill_fp(V0, ty),
+                    _ => self.spill(X0, ty),
+                }
+            }
+            _ => Value::Undef { ty: self.ptr_ty() },
+        }
+    }
+
+    /// Multiplication with overflow detection, returning `(low_product, overflowed)`.
+    ///
+    /// For 64-bit operands the high half of the 128-bit product is computed with `umulh`/`smulh`
+    /// and compared against the sign-extension of the low half (signed) or zero (unsigned). For
+    /// narrower widths the operands are extended to 64 bits, multiplied once, and the result is
+    /// range-checked against the type width.
+    fn checked_mul(
+        &mut self,
+        signed: bool,
+        val_ty: Type,
+        lhs: Value,
+        rhs: Value,
+    ) -> (Value, Value) {
+        let bool_ty = self.cx.intern_type(TypeData::Int(1));
+        let width = match self.cx.type_data(val_ty) {
+            TypeData::Int(b) => b,
+            _ => 64,
+        };
+        let overflow_cond = if width == 64 {
+            self.materialize(lhs, X9);
+            self.materialize(rhs, X10);
+            // high = mulhi(a, b); low = a * b (the result).
+            self.emit(Inst::MulHigh { signed, rd: X12, rn: X9, rm: X10 });
+            self.emit(Inst::Madd { size: OperandSize::S64, rd: X9, rn: X9, rm: X10, ra: ZR });
+            if signed {
+                // Overflow iff high != (low >>s 63).
+                self.load_imm(X13, 63, OperandSize::S64);
+                self.emit(Inst::DataProc2 {
+                    op: DataProc2::Asrv,
+                    size: OperandSize::S64,
+                    rd: X13,
+                    rn: X9,
+                    rm: X13,
+                });
+                self.emit(Inst::AddSubReg {
+                    op: AddSub::Sub,
+                    size: OperandSize::S64,
+                    set_flags: true,
+                    rd: ZR,
+                    rn: X12,
+                    rm: X13,
+                    amount: 0,
+                });
+            } else {
+                // Overflow iff high != 0.
+                self.emit(Inst::AddSubReg {
+                    op: AddSub::Sub,
+                    size: OperandSize::S64,
+                    set_flags: true,
+                    rd: ZR,
+                    rn: X12,
+                    rm: ZR,
+                    amount: 0,
+                });
+            }
+            Cond::Ne
+        } else {
+            // Widen to 64 bits so the full product fits, then range-check.
+            let i64ty = self.cx.intern_type(TypeData::Int(64));
+            let a = if signed { self.sext(lhs, i64ty) } else { self.zext(lhs, i64ty) };
+            let b = if signed { self.sext(rhs, i64ty) } else { self.zext(rhs, i64ty) };
+            self.materialize(a, X9);
+            self.materialize(b, X10);
+            self.emit(Inst::Madd { size: OperandSize::S64, rd: X9, rn: X9, rm: X10, ra: ZR });
+            if signed {
+                // Overflow iff the product differs from the sign-extension of its low `width` bits.
+                let shift = (64 - width) as u128;
+                self.load_imm(X13, shift, OperandSize::S64);
+                self.emit(Inst::DataProc2 {
+                    op: DataProc2::Lslv,
+                    size: OperandSize::S64,
+                    rd: X12,
+                    rn: X9,
+                    rm: X13,
+                });
+                self.emit(Inst::DataProc2 {
+                    op: DataProc2::Asrv,
+                    size: OperandSize::S64,
+                    rd: X12,
+                    rn: X12,
+                    rm: X13,
+                });
+                self.emit(Inst::AddSubReg {
+                    op: AddSub::Sub,
+                    size: OperandSize::S64,
+                    set_flags: true,
+                    rd: ZR,
+                    rn: X9,
+                    rm: X12,
+                    amount: 0,
+                });
+            } else {
+                // Overflow iff any bit above `width` is set.
+                self.load_imm(X13, width as u128, OperandSize::S64);
+                self.emit(Inst::DataProc2 {
+                    op: DataProc2::Lsrv,
+                    size: OperandSize::S64,
+                    rd: X12,
+                    rn: X9,
+                    rm: X13,
+                });
+                self.emit(Inst::AddSubReg {
+                    op: AddSub::Sub,
+                    size: OperandSize::S64,
+                    set_flags: true,
+                    rd: ZR,
+                    rn: X12,
+                    rm: ZR,
+                    amount: 0,
+                });
+            }
+            Cond::Ne
+        };
+        // cset overflow, cond  ==  csinc overflow, wzr, wzr, invert(cond)
+        self.emit(Inst::CondSel {
+            op: CondSel::Csinc,
+            size: OperandSize::S32,
+            rd: X11_HACK,
+            rn: ZR,
+            rm: ZR,
+            cond: overflow_cond.invert(),
+        });
+        let result = self.spill(X9, val_ty);
+        let overflow = self.spill(X11_HACK, bool_ty);
+        (result, overflow)
     }
 }
