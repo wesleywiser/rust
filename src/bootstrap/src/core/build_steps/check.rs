@@ -600,6 +600,85 @@ impl Step for CraneliftCodegenBackend {
     }
 }
 
+/// Check the ARM64 codegen backend.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Arm64CodegenBackend {
+    build_compiler: CompilerForCheck,
+    target: TargetSelection,
+}
+
+impl Step for Arm64CodegenBackend {
+    type Output = ();
+    const IS_HOST: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.alias("rustc_codegen_arm64").alias("cg_arm64")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        false
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(Arm64CodegenBackend {
+            build_compiler: prepare_compiler_for_check(run.builder, run.target, Mode::Codegen),
+            target: run.target,
+        });
+    }
+
+    fn run(self, builder: &Builder<'_>) {
+        let build_compiler = self.build_compiler.build_compiler();
+        let target = self.target;
+
+        let mut cargo = builder::Cargo::new(
+            builder,
+            build_compiler,
+            Mode::Codegen,
+            SourceType::InTree,
+            target,
+            builder.kind,
+        );
+
+        cargo
+            .arg("--manifest-path")
+            .arg(builder.src.join("compiler/rustc_codegen_arm64/Cargo.toml"));
+        rustc_cargo_env(builder, &mut cargo, target);
+        self.build_compiler.configure_cargo(&mut cargo);
+
+        let _guard = builder.msg(
+            Kind::Check,
+            "rustc_codegen_arm64",
+            Mode::Codegen,
+            build_compiler,
+            target,
+        );
+
+        let stamp = build_stamp::codegen_backend_stamp(
+            builder,
+            build_compiler,
+            target,
+            &CodegenBackendKind::Custom("arm64".to_owned()),
+        )
+        .with_prefix("check");
+
+        run_cargo(
+            builder,
+            cargo,
+            builder.config.free_args.clone(),
+            &stamp,
+            vec![],
+            ArtifactKeepMode::OnlyRmeta,
+        );
+    }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(
+            StepMetadata::check("rustc_codegen_arm64", self.target)
+                .built_by(self.build_compiler.build_compiler()),
+        )
+    }
+}
+
 /// Check the GCC codegen backend.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GccCodegenBackend {

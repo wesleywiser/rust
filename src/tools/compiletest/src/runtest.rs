@@ -1538,6 +1538,7 @@ impl<'test> TestCx<'test> {
             // Note that some suites never actually use this method, so the
             // return value for those suites is not necessarily meaningful.
             TestSuite::AssemblyLlvm
+            | TestSuite::AssemblyArm64
             | TestSuite::BuildStd
             | TestSuite::CodegenLlvm
             | TestSuite::CodegenUnits

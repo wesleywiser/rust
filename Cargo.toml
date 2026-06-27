@@ -51,6 +51,7 @@ members = [
 
 exclude = [
   "build",
+  "compiler/rustc_codegen_arm64",
   "compiler/rustc_codegen_cranelift",
   "compiler/rustc_codegen_gcc",
   "src/bootstrap",

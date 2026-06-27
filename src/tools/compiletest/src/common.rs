@@ -58,6 +58,7 @@ string_enum! {
     #[derive(Clone, Copy, PartialEq, Debug)]
     pub(crate) enum TestSuite {
         AssemblyLlvm => "assembly-llvm",
+        AssemblyArm64 => "assembly-arm64",
         CodegenLlvm => "codegen-llvm",
         CodegenUnits => "codegen-units",
         Coverage => "coverage",

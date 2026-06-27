@@ -1945,6 +1945,52 @@ test!(AssemblyLlvm {
     default: true
 });
 
+/// Runs the `tests/assembly-arm64` suite against the `rustc_codegen_arm64` backend.
+///
+/// Unlike the macro-generated suites, this step first builds the arm64 codegen backend and installs
+/// it into the test compiler's sysroot, so the test files can select it with
+/// `-Zcodegen-backend=arm64`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AssemblyArm64 {
+    test_compiler: Compiler,
+    target: TargetSelection,
+}
+
+impl Step for AssemblyArm64 {
+    type Output = ();
+    const IS_HOST: bool = false;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.suite_path("tests/assembly-arm64")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        false
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        let test_compiler = run.builder.compiler(run.builder.top_stage, run.build_triple());
+        run.builder.ensure(AssemblyArm64 { test_compiler, target: run.target });
+    }
+
+    fn run(self, builder: &Builder<'_>) {
+        // Build the arm64 codegen backend and install it into the test compiler's sysroot so the
+        // tests can select it with `-Zcodegen-backend=arm64`.
+        let compilers = RustcPrivateCompilers::new(builder, self.test_compiler.stage, self.target);
+        let stamp = builder.ensure(compile::Arm64CodegenBackend { compilers });
+        compile::copy_codegen_backends_to_sysroot(builder, stamp, self.test_compiler);
+
+        builder.ensure(Compiletest {
+            test_compiler: self.test_compiler,
+            target: self.target,
+            mode: CompiletestMode::Assembly,
+            suite: "assembly-arm64",
+            path: "tests/assembly-arm64",
+            compare_mode: None,
+        });
+    }
+}
+
 /// Runs the coverage test suite at `tests/coverage` in some or all of the
 /// coverage test modes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
