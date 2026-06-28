@@ -157,6 +157,18 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
                 );
             }
         }
+        Inst::AddSubExtReg { op, size, rd, rn, rm } => {
+            let mnem = match op {
+                AddSub::Add => "add",
+                AddSub::Sub => "sub",
+            };
+            // `rd`/`rn` use the SP-aware name (register 31 is `sp`, not the zero register, in the
+            // extended-register form).
+            line(
+                out,
+                &format!("{mnem} {}, {}, {}", rd.name(size), rn.name(size), rm.name(size)),
+            );
+        }
         Inst::Logical { op, size, rd, rn, rm, amount } => {
             let mnem = match op {
                 LogicOp::And => "and",

@@ -21,7 +21,7 @@
 //! rather than fixed up afterwards.
 
 /// Align `value` up to the next multiple of `align` (which must be a power of two).
-pub(crate) fn align_up(value: u32, align: u32) -> u32 {
+pub(crate) fn align_up(value: u64, align: u64) -> u64 {
     debug_assert!(align.is_power_of_two());
     (value + align - 1) & !(align - 1)
 }
@@ -34,25 +34,25 @@ pub(crate) fn align_up(value: u32, align: u32) -> u32 {
 pub struct FrameLayout {
     /// Size of the outgoing-argument area at the bottom of the frame (`sp + 0 .. sp + outgoing`),
     /// rounded up to the 16-byte stack alignment.
-    outgoing_size: u32,
+    outgoing_size: u64,
     /// `sp`-relative offset at which the next local slot will be placed; starts just above the
     /// outgoing area and grows as slots are allocated.
-    next_local: u32,
+    next_local: u64,
 }
 
 impl FrameLayout {
     /// Reserve `outgoing_bytes` (rounded up to the 16-byte stack alignment) for outgoing call
     /// arguments at the bottom of the frame.
-    pub fn new(outgoing_bytes: u32) -> FrameLayout {
+    pub fn new(outgoing_bytes: u64) -> FrameLayout {
         let outgoing_size = align_up(outgoing_bytes, 16);
         FrameLayout { outgoing_size, next_local: outgoing_size }
     }
 
     /// Allocate a local spill slot of `size`/`align` bytes, returning its `sp`-relative offset.
-    pub fn alloc_local(&mut self, size: u64, align: u64) -> u32 {
-        let align = (align.max(1)) as u32;
+    pub fn alloc_local(&mut self, size: u64, align: u64) -> u64 {
+        let align = align.max(1);
         let off = align_up(self.next_local, align);
-        self.next_local = off + (size.max(1)) as u32;
+        self.next_local = off + size.max(1);
         off
     }
 
@@ -60,7 +60,7 @@ impl FrameLayout {
     ///
     /// Outgoing arguments occupy `sp + 0 .. sp + outgoing_size`; callers must keep `arg_offset`
     /// within that range (guaranteed by the outgoing-area pre-pass).
-    pub fn outgoing_arg(&self, arg_offset: u32) -> u32 {
+    pub fn outgoing_arg(&self, arg_offset: u64) -> u64 {
         debug_assert!(arg_offset < self.outgoing_size || self.outgoing_size == 0);
         arg_offset
     }
@@ -69,18 +69,18 @@ impl FrameLayout {
     ///
     /// Our caller places stack arguments immediately above our saved `fp`/`lr`, i.e. at
     /// `fp + 16 + arg_offset`.
-    pub fn incoming_arg(&self, arg_offset: u32) -> u32 {
+    pub fn incoming_arg(&self, arg_offset: u64) -> u64 {
         16 + arg_offset
     }
 
     /// The bytes reserved for the outgoing-argument area.
-    pub fn outgoing_size(&self) -> u32 {
+    pub fn outgoing_size(&self) -> u64 {
         self.outgoing_size
     }
 
     /// The total frame size (outgoing area + local slots), rounded up to the 16-byte stack
     /// alignment. This is what the prologue subtracts from `sp`.
-    pub fn frame_size(&self) -> u32 {
+    pub fn frame_size(&self) -> u64 {
         align_up(self.next_local, 16)
     }
 }

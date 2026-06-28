@@ -168,9 +168,13 @@ pub enum Inst {
         rm: Gpr,
         amount: u8,
     },
+    /// `add`/`sub rd, rn, rm` (extended-register form, `UXTX #0`). Unlike the shifted-register
+    /// form, this permits the stack pointer as `rd`/`rn`, so it is used to adjust `sp` by, or form
+    /// frame addresses from, an offset materialized in a register (for frames too large for an
+    /// immediate).
+    AddSubExtReg { op: AddSub, size: OperandSize, rd: Gpr, rn: Gpr, rm: Gpr },
     /// `and`/`orr`/`eor`/`ands rd, rn, rm` (shifted-register form).
     Logical { op: LogicOp, size: OperandSize, rd: Gpr, rn: Gpr, rm: Gpr, amount: u8 },
-
     /// `madd rd, rn, rm, ra` (`mul` is `madd … , zr`).
     Madd { size: OperandSize, rd: Gpr, rn: Gpr, rm: Gpr, ra: Gpr },
     /// `msub rd, rn, rm, ra` (basis for `rem`).
@@ -190,8 +194,10 @@ pub enum Inst {
     /// `csel`/`csinc`/`csinv`/`csneg rd, rn, rm, cond`.
     CondSel { op: CondSel, size: OperandSize, rd: Gpr, rn: Gpr, rm: Gpr, cond: Cond },
 
-    /// Load/store with an unsigned, scaled 12-bit immediate offset: `[rn, #imm]`.
-    LoadStoreUImm { load: bool, signed: bool, size: MemSize, rt: Gpr, rn: Gpr, offset: u32 },
+    /// Load/store with an unsigned, scaled 12-bit immediate offset: `[rn, #imm]`. The offset is a
+    /// `u64` so it can address arbitrarily large frames; the builder routes offsets that exceed the
+    /// encodable range through a register instead (see `builder::push_mem_*`).
+    LoadStoreUImm { load: bool, signed: bool, size: MemSize, rt: Gpr, rn: Gpr, offset: u64 },
     /// Load/store pair: `stp`/`ldp rt, rt2, [rn{, #imm}]` with the given index mode.
     LoadStorePair {
         load: bool,
@@ -235,7 +241,7 @@ pub enum Inst {
     /// materialize floating-point constants).
     FmovFromGpr { size: FpSize, rd: Vreg, rn: Gpr },
     /// `ldr`/`str` of a scalar FP register with an unsigned, scaled 12-bit immediate offset.
-    LoadStoreFpUImm { load: bool, size: FpSize, rt: Vreg, rn: Gpr, offset: u32 },
+    LoadStoreFpUImm { load: bool, size: FpSize, rt: Vreg, rn: Gpr, offset: u64 },
     /// `fcmp rn, rm` — floating-point compare, setting the NZCV flags.
     FpCmp { size: FpSize, rn: Vreg, rm: Vreg },
     /// `scvtf`/`ucvtf` — integer (in a GPR) to floating-point conversion.
@@ -379,6 +385,22 @@ impl Inst {
                     | (rn.encoding() << 5)
                     | rd.encoding()
             }
+            Inst::AddSubExtReg { op, size, rd, rn, rm } => {
+                let op_bit = match op {
+                    AddSub::Add => 0,
+                    AddSub::Sub => 1,
+                };
+                // Extended-register form with `UXTX #0` (option=0b011, imm3=0): a plain 64-bit
+                // register operand that, unlike the shifted form, allows `sp` as `rd`/`rn`.
+                (size.sf() << 31)
+                    | (op_bit << 30)
+                    | (0b01011 << 24)
+                    | (1 << 21)
+                    | (rm.encoding() << 16)
+                    | (0b011 << 13)
+                    | (rn.encoding() << 5)
+                    | rd.encoding()
+            }
             Inst::Logical { op, size, rd, rn, rm, amount } => {
                 encode_logical(op, size, rd, rn, rm, amount)
             }
@@ -487,14 +509,15 @@ impl Inst {
                 } else {
                     0b10
                 };
-                let scaled = offset / size.bytes();
-                debug_assert!(offset % size.bytes() == 0, "unaligned scaled offset");
+                let bytes = size.bytes() as u64;
+                debug_assert!(offset % bytes == 0, "unaligned scaled offset");
+                let scaled = offset / bytes;
                 debug_assert!(scaled < (1 << 12), "offset out of range for unsigned-imm form");
                 (size.size_field() << 30)
                     | (0b111 << 27)
                     | (0b01 << 24)
                     | (opc << 22)
-                    | (scaled << 10)
+                    | ((scaled as u32) << 10)
                     | (rn.encoding() << 5)
                     | rt.encoding()
             }
@@ -605,7 +628,7 @@ impl Inst {
                 debug_assert!(offset % scale == 0, "unaligned scaled FP offset");
                 let scaled = offset / scale;
                 debug_assert!(scaled < (1 << 12), "FP offset out of range for unsigned-imm form");
-                base | (scaled << 10) | (rn.encoding() << 5) | rt.encoding()
+                base | ((scaled as u32) << 10) | (rn.encoding() << 5) | rt.encoding()
             }
             Inst::FpCmp { size, rn, rm } => {
                 let base: u32 = match size {
@@ -1093,6 +1116,61 @@ mod tests {
         assert_eq!(
             Inst::MulHigh { signed: true, rd: X9, rn: X10, rm: X11 }.encode(),
             0x9B4B7D49
+        );
+    }
+
+    #[test]
+    fn ext_reg_encodings() {
+        // add x16, sp, x16 (UXTX #0) — form a frame address from a register-held offset.
+        assert_eq!(
+            Inst::AddSubExtReg {
+                op: AddSub::Add,
+                size: OperandSize::S64,
+                rd: X16,
+                rn: SP,
+                rm: X16,
+            }
+            .encode(),
+            0x8B3063F0
+        );
+        // sub sp, sp, x16 (UXTX #0) — reserve a large frame.
+        assert_eq!(
+            Inst::AddSubExtReg {
+                op: AddSub::Sub,
+                size: OperandSize::S64,
+                rd: SP,
+                rn: SP,
+                rm: X16,
+            }
+            .encode(),
+            0xCB3063FF
+        );
+        // add sp, sp, x16 (UXTX #0) — release a large frame.
+        assert_eq!(
+            Inst::AddSubExtReg {
+                op: AddSub::Add,
+                size: OperandSize::S64,
+                rd: SP,
+                rn: SP,
+                rm: X16,
+            }
+            .encode(),
+            0x8B3063FF
+        );
+        // A scaled immediate load/store offset above 32 KiB (4096 * 8) would overflow the 12-bit
+        // field; the builder must route such offsets through a register instead. Confirm a
+        // just-in-range offset still encodes (ldr x0, [sp, #32760]).
+        assert_eq!(
+            Inst::LoadStoreUImm {
+                load: true,
+                signed: false,
+                size: MemSize::X,
+                rt: X0,
+                rn: SP,
+                offset: 32760,
+            }
+            .encode(),
+            0xF97FFFE0
         );
     }
 

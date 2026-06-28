@@ -49,8 +49,9 @@ pub enum Value {
     /// The address of a named symbol plus a byte offset (functions, statics, string literals).
     Sym { sym: Sym, offset: i64, ty: Type },
     /// A scalar value (integer, float, or pointer) materialized at the given `sp`-relative frame
-    /// offset. This is how the baseline keeps every non-constant SSA value live.
-    Slot { off: u32, ty: Type },
+    /// offset. This is how the baseline keeps every non-constant SSA value live. The offset is a
+    /// `u64` because frames are not bounded to 4 GiB.
+    Slot { off: u64, ty: Type },
     /// An undefined/poison value of the given type.
     Undef { ty: Type },
 }

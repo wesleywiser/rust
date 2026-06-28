@@ -41,7 +41,7 @@ use crate::mach::inst::{
 };
 use crate::mach::reg::{
     Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V1, V16, V17, X0, X1, X2, X9, X10, X12,
-    X13, ZR,
+    X13, X16, ZR,
 };
 
 /// State for the function currently being lowered.
@@ -63,7 +63,7 @@ impl FunctionBuild {
         func: Function,
         name: Box<str>,
         is_global: bool,
-        outgoing_bytes: u32,
+        outgoing_bytes: u64,
     ) -> FunctionBuild {
         FunctionBuild {
             func,
@@ -100,18 +100,14 @@ impl FunctionBuild {
             offset: -16,
         });
         f.push(Inst::MovSp { size: OperandSize::S64, rd: FP, rn: SP });
-        if frame > 0 {
-            f.push(sub_sp(frame));
-        }
+        push_sp_adjust(&mut f.insts, AddSub::Sub, frame);
 
         for (id, block) in self.blocks.into_iter().enumerate() {
             f.push(Inst::Label(id as Label));
             for inst in block {
                 if let Inst::Ret { .. } = inst {
                     // Epilogue before every return.
-                    if frame > 0 {
-                        f.push(add_sp(frame));
-                    }
+                    push_sp_adjust(&mut f.insts, AddSub::Add, frame);
                     f.push(Inst::LoadStorePair {
                         load: true,
                         size: OperandSize::S64,
@@ -129,29 +125,92 @@ impl FunctionBuild {
     }
 }
 
-/// `sub sp, sp, #frame` (frame assumed to fit in a 12-bit immediate for now).
-fn sub_sp(frame: u32) -> Inst {
-    Inst::AddSubImm {
-        op: AddSub::Sub,
+/// Whether a byte `offset` fits the scaled 12-bit unsigned-immediate load/store form for an access
+/// of `size_bytes` bytes (the encoded field holds `offset / size_bytes`, which must be < 4096).
+fn imm_offset_fits(offset: u64, size_bytes: u64) -> bool {
+    offset % size_bytes == 0 && offset / size_bytes < (1 << 12)
+}
+
+/// Push a `movz`/`movk` sequence materializing the 64-bit `value` into `reg`.
+fn push_load_imm64(out: &mut Vec<Inst>, reg: Gpr, value: u64) {
+    out.push(Inst::MovWide {
+        kind: MovKind::Zero,
         size: OperandSize::S64,
-        set_flags: false,
-        rd: SP,
-        rn: SP,
-        imm12: frame as u16,
-        shift12: false,
+        rd: reg,
+        imm16: (value & 0xffff) as u16,
+        shift: 0,
+    });
+    for shift in [16u8, 32, 48] {
+        let chunk = ((value >> shift) & 0xffff) as u16;
+        if chunk != 0 {
+            out.push(Inst::MovWide {
+                kind: MovKind::Keep,
+                size: OperandSize::S64,
+                rd: reg,
+                imm16: chunk,
+                shift,
+            });
+        }
     }
 }
 
-/// `add sp, sp, #frame`.
-fn add_sp(frame: u32) -> Inst {
-    Inst::AddSubImm {
-        op: AddSub::Add,
-        size: OperandSize::S64,
-        set_flags: false,
-        rd: SP,
-        rn: SP,
-        imm12: frame as u16,
-        shift12: false,
+/// Push a GPR load/store of `rt` at `[base, #offset]`. Offsets too large for the scaled-immediate
+/// form have their address formed in the `x16` scratch first (`base + offset`, extended-register
+/// add so `sp` is allowed), then the access is done at `[x16]`.
+fn push_mem_gpr(
+    out: &mut Vec<Inst>,
+    load: bool,
+    signed: bool,
+    size: MemSize,
+    rt: Gpr,
+    base: Gpr,
+    offset: u64,
+) {
+    if imm_offset_fits(offset, size.bytes() as u64) {
+        out.push(Inst::LoadStoreUImm { load, signed, size, rt, rn: base, offset });
+    } else {
+        push_load_imm64(out, X16, offset);
+        out.push(Inst::AddSubExtReg { op: AddSub::Add, size: OperandSize::S64, rd: X16, rn: base, rm: X16 });
+        out.push(Inst::LoadStoreUImm { load, signed, size, rt, rn: X16, offset: 0 });
+    }
+}
+
+/// Push a floating-point load/store of `rt` at `[base, #offset]`, with the same large-offset
+/// handling as [`push_mem_gpr`].
+fn push_mem_fp(out: &mut Vec<Inst>, load: bool, size: FpSize, rt: Vreg, base: Gpr, offset: u64) {
+    let bytes = match size {
+        FpSize::S32 => 4,
+        FpSize::S64 => 8,
+    };
+    if imm_offset_fits(offset, bytes) {
+        out.push(Inst::LoadStoreFpUImm { load, size, rt, rn: base, offset });
+    } else {
+        push_load_imm64(out, X16, offset);
+        out.push(Inst::AddSubExtReg { op: AddSub::Add, size: OperandSize::S64, rd: X16, rn: base, rm: X16 });
+        out.push(Inst::LoadStoreFpUImm { load, size, rt, rn: X16, offset: 0 });
+    }
+}
+
+/// Push the stack-pointer adjustment for the prologue (`Sub`) or epilogue (`Add`). A frame too large
+/// for a single 12-bit immediate materializes the size into `x16` and uses the extended-register
+/// form (which, unlike the shifted form, permits `sp` as the destination/source).
+fn push_sp_adjust(out: &mut Vec<Inst>, op: AddSub, frame: u64) {
+    if frame == 0 {
+        return;
+    }
+    if frame < (1 << 12) {
+        out.push(Inst::AddSubImm {
+            op,
+            size: OperandSize::S64,
+            set_flags: false,
+            rd: SP,
+            rn: SP,
+            imm12: frame as u16,
+            shift12: false,
+        });
+    } else {
+        push_load_imm64(out, X16, frame);
+        out.push(Inst::AddSubExtReg { op, size: OperandSize::S64, rd: SP, rn: SP, rm: X16 });
     }
 }
 
@@ -170,8 +229,43 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         fb.blocks[self.block.0 as usize].push(inst);
     }
 
+    /// Emit a GPR load/store of `rt` at `[base, #offset]`, handling offsets too large for the
+    /// scaled-immediate form (see [`push_mem_gpr`]).
+    fn emit_mem_gpr(&mut self, load: bool, signed: bool, size: MemSize, rt: Gpr, base: Gpr, offset: u64) {
+        let mut cur = self.cx.cur_fn.borrow_mut();
+        let fb = cur.as_mut().expect("no function is currently being built");
+        push_mem_gpr(&mut fb.blocks[self.block.0 as usize], load, signed, size, rt, base, offset);
+    }
+
+    /// Emit a floating-point load/store of `rt` at `[base, #offset]` (see [`push_mem_fp`]).
+    fn emit_mem_fp(&mut self, load: bool, size: FpSize, rt: Vreg, base: Gpr, offset: u64) {
+        let mut cur = self.cx.cur_fn.borrow_mut();
+        let fb = cur.as_mut().expect("no function is currently being built");
+        push_mem_fp(&mut fb.blocks[self.block.0 as usize], load, size, rt, base, offset);
+    }
+
+    /// Form the address of a frame slot (`sp + off`) into `rd`. Offsets too large for the add's
+    /// 12-bit immediate are materialized into `rd` first, then added with the extended-register
+    /// form (which, unlike a shifted register, permits `sp` as the source).
+    fn emit_frame_addr(&mut self, rd: Gpr, off: u64) {
+        if off < (1 << 12) {
+            self.emit(Inst::AddSubImm {
+                op: AddSub::Add,
+                size: OperandSize::S64,
+                set_flags: false,
+                rd,
+                rn: SP,
+                imm12: off as u16,
+                shift12: false,
+            });
+        } else {
+            self.load_imm(rd, off as u128, OperandSize::S64);
+            self.emit(Inst::AddSubExtReg { op: AddSub::Add, size: OperandSize::S64, rd, rn: SP, rm: rd });
+        }
+    }
+
     /// Reserve a stack slot of the given size/alignment, returning its `sp`-relative offset.
-    pub fn alloc_slot(&self, size: u64, align: u64) -> u32 {
+    pub fn alloc_slot(&self, size: u64, align: u64) -> u64 {
         let mut cur = self.cx.cur_fn.borrow_mut();
         let fb = cur.as_mut().expect("no function is currently being built");
         fb.frame.alloc_local(size, align)
@@ -439,32 +533,25 @@ fn setup_params(cx: &CodegenCx<'_>, fb: &mut FunctionBuild, block: BasicBlock) {
         // a stack parameter is first loaded from the caller-provided incoming area (`fp + 16 + k`)
         // through a scratch register, then stored into its slot.
         match loc {
-            ParamLoc::Gpr(reg) => fb.blocks[block.0 as usize].push(Inst::LoadStoreUImm {
-                load: false,
-                signed: false,
-                size: mem_size(cx, ty),
-                rt: reg,
-                rn: SP,
-                offset: off,
-            }),
-            ParamLoc::Fp(reg) => fb.blocks[block.0 as usize].push(Inst::LoadStoreFpUImm {
-                load: false,
-                size: fp_size(cx, ty),
-                rt: reg,
-                rn: SP,
-                offset: off,
-            }),
+            ParamLoc::Gpr(reg) => {
+                let out = &mut fb.blocks[block.0 as usize];
+                push_mem_gpr(out, false, false, mem_size(cx, ty), reg, SP, off);
+            }
+            ParamLoc::Fp(reg) => {
+                let out = &mut fb.blocks[block.0 as usize];
+                push_mem_fp(out, false, fp_size(cx, ty), reg, SP, off);
+            }
             ParamLoc::Stack(arg_off) => {
-                let incoming = fb.frame.incoming_arg(arg_off);
-                let block = &mut fb.blocks[block.0 as usize];
+                let incoming = fb.frame.incoming_arg(arg_off as u64);
+                let out = &mut fb.blocks[block.0 as usize];
                 if type_is_float(cx, ty) {
                     let size = fp_size(cx, ty);
-                    block.push(Inst::LoadStoreFpUImm { load: true, size, rt: V16, rn: FP, offset: incoming });
-                    block.push(Inst::LoadStoreFpUImm { load: false, size, rt: V16, rn: SP, offset: off });
+                    push_mem_fp(out, true, size, V16, FP, incoming);
+                    push_mem_fp(out, false, size, V16, SP, off);
                 } else {
                     let size = mem_size(cx, ty);
-                    block.push(Inst::LoadStoreUImm { load: true, signed: false, size, rt: X9, rn: FP, offset: incoming });
-                    block.push(Inst::LoadStoreUImm { load: false, signed: false, size, rt: X9, rn: SP, offset: off });
+                    push_mem_gpr(out, true, false, size, X9, FP, incoming);
+                    push_mem_gpr(out, false, false, size, X9, SP, off);
                 }
             }
         }
@@ -480,14 +567,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             Value::Const { bits, ty } => self.load_imm(reg, bits, op_size(self.cx, ty)),
             Value::Undef { ty } => self.load_imm(reg, 0, op_size(self.cx, ty)),
             Value::Slot { off, ty } => {
-                self.emit(Inst::LoadStoreUImm {
-                    load: true,
-                    signed: false,
-                    size: mem_size(self.cx, ty),
-                    rt: reg,
-                    rn: SP,
-                    offset: off,
-                });
+                self.emit_mem_gpr(true, false, mem_size(self.cx, ty), reg, SP, off);
             }
             Value::Sym { sym, offset, ty: _ } => {
                 let symref = SymRef { name: self.cx.sym_name(sym), addend: offset };
@@ -542,15 +622,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Store `reg` into a fresh frame slot and return a [`Value::Slot`] referring to it.
     fn spill(&mut self, reg: Gpr, ty: Type) -> Value {
         let (size, align) = self.cx.type_size_align(ty);
-        let off = self.alloc_slot(size, align) as u32;
-        self.emit(Inst::LoadStoreUImm {
-            load: false,
-            signed: false,
-            size: mem_size(self.cx, ty),
-            rt: reg,
-            rn: SP,
-            offset: off,
-        });
+        let off = self.alloc_slot(size, align);
+        self.emit_mem_gpr(false, false, mem_size(self.cx, ty), reg, SP, off);
         Value::Slot { off, ty }
     }
 
@@ -748,7 +821,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let size = fp_size(self.cx, ty);
         match val {
             Value::Slot { off, .. } => {
-                self.emit(Inst::LoadStoreFpUImm { load: true, size, rt: vreg, rn: SP, offset: off });
+                self.emit_mem_fp(true, size, vreg, SP, off);
             }
             Value::Const { bits, .. } => {
                 // Load the raw IEEE-754 bit pattern into a scratch GPR, then move it across.
@@ -772,14 +845,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Store the SIMD&FP register `vreg` into a fresh frame slot, returning a [`Value::Slot`].
     fn spill_fp(&mut self, vreg: Vreg, ty: Type) -> Value {
         let (size, align) = self.cx.type_size_align(ty);
-        let off = self.alloc_slot(size, align) as u32;
-        self.emit(Inst::LoadStoreFpUImm {
-            load: false,
-            size: fp_size(self.cx, ty),
-            rt: vreg,
-            rn: SP,
-            offset: off,
-        });
+        let off = self.alloc_slot(size, align);
+        self.emit_mem_fp(false, fp_size(self.cx, ty), vreg, SP, off);
         Value::Slot { off, ty }
     }
 
@@ -1315,7 +1382,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 Some(instance) => outgoing_arg_bytes(cx, instance),
                 None => 0,
             };
-            let mut fb = FunctionBuild::new(llfn, name, is_global, outgoing);
+            let mut fb = FunctionBuild::new(llfn, name, is_global, outgoing as u64);
             let entry = fb.new_block();
             setup_params(cx, &mut fb, entry);
             *cx.cur_fn.borrow_mut() = Some(fb);
@@ -1705,15 +1772,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn alloca(&mut self, size: Size, align: Align) -> Value {
         let off = self.alloc_slot(size.bytes(), align.bytes());
-        self.emit(Inst::AddSubImm {
-            op: AddSub::Add,
-            size: OperandSize::S64,
-            set_flags: false,
-            rd: X9,
-            rn: SP,
-            imm12: off as u16,
-            shift12: false,
-        });
+        self.emit_frame_addr(X9, off);
         let ptr_ty = self.ptr_ty();
         self.spill(X9, ptr_ty)
     }
@@ -2078,7 +2137,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         // A packed pair lives in a stack slot; field `idx` is a sub-slot at its byte offset.
         let (off, fty) = self.cx.pair_field(agg_val.ty(), idx as usize);
         match agg_val {
-            Value::Slot { off: base, .. } => Value::Slot { off: base + off as u32, ty: fty },
+            Value::Slot { off: base, .. } => Value::Slot { off: base + off as u64, ty: fty },
             _ => Value::Undef { ty: fty },
         }
     }
@@ -2090,29 +2149,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             Value::Slot { off, .. } => off,
             _ => {
                 let (size, align) = self.cx.type_size_align(pair_ty);
-                self.alloc_slot(size, align) as u32
+                self.alloc_slot(size, align)
             }
         };
-        let field_off = base + foff as u32;
+        let field_off = base + foff as u64;
         if type_is_float(self.cx, elt.ty()) {
             self.materialize_fp(elt, V16);
-            self.emit(Inst::LoadStoreFpUImm {
-                load: false,
-                size: fp_size(self.cx, elt.ty()),
-                rt: V16,
-                rn: SP,
-                offset: field_off,
-            });
+            self.emit_mem_fp(false, fp_size(self.cx, elt.ty()), V16, SP, field_off);
         } else {
             self.materialize(elt, X9);
-            self.emit(Inst::LoadStoreUImm {
-                load: false,
-                signed: false,
-                size: mem_size(self.cx, elt.ty()),
-                rt: X9,
-                rn: SP,
-                offset: field_off,
-            });
+            self.emit_mem_gpr(false, false, mem_size(self.cx, elt.ty()), X9, SP, field_off);
         }
         Value::Slot { off: base, ty: pair_ty }
     }
@@ -2306,19 +2352,19 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Load a scalar pair from memory at `ptr` into a fresh packed slot, field by field.
     fn load_pair(&mut self, ty: Type, ptr: Value) -> Value {
         let (size, align) = self.cx.type_size_align(ty);
-        let base = self.alloc_slot(size, align) as u32;
+        let base = self.alloc_slot(size, align);
         self.materialize(ptr, X9);
         for idx in 0..2 {
             let (foff, fty) = self.cx.pair_field(ty, idx);
-            let foff = foff as u32;
+            let foff = foff as u64;
             if type_is_float(self.cx, fty) {
                 let sz = fp_size(self.cx, fty);
                 self.emit(Inst::LoadStoreFpUImm { load: true, size: sz, rt: V16, rn: X9, offset: foff });
-                self.emit(Inst::LoadStoreFpUImm { load: false, size: sz, rt: V16, rn: SP, offset: base + foff });
+                self.emit_mem_fp(false, sz, V16, SP, base + foff);
             } else {
                 let sz = mem_size(self.cx, fty);
                 self.emit(Inst::LoadStoreUImm { load: true, signed: false, size: sz, rt: X10, rn: X9, offset: foff });
-                self.emit(Inst::LoadStoreUImm { load: false, signed: false, size: sz, rt: X10, rn: SP, offset: base + foff });
+                self.emit_mem_gpr(false, false, sz, X10, SP, base + foff);
             }
         }
         Value::Slot { off: base, ty }
@@ -2331,14 +2377,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.materialize(ptr, X9);
         for idx in 0..2 {
             let (foff, fty) = self.cx.pair_field(ty, idx);
-            let foff = foff as u32;
+            let foff = foff as u64;
             if type_is_float(self.cx, fty) {
                 let sz = fp_size(self.cx, fty);
-                self.emit(Inst::LoadStoreFpUImm { load: true, size: sz, rt: V16, rn: SP, offset: sbase + foff });
+                self.emit_mem_fp(true, sz, V16, SP, sbase + foff);
                 self.emit(Inst::LoadStoreFpUImm { load: false, size: sz, rt: V16, rn: X9, offset: foff });
             } else {
                 let sz = mem_size(self.cx, fty);
-                self.emit(Inst::LoadStoreUImm { load: true, signed: false, size: sz, rt: X10, rn: SP, offset: sbase + foff });
+                self.emit_mem_gpr(true, false, sz, X10, SP, sbase + foff);
                 self.emit(Inst::LoadStoreUImm { load: false, signed: false, size: sz, rt: X10, rn: X9, offset: foff });
             }
         }
@@ -2369,13 +2415,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     nsrn += 1;
                 } else {
                     self.materialize_fp(arg, V16);
-                    self.emit(Inst::LoadStoreFpUImm {
-                        load: false,
-                        size: fp_size(self.cx, arg.ty()),
-                        rt: V16,
-                        rn: SP,
-                        offset: nsaa,
-                    });
+                    self.emit_mem_fp(false, fp_size(self.cx, arg.ty()), V16, SP, nsaa as u64);
                     nsaa += 8;
                 }
             } else if ngrn < 8 {
@@ -2383,14 +2423,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 ngrn += 1;
             } else {
                 self.materialize(arg, X9);
-                self.emit(Inst::LoadStoreUImm {
-                    load: false,
-                    signed: false,
-                    size: mem_size(self.cx, arg.ty()),
-                    rt: X9,
-                    rn: SP,
-                    offset: nsaa,
-                });
+                self.emit_mem_gpr(false, false, mem_size(self.cx, arg.ty()), X9, SP, nsaa as u64);
                 nsaa += 8;
             }
         }
@@ -2415,30 +2448,30 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         // `PassMode::Pair`: field 0 comes back in x0/v0, field 1 in x1/v1; pack
                         // them into a fresh slot.
                         let (size, align) = self.cx.type_size_align(ty);
-                        let base = self.alloc_slot(size, align) as u32;
+                        let base = self.alloc_slot(size, align);
                         let mut ngrn: u8 = 0;
                         let mut nsrn: u8 = 0;
                         for (idx, fty) in [(0usize, fa), (1usize, fb)] {
                             let (foff, _) = self.cx.pair_field(ty, idx);
-                            let field_off = base + foff as u32;
+                            let field_off = base + foff as u64;
                             if type_is_float(self.cx, fty) {
-                                self.emit(Inst::LoadStoreFpUImm {
-                                    load: false,
-                                    size: fp_size(self.cx, fty),
-                                    rt: Vreg::from_encoding(nsrn),
-                                    rn: SP,
-                                    offset: field_off,
-                                });
+                                self.emit_mem_fp(
+                                    false,
+                                    fp_size(self.cx, fty),
+                                    Vreg::from_encoding(nsrn),
+                                    SP,
+                                    field_off,
+                                );
                                 nsrn += 1;
                             } else {
-                                self.emit(Inst::LoadStoreUImm {
-                                    load: false,
-                                    signed: false,
-                                    size: mem_size(self.cx, fty),
-                                    rt: Gpr::from_encoding(ngrn),
-                                    rn: SP,
-                                    offset: field_off,
-                                });
+                                self.emit_mem_gpr(
+                                    false,
+                                    false,
+                                    mem_size(self.cx, fty),
+                                    Gpr::from_encoding(ngrn),
+                                    SP,
+                                    field_off,
+                                );
                                 ngrn += 1;
                             }
                         }
