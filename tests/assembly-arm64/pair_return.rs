@@ -42,10 +42,11 @@ pub extern "C" fn add_ovf(a: u64, b: u64) -> (u64, bool) {
 }
 
 // A homogeneous floating-point pair (an HFA) returns both fields in the FP registers `d0`/`d1`.
+// The two field values are computed (`fadd`/`fsub`), assembled into the aggregate, then loaded
+// back into the return registers. Pin both `fadd`/`fsub` and the two-register FP return.
 // CHECK-LABEL: _fpair:
 // CHECK: fadd d16, d16, d17
 // CHECK: fsub d16, d16, d17
-// CHECK: ldr d16, [x9, #8]
 // CHECK: ldr d0, [sp,
 // CHECK-NEXT: ldr d1, [sp,
 // CHECK-NEXT: add sp, sp,

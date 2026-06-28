@@ -7,7 +7,7 @@
 
 use std::ops::Deref;
 
-use rustc_abi::{Align, BackendRepr, HasDataLayout, Scalar, Size, TargetDataLayout, WrappingRange};
+use rustc_abi::{Align, BackendRepr, HasDataLayout, RegKind, Scalar, Size, TargetDataLayout, WrappingRange};
 use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_codegen_ssa::common::{
     AtomicRmwBinOp, IntPredicate, RealPredicate, SynchronizationScope,
@@ -29,7 +29,7 @@ use rustc_middle::ty::layout::{
 };
 use rustc_middle::ty::{self, AtomicOrdering, Instance, Ty, TyCtxt};
 use rustc_span::{Span, sym};
-use rustc_target::callconv::{ArgAbi, FnAbi, PassMode};
+use rustc_target::callconv::{ArgAbi, CastTarget, FnAbi, PassMode};
 use rustc_target::spec::{HasTargetSpec, Target};
 
 use crate::context::{BasicBlock, CodegenCx, Function, Type, TypeData, Value};
@@ -278,14 +278,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         for chunk in [8u64, 4, 2, 1] {
             let msize = mem_size_from_bytes(chunk);
             while o + chunk <= size {
-                self.emit(Inst::LoadStoreUImm {
-                    load: true,
-                    signed: false,
-                    size: msize,
-                    rt: X10,
-                    rn: src,
-                    offset: o,
-                });
+                self.emit_mem_gpr(true, false, msize, X10, src, o);
                 self.emit_mem_gpr(false, false, msize, X10, SP, dst_off + o);
                 o += chunk;
             }
@@ -300,14 +293,37 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             let msize = mem_size_from_bytes(chunk);
             while o + chunk <= size {
                 self.emit_mem_gpr(true, false, msize, X10, SP, src_off + o);
-                self.emit(Inst::LoadStoreUImm {
-                    load: false,
-                    signed: false,
-                    size: msize,
-                    rt: X10,
-                    rn: dst,
-                    offset: o,
-                });
+                self.emit_mem_gpr(false, false, msize, X10, dst, o);
+                o += chunk;
+            }
+        }
+    }
+
+    /// Copy `size` bytes from frame slot `src_off` to `[base + dst_off]`, using descending
+    /// power-of-two chunks through the `x10` scratch. Used to assemble/scatter `PassMode::Cast`
+    /// register pieces, whose offsets within an aggregate need not be 8-aligned. `base` and `dst`
+    /// must not be `x10`.
+    fn copy_slot_to_base_off(&mut self, src_off: u64, base: Gpr, dst_off: u64, size: u64) {
+        let mut o = 0u64;
+        for chunk in [8u64, 4, 2, 1] {
+            let msize = mem_size_from_bytes(chunk);
+            while o + chunk <= size {
+                self.emit_mem_gpr(true, false, msize, X10, SP, src_off + o);
+                self.emit_mem_gpr(false, false, msize, X10, base, dst_off + o);
+                o += chunk;
+            }
+        }
+    }
+
+    /// Copy `size` bytes from `[base + src_off]` into frame slot `dst_off` (mirror of
+    /// [`copy_slot_to_base_off`](Self::copy_slot_to_base_off)). `base` must not be `x10`.
+    fn copy_base_off_to_slot(&mut self, base: Gpr, src_off: u64, dst_off: u64, size: u64) {
+        let mut o = 0u64;
+        for chunk in [8u64, 4, 2, 1] {
+            let msize = mem_size_from_bytes(chunk);
+            while o + chunk <= size {
+                self.emit_mem_gpr(true, false, msize, X10, base, src_off + o);
+                self.emit_mem_gpr(false, false, msize, X10, SP, dst_off + o);
                 o += chunk;
             }
         }
@@ -904,10 +920,101 @@ fn push_scalar_param(cx: &CodegenCx<'_>, params: &mut Vec<(ParamLoc, Type)>, a: 
     params.push((loc, ty));
 }
 
-/// Compute the location and backend type of each physical parameter, following the baseline
-/// AAPCS64 split: integer/pointer arguments fill `x0..x7`, floating-point arguments fill `v0..v7`,
-/// an indirect-return (sret) pointer arrives in `x8`, and anything left once a register bank is
-/// exhausted is passed on the stack (each scalar occupying an 8-byte slot).
+/// One physical register's worth of a `PassMode::Cast` value: whether it is a SIMD&FP register, its
+/// width in bytes (the register's natural width — 4 or 8), the number of meaningful bytes it carries
+/// (`<= width`; smaller only for the final chunk of a non-8-multiple integer cast), and the byte
+/// offset of those bytes within the aggregate.
+#[derive(Clone, Copy)]
+struct CastReg {
+    fp: bool,
+    width: u32,
+    data: u32,
+    offset: u32,
+}
+
+/// Enumerate the registers a `CastTarget` occupies, following AAPCS64: the prefix registers (at
+/// consecutive offsets, or `prefix[0]@0` plus `rest@rest_offset`), then `ceil(rest.total / unit)`
+/// copies of the `rest` unit. Every register is kept at its full width so the all-or-nothing
+/// register/stack placement can be computed; `data` records how many bytes are actually meaningful.
+fn cast_regs(cast: &CastTarget) -> Vec<CastReg> {
+    fn is_fp(kind: RegKind) -> bool {
+        matches!(kind, RegKind::Float | RegKind::Vector { .. })
+    }
+    let mut regs = Vec::new();
+    let mut offset: u32 = 0;
+    if let Some(ro) = cast.rest_offset {
+        let p = cast.prefix[0];
+        let w = p.size.bytes() as u32;
+        regs.push(CastReg { fp: is_fp(p.kind), width: w, data: w, offset: 0 });
+        offset = ro.bytes() as u32;
+    } else {
+        for p in &cast.prefix {
+            let w = p.size.bytes() as u32;
+            regs.push(CastReg { fp: is_fp(p.kind), width: w, data: w, offset });
+            offset += w;
+        }
+    }
+    let unit = cast.rest.unit;
+    let usz = (unit.size.bytes() as u32).max(1);
+    let total = cast.rest.total.bytes() as u32;
+    if total > 0 {
+        let n = total.div_ceil(usz);
+        for i in 0..n {
+            let rel = i * usz;
+            let data = (total - rel).min(usz);
+            regs.push(CastReg { fp: is_fp(unit.kind), width: usz, data, offset: offset + rel });
+        }
+    }
+    regs
+}
+
+/// Assign a `PassMode::Cast` argument, pushing one physical parameter per register it occupies.
+/// AAPCS64 placement is all-or-nothing per register bank: if the cast's registers do not all fit in
+/// the remaining registers of their bank, the whole aggregate is passed contiguously on the stack.
+fn push_cast_param<'tcx>(
+    cx: &CodegenCx<'tcx>,
+    params: &mut Vec<(ParamLoc, Type)>,
+    a: &mut ArgAssign,
+    cast: &CastTarget,
+) {
+    let regs = cast_regs(cast);
+    let piece_ty = |r: &CastReg| {
+        if r.fp {
+            cx.intern_type(TypeData::Float(r.width * 8))
+        } else {
+            // Spill an integer piece at its meaningful width (rounded to a natural load/store size)
+            // so a 4-byte chunk uses `str w`, not `str x`; only `data` bytes are ever consumed.
+            cx.intern_type(TypeData::Int(r.data.next_power_of_two().max(1) * 8))
+        }
+    };
+    let n_int = regs.iter().filter(|r| !r.fp).count() as u8;
+    let n_fp = regs.iter().filter(|r| r.fp).count() as u8;
+    if a.ngrn + n_int <= 8 && a.nsrn + n_fp <= 8 {
+        for r in &regs {
+            if r.fp {
+                params.push((ParamLoc::Fp(Vreg::from_encoding(a.nsrn)), piece_ty(r)));
+                a.nsrn += 1;
+            } else {
+                params.push((ParamLoc::Gpr(Gpr::from_encoding(a.ngrn)), piece_ty(r)));
+                a.ngrn += 1;
+            }
+        }
+    } else {
+        if n_int > 0 {
+            a.ngrn = 8;
+        }
+        if n_fp > 0 {
+            a.nsrn = 8;
+        }
+        let align = (cast.align(cx).bytes() as u32).max(8);
+        let base = (a.nsaa + align - 1) & !(align - 1);
+        for r in &regs {
+            params.push((ParamLoc::Stack(base + r.offset), piece_ty(r)));
+        }
+        let size = cast.size(cx).bytes() as u32;
+        a.nsaa = base + ((size + 7) & !7);
+    }
+}
 fn build_param_list<'tcx>(cx: &CodegenCx<'tcx>, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> ParamList {
     let mut params = Vec::new();
     let ptr = cx.intern_type(TypeData::Ptr);
@@ -930,21 +1037,7 @@ fn build_param_list<'tcx>(cx: &CodegenCx<'tcx>, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) 
                 push_scalar_param(cx, &mut params, &mut a, y);
             }
             PassMode::Indirect { .. } => push_scalar_param(cx, &mut params, &mut a, ptr),
-            PassMode::Cast { ref cast, .. } => {
-                // A cast aggregate is passed in its ABI register form. Use the real cast register
-                // type so the param is spilled/stored at its true width: typing it as a plain
-                // `i64` (8 bytes) for, say, a 4-byte aggregate would store past the aggregate and
-                // corrupt the adjacent stack slot.
-                let cast_ty = cx.cast_backend_type(cast);
-                match cx.type_data(cast_ty) {
-                    TypeData::Int(_) | TypeData::Float(_) => {
-                        push_scalar_param(cx, &mut params, &mut a, cast_ty)
-                    }
-                    // Two-register and HFA casts keep the existing single-`i64` placement for now
-                    // (only 1-register casts were observed to be mis-sized); see `store_fn_arg`.
-                    _ => push_scalar_param(cx, &mut params, &mut a, cx.intern_type(TypeData::Int(64))),
-                }
-            }
+            PassMode::Cast { ref cast, .. } => push_cast_param(cx, &mut params, &mut a, cast),
         }
     }
     ParamList { params, stack_size: a.nsaa }
@@ -1913,35 +2006,40 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 .store(self, dst);
             }
             PassMode::Cast { ref cast, .. } => {
-                let val = self.get_param(*idx);
-                *idx += 1;
-                let cast_ty = self.cx.cast_backend_type(cast);
-                match self.cx.type_data(cast_ty) {
-                    TypeData::Int(_) | TypeData::Float(_) => {
-                        // 1-register cast: copy only the bytes that overlap the aggregate, since the
-                        // cast register may be wider than the aggregate (e.g. a 4-byte struct in an
-                        // `i32`, or a 3-byte struct in an `i32`). A full store of the register would
-                        // overflow the aggregate and clobber adjacent memory.
-                        let cast_size = self.cx.type_size_align(cast_ty).0;
-                        let copy = cast_size.min(dst.layout.size.bytes());
-                        if let Value::Slot { off, .. } = val {
-                            self.materialize(dst.val.llval, X9);
-                            self.copy_slot_to_ptr(off, X9, copy);
-                        } else {
-                            OperandValue::Immediate(val).store(self, dst);
-                        }
+                // A cast aggregate arrives in one or more registers (integer GPRs for a composite,
+                // SIMD&FP registers for an HFA). Each was spilled to its own param slot; copy the
+                // meaningful bytes of each back into the destination aggregate at its true offset.
+                let regs = cast_regs(cast);
+                self.materialize(dst.val.llval, X9);
+                let agg = dst.layout.size.bytes();
+                for r in &regs {
+                    let slot = self.get_param(*idx);
+                    *idx += 1;
+                    let Value::Slot { off, .. } = slot else { continue };
+                    let n = (r.data as u64).min(agg.saturating_sub(r.offset as u64));
+                    if n > 0 {
+                        self.copy_slot_to_base_off(off, X9, r.offset as u64, n);
                     }
-                    _ => OperandValue::Immediate(val).store(self, dst),
                 }
             }
         }
     }
     fn store_arg(
         &mut self,
-        _arg_abi: &ArgAbi<'tcx, Ty<'tcx>>,
+        arg_abi: &ArgAbi<'tcx, Ty<'tcx>>,
         val: Value,
         dst: PlaceRef<'tcx, Value>,
     ) {
+        // A `PassMode::Cast` value (e.g. a call's small-aggregate/HFA return collected by
+        // `collect_cast_ret`) is a slot already laid out as the aggregate; copy its bytes into the
+        // destination place. Everything else is a scalar immediate.
+        if let PassMode::Cast { .. } = arg_abi.mode {
+            if let Value::Slot { off, .. } = val {
+                self.materialize(dst.val.llval, X9);
+                self.copy_slot_to_ptr(off, X9, dst.layout.size.bytes());
+                return;
+            }
+        }
         OperandValue::Immediate(val).store(self, dst);
     }
 }
@@ -2421,6 +2519,21 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.emit(Inst::Ret { rn: LR });
     }
     fn ret(&mut self, v: Value) {
+        // A multi-register `PassMode::Cast` return (a small aggregate split across `x0:x1`, or an
+        // HFA across `v0..v3`) must be scattered back into its result registers. The return ABI is
+        // taken from the current function's `FnAbi`; a 1-register cast falls through to the scalar
+        // handling below (the value is already an immediate of the cast register's type).
+        if let Some(instance) = self.cx.cur_instance.get() {
+            let fn_abi = self.cx.fn_abi_of_instance(instance, ty::List::empty());
+            if let PassMode::Cast { ref cast, .. } = fn_abi.ret.mode {
+                let regs = cast_regs(cast);
+                if regs.len() > 1 {
+                    self.ret_cast_multi(v, &regs);
+                    self.emit(Inst::Ret { rn: LR });
+                    return;
+                }
+            }
+        }
         if let TypeData::Pair(..) = self.cx.type_data(v.ty()) {
             // `PassMode::Pair`: return field 0 in x0/v0 and field 1 in x1/v1 (per field class).
             let fields = [self.extract_value(v, 0), self.extract_value(v, 1)];
@@ -2869,6 +2982,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 self.copy_ptr_to_slot(off, X9, size);
                 return Value::Slot { off, ty };
             }
+            TypeData::Aggregate { .. } => {
+                // A `>2`-register cast aggregate (e.g. a 3- or 4-element HFA) does not fit in a
+                // single register; copy its full byte image into a fresh slot so the caller's
+                // argument/return marshalling can split it across the right registers.
+                let (size, align) = self.cx.type_size_align(ty);
+                let off = self.alloc_slot(size, align);
+                self.materialize(ptr, X9);
+                self.copy_ptr_to_slot(off, X9, size);
+                return Value::Slot { off, ty };
+            }
             _ => {}
         }
         self.materialize(ptr, X9);
@@ -3000,6 +3123,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         if let TypeData::Vector(..) = self.cx.type_data(val.ty()) {
             // Store a vector by copying its slot bytes into `[ptr]`.
             if let Some(off) = self.vector_to_slot(val) {
+                let (size, _) = self.cx.type_size_align(val.ty());
+                self.materialize(ptr, X9);
+                self.copy_slot_to_ptr(off, X9, size);
+            }
+            return Value::Undef { ty: self.ptr_ty() };
+        }
+        if let TypeData::Aggregate { .. } = self.cx.type_data(val.ty()) {
+            // An opaque aggregate (e.g. a multi-register cast value) is a byte image in a slot;
+            // copy it out in full rather than truncating to a single register store.
+            if let Value::Slot { off, .. } = val {
                 let (size, _) = self.cx.type_size_align(val.ty());
                 self.materialize(ptr, X9);
                 self.copy_slot_to_ptr(off, X9, size);
@@ -3557,9 +3690,17 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 self.emit(Inst::LoadStoreFpUImm { load: true, size: sz, rt: V16, rn: X9, offset: foff });
                 self.emit_mem_fp(false, sz, V16, SP, base + foff);
             } else {
-                let sz = mem_size(self.cx, fty);
-                self.emit(Inst::LoadStoreUImm { load: true, signed: false, size: sz, rt: X10, rn: X9, offset: foff });
-                self.emit_mem_gpr(false, false, sz, X10, SP, base + foff);
+                let fsize = self.cx.type_size_align(fty).0;
+                if matches!(fsize, 1 | 2 | 4 | 8) {
+                    let sz = mem_size_from_bytes(fsize);
+                    self.emit(Inst::LoadStoreUImm { load: true, signed: false, size: sz, rt: X10, rn: X9, offset: foff });
+                    self.emit_mem_gpr(false, false, sz, X10, SP, base + foff);
+                } else {
+                    // An odd-width integer field — e.g. the `i24`/`i40`/`i48`/`i56` remainder of a
+                    // cast `Pair` — would over-read/write at a single 8-byte access (`mem_size`
+                    // rounds 3/5/6/7 up to `x`); copy exactly its bytes instead.
+                    self.copy_base_off_to_slot(X9, foff, base + foff, fsize);
+                }
             }
         }
         Value::Slot { off: base, ty }
@@ -3578,9 +3719,179 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 self.emit_mem_fp(true, sz, V16, SP, sbase + foff);
                 self.emit(Inst::LoadStoreFpUImm { load: false, size: sz, rt: V16, rn: X9, offset: foff });
             } else {
-                let sz = mem_size(self.cx, fty);
-                self.emit_mem_gpr(true, false, sz, X10, SP, sbase + foff);
-                self.emit(Inst::LoadStoreUImm { load: false, signed: false, size: sz, rt: X10, rn: X9, offset: foff });
+                let fsize = self.cx.type_size_align(fty).0;
+                if matches!(fsize, 1 | 2 | 4 | 8) {
+                    let sz = mem_size_from_bytes(fsize);
+                    self.emit_mem_gpr(true, false, sz, X10, SP, sbase + foff);
+                    self.emit(Inst::LoadStoreUImm { load: false, signed: false, size: sz, rt: X10, rn: X9, offset: foff });
+                } else {
+                    // Odd-width integer field (cast remainder): copy exactly its bytes.
+                    self.copy_slot_to_base_off(sbase + foff, X9, foff, fsize);
+                }
+            }
+        }
+    }
+
+    /// Marshal a single scalar argument into the next register of its bank, spilling to the
+    /// outgoing-argument area once the bank is exhausted. Floats use the SIMD bank (`v0..v7`),
+    /// 128-bit integers take a consecutive `x` pair (or a 16-byte stack slot), everything else uses
+    /// the next `x` register.
+    fn marshal_scalar_arg(&mut self, arg: Value, a: &mut ArgAssign) {
+        if type_is_float(self.cx, arg.ty()) {
+            if a.nsrn < 8 {
+                self.materialize_fp(arg, Vreg::from_encoding(a.nsrn));
+                a.nsrn += 1;
+            } else {
+                self.materialize_fp(arg, V16);
+                self.emit_mem_fp(false, fp_size(self.cx, arg.ty()), V16, SP, a.nsaa as u64);
+                a.nsaa += 8;
+            }
+        } else if self.is_int128(arg.ty()) {
+            if a.ngrn <= 6 {
+                let lo = Gpr::from_encoding(a.ngrn);
+                let hi = Gpr::from_encoding(a.ngrn + 1);
+                self.materialize128(arg, lo, hi);
+                a.ngrn += 2;
+            } else {
+                a.ngrn = 8;
+                a.nsaa = (a.nsaa + 15) & !15;
+                self.materialize128(arg, X9, X10);
+                self.emit_mem_gpr(false, false, MemSize::X, X9, SP, a.nsaa as u64);
+                self.emit_mem_gpr(false, false, MemSize::X, X10, SP, a.nsaa as u64 + 8);
+                a.nsaa += 16;
+            }
+        } else if a.ngrn < 8 {
+            self.materialize(arg, Gpr::from_encoding(a.ngrn));
+            a.ngrn += 1;
+        } else {
+            self.materialize(arg, X9);
+            self.emit_mem_gpr(false, false, mem_size(self.cx, arg.ty()), X9, SP, a.nsaa as u64);
+            a.nsaa += 8;
+        }
+    }
+
+    /// Marshal a `PassMode::Cast` argument. A 1-register cast travels as a single scalar; a
+    /// multi-register cast is split into its register pieces (integer GPRs for a composite, SIMD&FP
+    /// registers for an HFA), all-or-nothing: if they do not all fit in their bank the aggregate is
+    /// copied contiguously onto the outgoing-argument area.
+    fn marshal_cast_arg(&mut self, arg: Value, cast: &CastTarget, a: &mut ArgAssign) {
+        let regs = cast_regs(cast);
+        let src = match arg {
+            Value::Slot { off, .. } if regs.len() > 1 => off,
+            // A single-register cast is just a scalar; a multi-register cast value is always a slot,
+            // but fall back to scalar marshalling defensively if it is not.
+            _ => return self.marshal_scalar_arg(arg, a),
+        };
+        let n_int = regs.iter().filter(|r| !r.fp).count() as u8;
+        let n_fp = regs.iter().filter(|r| r.fp).count() as u8;
+        if a.ngrn + n_int <= 8 && a.nsrn + n_fp <= 8 {
+            for r in &regs {
+                if r.fp {
+                    let fps = if r.width == 8 { FpSize::S64 } else { FpSize::S32 };
+                    self.emit_mem_fp(true, fps, Vreg::from_encoding(a.nsrn), SP, src + r.offset as u64);
+                    a.nsrn += 1;
+                } else {
+                    self.load_agg_gpr(Gpr::from_encoding(a.ngrn), src + r.offset as u64, r.data);
+                    a.ngrn += 1;
+                }
+            }
+        } else {
+            if n_int > 0 {
+                a.ngrn = 8;
+            }
+            if n_fp > 0 {
+                a.nsrn = 8;
+            }
+            let align = (cast.align(self.cx).bytes() as u32).max(8);
+            let base = (a.nsaa + align - 1) & !(align - 1);
+            for r in &regs {
+                self.copy_slot_to_base_off(
+                    src + r.offset as u64,
+                    SP,
+                    (base + r.offset) as u64,
+                    r.data as u64,
+                );
+            }
+            let size = cast.size(self.cx).bytes() as u32;
+            a.nsaa = base + ((size + 7) & !7);
+        }
+    }
+
+    /// Load `data` (1..=8) bytes from frame slot `src_off` into GPR `reg`, zero-extended. Natural
+    /// widths use one load; an odd width (3/5/6/7) is staged through a zeroed 8-byte scratch.
+    fn load_agg_gpr(&mut self, reg: Gpr, src_off: u64, data: u32) {
+        match data {
+            1 | 2 | 4 | 8 => {
+                self.emit_mem_gpr(true, false, mem_size_from_bytes(data as u64), reg, SP, src_off)
+            }
+            _ => {
+                let sc = self.alloc_slot(8, 8);
+                self.emit_mem_gpr(false, false, MemSize::X, ZR, SP, sc);
+                self.copy_slot_to_base_off(src_off, SP, sc, data as u64);
+                self.emit_mem_gpr(true, false, MemSize::X, reg, SP, sc);
+            }
+        }
+    }
+
+    /// Store the low `data` (1..=8) bytes of GPR `reg` to frame slot `dst_off`. Mirror of
+    /// [`load_agg_gpr`](Self::load_agg_gpr).
+    fn store_agg_gpr(&mut self, reg: Gpr, dst_off: u64, data: u32) {
+        match data {
+            1 | 2 | 4 | 8 => {
+                self.emit_mem_gpr(false, false, mem_size_from_bytes(data as u64), reg, SP, dst_off)
+            }
+            _ => {
+                let sc = self.alloc_slot(8, 8);
+                self.emit_mem_gpr(false, false, MemSize::X, reg, SP, sc);
+                self.copy_slot_to_base_off(sc, SP, dst_off, data as u64);
+            }
+        }
+    }
+
+    /// Collect a `PassMode::Cast` return value out of its result registers into a fresh frame slot
+    /// laid out as the aggregate, returning a `Value::Slot` over it.
+    fn collect_cast_ret(&mut self, cast: &CastTarget, layout: TyAndLayout<'tcx>) -> Value {
+        let regs = cast_regs(cast);
+        let size = cast.size(self.cx).bytes().max(layout.size.bytes()).max(1);
+        let align = cast.align(self.cx).bytes().max(layout.align.abi.bytes()).max(1);
+        let slot = self.alloc_slot(size, align);
+        let mut ngrn: u8 = 0;
+        let mut nsrn: u8 = 0;
+        for r in &regs {
+            if r.fp {
+                let fps = if r.width == 8 { FpSize::S64 } else { FpSize::S32 };
+                self.emit_mem_fp(false, fps, Vreg::from_encoding(nsrn), SP, slot + r.offset as u64);
+                nsrn += 1;
+            } else {
+                self.store_agg_gpr(Gpr::from_encoding(ngrn), slot + r.offset as u64, r.data);
+                ngrn += 1;
+            }
+        }
+        let ty = self.cx.intern_type(TypeData::Aggregate {
+            size: layout.size.bytes(),
+            align: layout.align.abi.bytes(),
+        });
+        Value::Slot { off: slot, ty }
+    }
+
+    /// Return a multi-register `PassMode::Cast` value: scatter the slot's bytes back into the
+    /// result registers (integer GPRs for a composite, SIMD&FP registers for an HFA).
+    fn ret_cast_multi(&mut self, v: Value, regs: &[CastReg]) {
+        let off = match v {
+            Value::Slot { off, .. } => off,
+            // A multi-register cast value is always materialized in memory; fall back defensively.
+            _ => return self.materialize(v, X0),
+        };
+        let mut ngrn: u8 = 0;
+        let mut nsrn: u8 = 0;
+        for r in regs {
+            if r.fp {
+                let fps = if r.width == 8 { FpSize::S64 } else { FpSize::S32 };
+                self.emit_mem_fp(true, fps, Vreg::from_encoding(nsrn), SP, off + r.offset as u64);
+                nsrn += 1;
+            } else {
+                self.load_agg_gpr(Gpr::from_encoding(ngrn), off + r.offset as u64, r.data);
+                ngrn += 1;
             }
         }
     }
@@ -3599,43 +3910,49 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         // register banks; an sret pointer goes in x8. Once a bank is exhausted the remaining
         // arguments are written into the outgoing-argument area at the bottom of our frame
         // (`sp + nsaa`), which the frame-layout pre-pass sized so they never overlap local slots.
-        let mut ngrn: u8 = 0;
-        let mut nsrn: u8 = 0;
-        let mut nsaa: u32 = 0;
-        for (i, &arg) in args.iter().enumerate() {
-            if indirect_ret && i == 0 {
-                self.materialize(arg, Gpr::from_encoding(8));
-            } else if type_is_float(self.cx, arg.ty()) {
-                if nsrn < 8 {
-                    self.materialize_fp(arg, Vreg::from_encoding(nsrn));
-                    nsrn += 1;
-                } else {
-                    self.materialize_fp(arg, V16);
-                    self.emit_mem_fp(false, fp_size(self.cx, arg.ty()), V16, SP, nsaa as u64);
-                    nsaa += 8;
+        //
+        // With a concrete `fn_abi` we walk its argument modes so that a `PassMode::Cast` value (a
+        // small aggregate or HFA) is split across the exact registers the callee expects; without
+        // one (the entry-wrapper/`catch_unwind` paths) each value is a single scalar register.
+        let mut a = ArgAssign::default();
+        let mut ai = 0usize;
+        if indirect_ret {
+            self.materialize(args[ai], Gpr::from_encoding(8));
+            ai += 1;
+        }
+        match fn_abi {
+            Some(abi) => {
+                for arg_abi in abi.args.iter() {
+                    match arg_abi.mode {
+                        PassMode::Ignore => {}
+                        PassMode::Cast { ref cast, .. } => {
+                            self.marshal_cast_arg(args[ai], cast, &mut a);
+                            ai += 1;
+                        }
+                        PassMode::Pair(..) => {
+                            self.marshal_scalar_arg(args[ai], &mut a);
+                            self.marshal_scalar_arg(args[ai + 1], &mut a);
+                            ai += 2;
+                        }
+                        PassMode::Indirect { meta_attrs, .. } => {
+                            self.marshal_scalar_arg(args[ai], &mut a);
+                            ai += 1;
+                            if meta_attrs.is_some() {
+                                self.marshal_scalar_arg(args[ai], &mut a);
+                                ai += 1;
+                            }
+                        }
+                        PassMode::Direct(_) => {
+                            self.marshal_scalar_arg(args[ai], &mut a);
+                            ai += 1;
+                        }
+                    }
                 }
-            } else if self.is_int128(arg.ty()) {
-                // A 128-bit integer takes two consecutive registers, else a 16-byte stack slot.
-                if ngrn <= 6 {
-                    let lo = Gpr::from_encoding(ngrn);
-                    let hi = Gpr::from_encoding(ngrn + 1);
-                    self.materialize128(arg, lo, hi);
-                    ngrn += 2;
-                } else {
-                    ngrn = 8;
-                    nsaa = (nsaa + 15) & !15;
-                    self.materialize128(arg, X9, X10);
-                    self.emit_mem_gpr(false, false, MemSize::X, X9, SP, nsaa as u64);
-                    self.emit_mem_gpr(false, false, MemSize::X, X10, SP, nsaa as u64 + 8);
-                    nsaa += 16;
+            }
+            None => {
+                for &arg in &args[ai..] {
+                    self.marshal_scalar_arg(arg, &mut a);
                 }
-            } else if ngrn < 8 {
-                self.materialize(arg, Gpr::from_encoding(ngrn));
-                ngrn += 1;
-            } else {
-                self.materialize(arg, X9);
-                self.emit_mem_gpr(false, false, mem_size(self.cx, arg.ty()), X9, SP, nsaa as u64);
-                nsaa += 8;
             }
         }
         // Emit the call. Direct calls reference the symbol (BRANCH26 relocation); otherwise the
@@ -3654,6 +3971,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         // honor its return mode; without one — e.g. the synthesized C `main` wrapper's call to
         // `lang_start`, which passes the function type but no `FnAbi` — we fall back to the
         // callee's declared return type so the result (the process exit code!) isn't dropped.
+        // A `PassMode::Cast` return (a small aggregate or HFA) comes back in one or more registers
+        // determined by the cast, not by the Rust layout; collect them into a slot laid out as the
+        // aggregate. `store_arg` then copies that slot into the destination place.
+        if let Some(a) = fn_abi {
+            if let PassMode::Cast { ref cast, .. } = a.ret.mode {
+                return self.collect_cast_ret(cast, a.ret.layout);
+            }
+        }
         let ret_ty = match fn_abi {
             Some(a) if a.ret.is_indirect() || a.ret.is_ignore() => None,
             Some(a) => Some(self.cx.immediate_backend_type(a.ret.layout)),

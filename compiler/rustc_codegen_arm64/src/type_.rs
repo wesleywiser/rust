@@ -175,10 +175,12 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn cast_backend_type(&self, ty: &CastTarget) -> Type {
-        // Flatten the cast target into the sequence of registers it occupies. A two-register cast
-        // (e.g. a 16-byte aggregate returned in `x0:x1`, or an HFA in `v0:v1`) maps to a `Pair` so
-        // the builder splits it across the return/argument registers; longer casts fall back to an
-        // opaque aggregate addressed by byte offset.
+        // Flatten the cast target into the sequence of registers it occupies. A single-register
+        // cast maps to that register's scalar type; any multi-register cast (a small composite in
+        // `x0:x1`, or an HFA in `v0..v3`) maps to an opaque aggregate addressed by byte offset, so
+        // the value is a faithful byte image that the builder splits across the ABI registers using
+        // the `CastTarget`'s own layout (a `Pair` would impose scalar-pair field offsets that need
+        // not match the cast's, mishandling odd-width remainders).
         let mut regs: Vec<Reg> = ty.prefix.iter().copied().collect();
         let unit_size = ty.rest.unit.size.bytes().max(1);
         let total = ty.rest.total.bytes();
@@ -191,11 +193,6 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
         }
         match regs.len() {
             1 => self.reg_backend_type(&regs[0]),
-            2 => {
-                let a = self.reg_backend_type(&regs[0]);
-                let b = self.reg_backend_type(&regs[1]);
-                self.intern_type(TypeData::Pair(a, b))
-            }
             _ => {
                 let size = ty.size(self);
                 let align = ty.align(self);
