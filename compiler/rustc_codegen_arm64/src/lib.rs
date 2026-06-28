@@ -33,6 +33,7 @@ extern crate rustc_hir;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_symbol_mangling;
 extern crate rustc_target;
 
 // This links the backend against the same `rustc_driver` dylib as the host rustc process so that
@@ -45,6 +46,7 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod allocator;
 mod asm;
 mod builder;
 mod common;
@@ -148,13 +150,11 @@ impl ExtraBackendMethods for Arm64CodegenBackend {
 
     fn codegen_allocator(
         &self,
-        _tcx: TyCtxt<'_>,
+        tcx: TyCtxt<'_>,
         _module_name: &str,
-        _methods: &[AllocatorMethod],
+        methods: &[AllocatorMethod],
     ) -> Self::Module {
-        // TODO: emit the allocator shim (__rust_alloc and friends). Empty for now; programs that
-        // actually allocate will fail to link until this is implemented.
-        Arm64Module::default()
+        Arm64Module { mach: crate::allocator::codegen(tcx, methods) }
     }
 
     fn compile_codegen_unit(
@@ -186,6 +186,17 @@ impl ExtraBackendMethods for Arm64CodegenBackend {
                 cx.module.borrow_mut().push_function(fb.finish());
             }
             cx.cur_instance.set(None);
+        }
+
+        // Phase 3: synthesize the C `main` entry wrapper (which calls the `lang_start` shim) into
+        // whichever CGU holds the Rust `main`. `maybe_create_entry_wrapper` self-guards: it returns
+        // `None` for every other CGU. `cur_instance` is left `None` so the wrapper's argc/argv
+        // parameters are set up by `setup_params`' entry-wrapper path.
+        if rustc_codegen_ssa::base::maybe_create_entry_wrapper::<Builder<'_, '_>>(&cx, cgu).is_some()
+        {
+            if let Some(fb) = cx.cur_fn.borrow_mut().take() {
+                cx.module.borrow_mut().push_function(fb.finish());
+            }
         }
 
         let mach = std::mem::take(&mut *cx.module.borrow_mut());

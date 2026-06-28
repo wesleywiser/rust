@@ -369,9 +369,21 @@ fn build_param_list<'tcx>(
 
 /// Spill each incoming parameter register into a frame slot at function entry and record the slots.
 fn setup_params(cx: &CodegenCx<'_>, fb: &mut FunctionBuild, block: BasicBlock) {
-    let Some(instance) = cx.cur_instance.get() else { return };
-    let fn_abi = cx.fn_abi_of_instance(instance, ty::List::empty());
-    for (reg, ty) in build_param_list(cx, fn_abi) {
+    let params = match cx.cur_instance.get() {
+        Some(instance) => {
+            let fn_abi = cx.fn_abi_of_instance(instance, ty::List::empty());
+            build_param_list(cx, fn_abi)
+        }
+        // The synthesized C `main` entry wrapper has no MIR instance. Where `main` is
+        // `int main(int argc, char** argv)`, spill those two incoming registers so the generic
+        // entry-wrapper builder can read them back via `get_param`.
+        None if cx.tcx.sess.target.main_needs_argc_argv => vec![
+            (ParamReg::Gpr(Gpr::from_encoding(0)), cx.intern_type(TypeData::Int(32))),
+            (ParamReg::Gpr(Gpr::from_encoding(1)), cx.intern_type(TypeData::Ptr)),
+        ],
+        None => return,
+    };
+    for (reg, ty) in params {
         let (size, align) = cx.type_size_align(ty);
         let off = fb.frame.alloc(size, align) as u32;
         let inst = match reg {
