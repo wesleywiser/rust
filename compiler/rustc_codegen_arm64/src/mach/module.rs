@@ -15,6 +15,9 @@ pub enum DataSection {
     ReadOnly,
     /// Zero-initialized data: `__DATA,__bss`.
     Bss,
+    /// Thread-local data: `__DATA,__thread_data`. The object emitter also generates the
+    /// `__thread_vars` descriptor (the `__tlv_bootstrap` entry) for the item's symbol.
+    Tls,
 }
 
 /// A statically-allocated data item (a `static`, a constant aggregate, a string literal, ...).

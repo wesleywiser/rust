@@ -30,10 +30,30 @@ pub fn emit_asm(module: &MachModule) -> String {
     }
 
     for d in &module.data {
+        // Thread-local data is emitted as a `$tlv$init` initializer in `__thread_data` plus the
+        // 3-word `__thread_vars` descriptor (matching what the object writer synthesizes).
+        if d.section == DataSection::Tls {
+            out.push_str("\t.section\t__DATA,__thread_data,thread_local_regular\n");
+            if d.align > 1 {
+                let _ = writeln!(out, "\t.p2align\t{}", d.align.trailing_zeros());
+            }
+            let _ = writeln!(out, "{}$tlv$init:", d.name);
+            emit_data_bytes(&mut out, &d.bytes, &d.relocs);
+            out.push_str("\t.section\t__DATA,__thread_vars,thread_local_variables\n");
+            if d.is_global {
+                let _ = writeln!(out, "\t.globl\t{}", d.name);
+            }
+            let _ = writeln!(out, "{}:", d.name);
+            let _ = writeln!(out, "\t.quad\t__tlv_bootstrap");
+            let _ = writeln!(out, "\t.quad\t0");
+            let _ = writeln!(out, "\t.quad\t{}$tlv$init", d.name);
+            continue;
+        }
         let directive = match d.section {
             DataSection::Data => "\t.section\t__DATA,__data\n",
             DataSection::ReadOnly => "\t.section\t__TEXT,__const\n",
             DataSection::Bss => "\t.section\t__DATA,__bss\n",
+            DataSection::Tls => unreachable!("thread-local data handled above"),
         };
         out.push_str(directive);
         if d.is_global {
@@ -313,6 +333,18 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
         Inst::Adrp { rd, ref sym } => {
             line(out, &format!("adrp {}, {}@PAGE", rd.name(OperandSize::S64), sym.name))
         }
+        Inst::AdrpTlv { rd, ref sym } => {
+            line(out, &format!("adrp {}, {}@TLVPPAGE", rd.name(OperandSize::S64), sym.name))
+        }
+        Inst::LdrTlvLo { rt, rn, ref sym } => line(
+            out,
+            &format!(
+                "ldr {}, [{}, {}@TLVPPAGEOFF]",
+                rt.name(OperandSize::S64),
+                rn.name(OperandSize::S64),
+                sym.name
+            ),
+        ),
         Inst::AddLo { rd, rn, ref sym } => line(
             out,
             &format!(

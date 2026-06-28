@@ -132,6 +132,20 @@ impl<'tcx> CodegenCx<'tcx> {
         let (bytes, relocs) = self.lower_alloc(inner);
         let name = self.static_symbol_name(def_id);
         let align = inner.align.bytes() as u32;
+        // Thread-local statics go in `__thread_data`; the object/asm emitters synthesize the
+        // `__thread_vars` descriptor that the TLV access sequence (`get_static`) targets.
+        if self.tcx.is_thread_local_static(def_id) {
+            self.module.borrow_mut().push_data(DataItem {
+                name,
+                is_global: true,
+                section: DataSection::Tls,
+                align,
+                bytes,
+                bss_size: 0,
+                relocs,
+            });
+            return;
+        }
         let mutable = inner.mutability.is_mut();
         self.push_alloc_data(name, true, mutable, align, bytes, relocs);
     }

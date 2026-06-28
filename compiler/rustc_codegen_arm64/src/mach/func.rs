@@ -26,6 +26,10 @@ pub enum RelocKind {
     GotLoadPageOff12,
     /// 64-bit absolute pointer in data: `ARM64_RELOC_UNSIGNED`.
     Unsigned64,
+    /// `adrp` page of a thread-local variable descriptor: `ARM64_RELOC_TLVP_LOAD_PAGE21`.
+    TlvpPage21,
+    /// `ldr` of a thread-local descriptor's low bits: `ARM64_RELOC_TLVP_LOAD_PAGEOFF12`.
+    TlvpPageOff12,
 }
 
 /// A relocation to apply at `offset` bytes into a function's (or data item's) contents.
@@ -112,6 +116,14 @@ impl MachFunction {
                 }
                 Inst::AddLo { sym, .. } => {
                     push_reloc(&mut relocs, cur, sym, RelocKind::PageOff12);
+                    code.extend_from_slice(&inst.encode().to_le_bytes());
+                }
+                Inst::AdrpTlv { sym, .. } => {
+                    push_reloc(&mut relocs, cur, sym, RelocKind::TlvpPage21);
+                    code.extend_from_slice(&inst.encode().to_le_bytes());
+                }
+                Inst::LdrTlvLo { sym, .. } => {
+                    push_reloc(&mut relocs, cur, sym, RelocKind::TlvpPageOff12);
                     code.extend_from_slice(&inst.encode().to_le_bytes());
                 }
                 _ => code.extend_from_slice(&inst.encode().to_le_bytes()),

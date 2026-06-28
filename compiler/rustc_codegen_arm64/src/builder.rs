@@ -1757,6 +1757,24 @@ impl<'a, 'tcx> AsmBuilderMethods<'tcx> for Builder<'a, 'tcx> {
 impl<'a, 'tcx> StaticBuilderMethods for Builder<'a, 'tcx> {
     fn get_static(&mut self, def_id: rustc_hir::def_id::DefId) -> Value {
         let sym = self.cx.get_static_sym(def_id);
+        if self.cx.tcx.is_thread_local_static(def_id) {
+            // macOS thread-local access: load the variable's descriptor address, then call its
+            // thunk (`descriptor[0]`), which returns the per-thread variable address in `x0`.
+            let symref = SymRef { name: self.cx.sym_name(sym), addend: 0 };
+            self.emit(Inst::AdrpTlv { rd: X0, sym: symref.clone() });
+            self.emit(Inst::LdrTlvLo { rt: X0, rn: X0, sym: symref });
+            self.emit(Inst::LoadStoreUImm {
+                load: true,
+                signed: false,
+                size: MemSize::X,
+                rt: Gpr::from_encoding(8),
+                rn: X0,
+                offset: 0,
+            });
+            self.emit(Inst::Blr { rn: Gpr::from_encoding(8) });
+            let ptr_ty = self.ptr_ty();
+            return self.spill(X0, ptr_ty);
+        }
         Value::Sym { sym, offset: 0, ty: self.ptr_ty() }
     }
 }

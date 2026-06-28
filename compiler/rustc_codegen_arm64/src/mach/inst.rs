@@ -230,6 +230,11 @@ pub enum Inst {
     Adrp { rd: Gpr, sym: SymRef },
     /// `add rd, rn, #:lo12:<sym>` — records a `PageOff12` relocation (the `@PAGEOFF` add).
     AddLo { rd: Gpr, rn: Gpr, sym: SymRef },
+    /// `adrp rd, <sym>@TLVPPAGE` — thread-local descriptor page (records a `TlvpPage21` relocation).
+    AdrpTlv { rd: Gpr, sym: SymRef },
+    /// `ldr rt, [rn, <sym>@TLVPPAGEOFF]` — load the descriptor address (records a `TlvpPageOff12`
+    /// relocation that patches the scaled 12-bit immediate).
+    LdrTlvLo { rt: Gpr, rn: Gpr, sym: SymRef },
 
     /// `fadd`/`fsub`/`fmul`/`fdiv` two-operand FP.
     FpDataProc2 { op: FpOp2, size: FpSize, rd: Vreg, rn: Vreg, rm: Vreg },
@@ -559,6 +564,10 @@ impl Inst {
 
             // adrp/add encode with zeroed immediates; Page21/PageOff12 relocations patch them.
             Inst::Adrp { rd, .. } => 0x90000000 | rd.encoding(),
+            // `adrp` page of a thread-local descriptor; encodes like `adrp`, the relocation differs.
+            Inst::AdrpTlv { rd, .. } => 0x90000000 | rd.encoding(),
+            // `ldr rt, [rn, #0]` (64-bit); the `TlvpPageOff12` relocation patches the immediate.
+            Inst::LdrTlvLo { rt, rn, .. } => 0xF940_0000 | (rn.encoding() << 5) | rt.encoding(),
             Inst::AddLo { rd, rn, .. } => {
                 encode_add_sub_imm(AddSub::Add, OperandSize::S64, false, rd, rn, 0, false)
             }
