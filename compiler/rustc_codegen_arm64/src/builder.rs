@@ -40,8 +40,8 @@ use crate::mach::inst::{
     LogicOp, MemSize, MovKind, PairIndex, SymRef,
 };
 use crate::mach::reg::{
-    Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V1, V16, V17, X0, X1, X2, X3, X9, X10,
-    X11, X12, X13, X16, ZR,
+    Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V1, V16, V17, X0, X1, X2, X3, X4, X9,
+    X10, X11, X12, X13, X16, ZR,
 };
 
 /// State for the function currently being lowered.
@@ -675,8 +675,8 @@ fn op_size(cx: &CodegenCx<'_>, ty: Type) -> OperandSize {
     match cx.type_data(ty) {
         // 128-bit integers are handled as a low/high word pair by dedicated paths in the builder,
         // which never call this. Reaching here with one means an i128 operation was not routed to
-        // its 128-bit path (e.g. overflow-checked multiply, still unimplemented); fail loudly rather
-        // than silently truncating to a single 64-bit register.
+        // its 128-bit path (e.g. a `match` on an i128 value); fail loudly rather than silently
+        // truncating to a single 64-bit register.
         TypeData::Int(bits) if bits > 64 => {
             todo!("{bits}-bit integer operations are not yet supported by the arm64 backend")
         }
@@ -1142,6 +1142,40 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let result = self.spill128(X9, X10, ty);
         let overflow = self.spill(X13, bool_ty);
         (result, overflow)
+    }
+
+    /// 128-bit overflow-checked multiply, returning `(low_product, overflowed)`.
+    ///
+    /// The signed case calls the purpose-built `__muloti4(a, b, &overflow)` libcall. The unsigned
+    /// case computes the wrapping product and uses the standard idiom `a != 0 && (a*b)/a != b`,
+    /// where the division (a libcall) is guarded against `a == 0` by substituting `1` (whose result
+    /// is masked off by the `a != 0` term).
+    fn checked128_mul(&mut self, signed: bool, lhs: Value, rhs: Value) -> (Value, Value) {
+        let ty = lhs.ty();
+        if signed {
+            let i32t = self.cx.intern_type(TypeData::Int(32));
+            let ovf_off = self.alloc_slot(4, 4);
+            self.materialize128(lhs, X0, X1);
+            self.materialize128(rhs, X2, X3);
+            self.emit_frame_addr(X4, ovf_off);
+            self.emit(Inst::Bl { sym: SymRef::new("___muloti4") });
+            let result = self.spill128(X0, X1, ty);
+            let ovf = Value::Slot { off: ovf_off, ty: i32t };
+            let zero = self.cx.const_uint(i32t, 0);
+            let overflow = self.icmp(IntPredicate::IntNE, ovf, zero);
+            (result, overflow)
+        } else {
+            let zero = Value::Const { bits: 0, ty };
+            let one = Value::Const { bits: 1, ty };
+            let prod = self.int128_mul(lhs, rhs);
+            let a_is_zero = self.icmp(IntPredicate::IntEQ, lhs, zero);
+            let a_safe = self.select(a_is_zero, one, lhs);
+            let q = self.int128_bin_libcall("___udivti3", prod, a_safe);
+            let q_ne_b = self.icmp(IntPredicate::IntNE, q, rhs);
+            let a_nonzero = self.icmp(IntPredicate::IntNE, lhs, zero);
+            let overflow = self.and(q_ne_b, a_nonzero);
+            (prod, overflow)
+        }
     }
 
     /// A 128-bit binary op implemented by a compiler-builtins libcall taking two `i128` arguments in
@@ -2448,10 +2482,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let val_ty = lhs.ty();
         if self.is_int128(val_ty) {
             if let OverflowOp::Mul = oop {
-                // 128-bit overflow-checked multiply needs a long inline partial-product sequence
-                // (signed especially); not yet implemented, so fail loudly. `wrapping_mul`/`*` with
-                // overflow checks off use the plain 128-bit multiply and work.
-                todo!("rustc_codegen_arm64: 128-bit overflow-checked multiplication");
+                return self.checked128_mul(signed, lhs, rhs);
             }
             return self.checked128_addsub(oop, signed, lhs, rhs);
         }
