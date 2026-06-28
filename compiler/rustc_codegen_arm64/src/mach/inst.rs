@@ -227,8 +227,10 @@ pub enum Inst {
 
     /// `fadd`/`fsub`/`fmul`/`fdiv` two-operand FP.
     FpDataProc2 { op: FpOp2, size: FpSize, rd: Vreg, rn: Vreg, rm: Vreg },
-    /// `fneg`/`fabs`/`fsqrt` one-operand FP.
+    /// `fneg`/`fabs`/`fsqrt`/`frint{n,p,m,z,a}` one-operand FP.
     FpDataProc1 { op: FpOp1, size: FpSize, rd: Vreg, rn: Vreg },
+    /// `fmadd rd, rn, rm, ra` — fused multiply-add (`rd = rn * rm + ra`, single rounding).
+    FpFma { size: FpSize, rd: Vreg, rn: Vreg, rm: Vreg, ra: Vreg },
     /// `fmov rd, rn` moving a general register's raw bits into a scalar FP register (used to
     /// materialize floating-point constants).
     FmovFromGpr { size: FpSize, rd: Vreg, rn: Gpr },
@@ -313,6 +315,16 @@ pub enum FpOp1 {
     Fabs,
     Fneg,
     Fsqrt,
+    /// Round to nearest, ties to even (`frintn`).
+    Frintn,
+    /// Round toward +∞ (`frintp`) — `ceil`.
+    Frintp,
+    /// Round toward -∞ (`frintm`) — `floor`.
+    Frintm,
+    /// Round toward zero (`frintz`) — `trunc`.
+    Frintz,
+    /// Round to nearest, ties away from zero (`frinta`) — `round`.
+    Frinta,
 }
 
 impl Inst {
@@ -549,12 +561,26 @@ impl Inst {
                     FpOp1::Fabs => 0b000001,
                     FpOp1::Fneg => 0b000010,
                     FpOp1::Fsqrt => 0b000011,
+                    FpOp1::Frintn => 0b001000,
+                    FpOp1::Frintp => 0b001001,
+                    FpOp1::Frintm => 0b001010,
+                    FpOp1::Frintz => 0b001011,
+                    FpOp1::Frinta => 0b001100,
                 };
                 (0b00011110 << 24)
                     | (size.ftype() << 22)
                     | (1 << 21)
                     | (opcode << 15)
                     | (0b10000 << 10)
+                    | (rn.encoding() << 5)
+                    | rd.encoding()
+            }
+            // Floating-point data-processing (3 source); FMADD has o1=0, o0=0.
+            Inst::FpFma { size, rd, rn, rm, ra } => {
+                (0b00011111 << 24)
+                    | (size.ftype() << 22)
+                    | (rm.encoding() << 16)
+                    | (ra.encoding() << 10)
                     | (rn.encoding() << 5)
                     | rd.encoding()
             }
@@ -943,6 +969,50 @@ mod tests {
         assert_eq!(
             Inst::FpDataProc1 { op: FpOp1::Fneg, size: FpSize::S32, rd: V16, rn: V16 }.encode(),
             0x1E214210
+        );
+        // fabs d0, d0 / fsqrt d0, d0
+        assert_eq!(
+            Inst::FpDataProc1 { op: FpOp1::Fabs, size: FpSize::S64, rd: V0, rn: V0 }.encode(),
+            0x1E60C000
+        );
+        assert_eq!(
+            Inst::FpDataProc1 { op: FpOp1::Fsqrt, size: FpSize::S64, rd: V0, rn: V0 }.encode(),
+            0x1E61C000
+        );
+        // frint{m,p,z,a,n} d0, d0 (floor / ceil / trunc / round-ties-away / round-ties-even)
+        assert_eq!(
+            Inst::FpDataProc1 { op: FpOp1::Frintm, size: FpSize::S64, rd: V0, rn: V0 }.encode(),
+            0x1E654000
+        );
+        assert_eq!(
+            Inst::FpDataProc1 { op: FpOp1::Frintp, size: FpSize::S64, rd: V0, rn: V0 }.encode(),
+            0x1E64C000
+        );
+        assert_eq!(
+            Inst::FpDataProc1 { op: FpOp1::Frintz, size: FpSize::S64, rd: V0, rn: V0 }.encode(),
+            0x1E65C000
+        );
+        assert_eq!(
+            Inst::FpDataProc1 { op: FpOp1::Frinta, size: FpSize::S64, rd: V0, rn: V0 }.encode(),
+            0x1E664000
+        );
+        assert_eq!(
+            Inst::FpDataProc1 { op: FpOp1::Frintn, size: FpSize::S64, rd: V0, rn: V0 }.encode(),
+            0x1E644000
+        );
+        // frintm s0, s0 (32-bit form)
+        assert_eq!(
+            Inst::FpDataProc1 { op: FpOp1::Frintm, size: FpSize::S32, rd: V0, rn: V0 }.encode(),
+            0x1E254000
+        );
+        // fmadd d0, d1, d2, d3 / fmadd s0, s1, s2, s3
+        assert_eq!(
+            Inst::FpFma { size: FpSize::S64, rd: V0, rn: V1, rm: V2, ra: V3 }.encode(),
+            0x1F420C20
+        );
+        assert_eq!(
+            Inst::FpFma { size: FpSize::S32, rd: V0, rn: V1, rm: V2, ra: V3 }.encode(),
+            0x1F020C20
         );
         // fmov d0, x9
         assert_eq!(Inst::FmovFromGpr { size: FpSize::S64, rd: V0, rn: X9 }.encode(), 0x9E670120);

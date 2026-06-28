@@ -325,8 +325,25 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
                 FpOp1::Fabs => "fabs",
                 FpOp1::Fneg => "fneg",
                 FpOp1::Fsqrt => "fsqrt",
+                FpOp1::Frintn => "frintn",
+                FpOp1::Frintp => "frintp",
+                FpOp1::Frintm => "frintm",
+                FpOp1::Frintz => "frintz",
+                FpOp1::Frinta => "frinta",
             };
             line(out, &format!("{mnem} {}, {}", vname(rd, size), vname(rn, size)));
+        }
+        Inst::FpFma { size, rd, rn, rm, ra } => {
+            line(
+                out,
+                &format!(
+                    "fmadd {}, {}, {}, {}",
+                    vname(rd, size),
+                    vname(rn, size),
+                    vname(rm, size),
+                    vname(ra, size)
+                ),
+            );
         }
         Inst::FmovFromGpr { size, rd, rn } => {
             let gpr_size = match size {

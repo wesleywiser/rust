@@ -40,8 +40,8 @@ use crate::mach::inst::{
     LogicOp, MemSize, MovKind, PairIndex, SymRef,
 };
 use crate::mach::reg::{
-    Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V16, V17, X0, X1, X2, X9, X10, X12, X13,
-    ZR,
+    Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V1, V16, V17, X0, X1, X2, X9, X10, X12,
+    X13, ZR,
 };
 
 /// State for the function currently being lowered.
@@ -794,6 +794,69 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.spill_fp(V16, ty)
     }
 
+    /// Emit a one-operand FP instruction (`fabs`/`fsqrt`/`frint*`): materialize the operand into
+    /// `v16`, compute in place, and spill.
+    fn fp_unary(&mut self, op: FpOp1, arg: Value) -> Value {
+        let ty = arg.ty();
+        let size = fp_size(self.cx, ty);
+        self.materialize_fp(arg, V16);
+        self.emit(Inst::FpDataProc1 { op, size, rd: V16, rn: V16 });
+        self.spill_fp(V16, ty)
+    }
+
+    /// Emit a fused multiply-add (`a * b + c`, single rounding) via `fmadd`.
+    fn fp_fma(&mut self, a: Value, b: Value, c: Value) -> Value {
+        let ty = a.ty();
+        let size = fp_size(self.cx, ty);
+        self.materialize_fp(a, V16);
+        self.materialize_fp(b, V17);
+        self.materialize_fp(c, V0);
+        self.emit(Inst::FpFma { size, rd: V16, rn: V16, rm: V17, ra: V0 });
+        self.spill_fp(V16, ty)
+    }
+
+    /// The C library symbol for a libm routine: the `f64` form is `base` and the `f32` form
+    /// appends `f` (e.g. `sin`/`sinf`), with the Mach-O `_` prefix.
+    fn libm_symbol(&self, base: &str, ty: Type) -> String {
+        match fp_size(self.cx, ty) {
+            FpSize::S64 => format!("_{base}"),
+            FpSize::S32 => format!("_{base}f"),
+        }
+    }
+
+    /// Call a unary libm routine, passing the argument in `d0`/`s0` and collecting the result.
+    fn fp_libm_unary(&mut self, base: &str, arg: Value) -> Value {
+        let ty = arg.ty();
+        let sym = self.libm_symbol(base, ty);
+        self.materialize_fp(arg, V0);
+        self.emit(Inst::Bl { sym: SymRef::new(sym) });
+        self.spill_fp(V0, ty)
+    }
+
+    /// Call a binary libm routine (`pow`, `copysign`), passing args in `d0`/`d1` (or `s0`/`s1`).
+    fn fp_libm_binary(&mut self, base: &str, a: Value, b: Value) -> Value {
+        let ty = a.ty();
+        let sym = self.libm_symbol(base, ty);
+        self.materialize_fp(a, V0);
+        self.materialize_fp(b, V1);
+        self.emit(Inst::Bl { sym: SymRef::new(sym) });
+        self.spill_fp(V0, ty)
+    }
+
+    /// Integer power (`powi`): the base is passed in `d0`/`s0` and the `i32` exponent in `w0`,
+    /// calling the compiler-builtins routine `__powidf2`/`__powisf2`.
+    fn fp_powi(&mut self, base_val: Value, exp: Value) -> Value {
+        let ty = base_val.ty();
+        let sym = match fp_size(self.cx, ty) {
+            FpSize::S64 => "___powidf2",
+            FpSize::S32 => "___powisf2",
+        };
+        self.materialize_fp(base_val, V0);
+        self.materialize(exp, X0);
+        self.emit(Inst::Bl { sym: SymRef::new(sym) });
+        self.spill_fp(V0, ty)
+    }
+
     /// Emit a register-register ALU op: materialize both operands, compute into `x9`, spill.
     fn alu_rrr(
         &mut self,
@@ -1065,6 +1128,93 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                     signed,
                     result_ty,
                 );
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            // Floating-point math intrinsics that map to a single ARM64 instruction with identical
+            // IEEE-754 semantics: square root, and the directed/round-to-nearest rounding modes.
+            sym::sqrtf32 | sym::sqrtf64 => {
+                let r = self.fp_unary(FpOp1::Fsqrt, args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::floorf32 | sym::floorf64 => {
+                let r = self.fp_unary(FpOp1::Frintm, args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::ceilf32 | sym::ceilf64 => {
+                let r = self.fp_unary(FpOp1::Frintp, args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::truncf32 | sym::truncf64 => {
+                let r = self.fp_unary(FpOp1::Frintz, args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            // `round` is ties-away-from-zero (`frinta`); `round_ties_even` is ties-to-even (`frintn`).
+            sym::roundf32 | sym::roundf64 => {
+                let r = self.fp_unary(FpOp1::Frinta, args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::round_ties_even_f32 | sym::round_ties_even_f64 => {
+                let r = self.fp_unary(FpOp1::Frintn, args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            // `fabs` is generic over the float type; f32/f64 map to `fabs`, wider/narrower floats
+            // are unsupported and fall through to the loud "must be overridden" error.
+            sym::fabs => {
+                let arg = args[0].immediate();
+                if matches!(self.cx.type_data(arg.ty()), TypeData::Float(32) | TypeData::Float(64)) {
+                    let r = self.fp_unary(FpOp1::Fabs, arg);
+                    IntrinsicResult::Operand(OperandValue::Immediate(r))
+                } else {
+                    IntrinsicResult::Fallback(instance)
+                }
+            }
+            // Fused multiply-add (`fma`, single rounding) and `fmuladd` (fusing permitted) -> `fmadd`.
+            sym::fmaf32 | sym::fmaf64 | sym::fmuladdf32 | sym::fmuladdf64 => {
+                let r =
+                    self.fp_fma(args[0].immediate(), args[1].immediate(), args[2].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            // The transcendental routines and `copysign`/`pow` have no exact single-instruction
+            // form, so they call the corresponding libm routine (always linked in `libSystem`).
+            sym::sinf32 | sym::sinf64 => {
+                let r = self.fp_libm_unary("sin", args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::cosf32 | sym::cosf64 => {
+                let r = self.fp_libm_unary("cos", args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::expf32 | sym::expf64 => {
+                let r = self.fp_libm_unary("exp", args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::exp2f32 | sym::exp2f64 => {
+                let r = self.fp_libm_unary("exp2", args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::logf32 | sym::logf64 => {
+                let r = self.fp_libm_unary("log", args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::log2f32 | sym::log2f64 => {
+                let r = self.fp_libm_unary("log2", args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::log10f32 | sym::log10f64 => {
+                let r = self.fp_libm_unary("log10", args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::powf32 | sym::powf64 => {
+                let r = self.fp_libm_binary("pow", args[0].immediate(), args[1].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::copysignf32 | sym::copysignf64 => {
+                let r = self.fp_libm_binary("copysign", args[0].immediate(), args[1].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            // Integer power -> the compiler-builtins routine `__powidf2`/`__powisf2`.
+            sym::powif32 | sym::powif64 => {
+                let r = self.fp_powi(args[0].immediate(), args[1].immediate());
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
             // Everything else falls back to the intrinsic's MIR body (if it has one).
