@@ -267,6 +267,7 @@ fn op_size(cx: &CodegenCx<'_>, ty: Type) -> OperandSize {
     match cx.type_data(ty) {
         // 128-bit integers would need a register pair (or libcalls); silently truncating them to a
         // single 64-bit register would miscompile, so fail loudly until they are implemented.
+        // See the "Future work" section in `lib.rs` for the intended implementation strategy.
         TypeData::Int(bits) if bits > 64 => {
             todo!("{bits}-bit integer operations are not yet supported by the arm64 backend")
         }

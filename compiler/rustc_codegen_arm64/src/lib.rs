@@ -4,6 +4,17 @@
 //!
 //! It reuses `rustc_codegen_ssa`'s generic MIR-lowering driver (like the LLVM and GCC backends) by
 //! implementing the backend trait family, rather than walking MIR itself.
+//!
+//! # Future work / known limitations
+//!
+//! These are deliberately unimplemented; the backend fails loudly (via `todo!`) rather than
+//! miscompiling when it hits them, so they show up as clear ICEs instead of wrong runtime results.
+//!
+//! - **128-bit integers (`i128`/`u128`).** Values wider than a register are not modelled; runtime
+//!   128-bit arithmetic is rejected in `builder::op_size`. Implementing this needs either a
+//!   register-pair value model (lo/hi `Gpr`s with carry-aware add/sub/shift/cmp) or lowering to the
+//!   `compiler_builtins` libcalls (`__multi3`, `__udivti3`, `__umodti3`, `__ashlti3`, ...).
+//!   Compile-time-constant 128-bit values still work because const-eval folds them before codegen.
 
 // tidy-alphabetical-start
 #![feature(rustc_private)]
