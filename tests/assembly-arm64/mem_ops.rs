@@ -39,3 +39,15 @@ pub unsafe extern "C" fn mmove(dst: *mut u8, src: *const u8, n: usize) {
 pub unsafe extern "C" fn mset(dst: *mut u8, val: u8, n: usize) {
     core::intrinsics::write_bytes(dst, val, n);
 }
+
+// `compare_bytes` has `memcmp` semantics; the pointers and length are marshalled into `x0`/`x1`/`x2`
+// and the `i32` result comes back in `w0`.
+// CHECK-LABEL: _mcmp:
+// CHECK: ldr x0, [sp, #0]
+// CHECK-NEXT: ldr x1, [sp, #8]
+// CHECK-NEXT: ldr x2, [sp, #16]
+// CHECK-NEXT: bl _memcmp
+#[no_mangle]
+pub unsafe extern "C" fn mcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    core::intrinsics::compare_bytes(a, b, n)
+}

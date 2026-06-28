@@ -980,6 +980,15 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                     self.emit_reverse(args[0].immediate(), DataProc1::Rbit),
                 ))
             }
+            // `compare_bytes` has `memcmp` semantics: the sign of the first differing byte, as i32.
+            sym::compare_bytes => {
+                self.materialize(args[0].immediate(), X0);
+                self.materialize(args[1].immediate(), X1);
+                self.materialize(args[2].immediate(), X2);
+                self.emit(Inst::Bl { sym: SymRef::new("_memcmp") });
+                let result_ty = self.cx.immediate_backend_type(result_layout);
+                IntrinsicResult::Operand(OperandValue::Immediate(self.spill(X0, result_ty)))
+            }
             // Saturating add/sub, clamped to the integer type's range.
             sym::saturating_add | sym::saturating_sub => {
                 let is_add = name == sym::saturating_add;
