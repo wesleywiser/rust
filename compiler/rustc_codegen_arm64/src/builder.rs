@@ -564,6 +564,40 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.spill(X9, i64t)
     }
 
+    /// Clamp the result of a float-to-int conversion (in `raw_reg`, saturated by the hardware only
+    /// to the 32/64-bit operation width) into the destination type's own range, then narrow to it.
+    /// AArch64's `fcvtzs`/`fcvtzu` saturate to the 32- or 64-bit register, so for an `i8`/`i16`/etc.
+    /// destination the out-of-range value must be additionally clamped (e.g. `300.0 as u8 == 255`,
+    /// not `44`). Returns `raw_reg` spilled directly when the destination already spans the op width.
+    fn clamp_fp_to_int(&mut self, raw_reg: Gpr, dest_ty: Type, signed: bool) -> Value {
+        let n = match self.cx.type_data(dest_ty) {
+            TypeData::Int(b) => b,
+            _ => return self.spill(raw_reg, dest_ty),
+        };
+        let op_bits = match op_size(self.cx, dest_ty) {
+            OperandSize::S32 => 32,
+            OperandSize::S64 => 64,
+        };
+        if n >= op_bits {
+            return self.spill(raw_reg, dest_ty);
+        }
+        let op_ty = self.cx.intern_type(TypeData::Int(op_bits));
+        let raw = self.spill(raw_reg, op_ty);
+        let clamped = if signed {
+            let max = self.cx.const_uint(op_ty, ((1i128 << (n - 1)) - 1) as u64);
+            let min = self.cx.const_uint(op_ty, (-(1i128 << (n - 1))) as i64 as u64);
+            let too_high = self.icmp(IntPredicate::IntSGT, raw, max);
+            let raw = self.select(too_high, max, raw);
+            let too_low = self.icmp(IntPredicate::IntSLT, raw, min);
+            self.select(too_low, min, raw)
+        } else {
+            let max = self.cx.const_uint(op_ty, ((1u128 << n) - 1) as u64);
+            let too_high = self.icmp(IntPredicate::IntUGT, raw, max);
+            self.select(too_high, max, raw)
+        };
+        self.trunc(clamped, dest_ty)
+    }
+
     /// Saturating add/sub for an integer of width `n`. Operands are widened to 64 bits (sign- or
     /// zero-extended per `signed`) and the wrapping result is computed there. For `n < 64` that
     /// widened result cannot overflow 64 bits, so clamping into the `n`-bit range is exact; at
@@ -1560,20 +1594,18 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.fptosi(val, dest_ty)
     }
     fn fptoui(&mut self, val: Value, dest_ty: Type) -> Value {
-        // FIXME: for destination widths < 32 bits the result saturates to the 32-bit range rather
-        // than the narrow type's range; correct for i32/i64/u32/u64.
         let fp = fp_size(self.cx, val.ty());
         let int = op_size(self.cx, dest_ty);
         self.materialize_fp(val, V16);
         self.emit(Inst::FpToInt { signed: false, fp, int, rd: X9, rn: V16 });
-        self.spill(X9, dest_ty)
+        self.clamp_fp_to_int(X9, dest_ty, false)
     }
     fn fptosi(&mut self, val: Value, dest_ty: Type) -> Value {
         let fp = fp_size(self.cx, val.ty());
         let int = op_size(self.cx, dest_ty);
         self.materialize_fp(val, V16);
         self.emit(Inst::FpToInt { signed: true, fp, int, rd: X9, rn: V16 });
-        self.spill(X9, dest_ty)
+        self.clamp_fp_to_int(X9, dest_ty, true)
     }
     fn uitofp(&mut self, val: Value, dest_ty: Type) -> Value {
         // Zero-extend the source to 64 bits so any integer width converts correctly.
