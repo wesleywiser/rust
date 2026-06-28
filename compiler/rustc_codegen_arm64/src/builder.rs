@@ -34,8 +34,8 @@ use rustc_target::spec::{HasTargetSpec, Target};
 use crate::context::{BasicBlock, CodegenCx, Function, Type, TypeData, Value};
 use crate::mach::func::MachFunction;
 use crate::mach::inst::{
-    AddSub, AtomicRmwOp, CondSel, DataProc2, DmbOption, FpOp1, FpOp2, Inst, Label, LogicOp, MemSize,
-    MovKind, PairIndex, SymRef,
+    AddSub, AtomicRmwOp, CondSel, DataProc1, DataProc2, DmbOption, FpOp1, FpOp2, Inst, Label,
+    LogicOp, MemSize, MovKind, PairIndex, SymRef,
 };
 use crate::mach::reg::{
     Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V16, V17, X0, X1, X2, X9, X10, X12, X13,
@@ -506,6 +506,48 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.lshr(prod, s56)
     }
 
+    /// Count leading zeros (`ctlz`). The input is zero-extended to 64 bits and `clz` is taken; the
+    /// extra `64 - N` high zero bits introduced by the extension are then subtracted off. `ctlz(0)`
+    /// is `N`, which falls out correctly (`clz` of `0` is 64). Returned as a 64-bit value for the
+    /// caller to narrow.
+    fn emit_ctlz(&mut self, v: Value) -> Value {
+        let n = match self.cx.type_data(v.ty()) {
+            TypeData::Int(b) => b as u64,
+            _ => 64,
+        };
+        let i64t = self.cx.intern_type(TypeData::Int(64));
+        let x = self.intcast(v, i64t, false);
+        self.materialize(x, X9);
+        self.emit(Inst::DataProc1 { op: DataProc1::Clz, size: OperandSize::S64, rd: X9, rn: X9 });
+        let clz = self.spill(X9, i64t);
+        if n < 64 {
+            let adjust = self.cx.const_uint(i64t, 64 - n);
+            self.sub(clz, adjust)
+        } else {
+            clz
+        }
+    }
+
+    /// Count trailing zeros (`cttz`/`cttz_nonzero`) as `clz(rbit(x))`. A guard bit set at position
+    /// `N` makes `cttz(0) == N` (it cannot affect any lower set bit, so non-zero inputs are
+    /// unchanged). Returned as a 64-bit value for the caller to narrow.
+    fn emit_cttz(&mut self, v: Value) -> Value {
+        let n = match self.cx.type_data(v.ty()) {
+            TypeData::Int(b) => b as u64,
+            _ => 64,
+        };
+        let i64t = self.cx.intern_type(TypeData::Int(64));
+        let mut x = self.intcast(v, i64t, false);
+        if n < 64 {
+            let guard = self.cx.const_uint(i64t, 1u64 << n);
+            x = self.or(x, guard);
+        }
+        self.materialize(x, X9);
+        self.emit(Inst::DataProc1 { op: DataProc1::Rbit, size: OperandSize::S64, rd: X9, rn: X9 });
+        self.emit(Inst::DataProc1 { op: DataProc1::Clz, size: OperandSize::S64, rd: X9, rn: X9 });
+        self.spill(X9, i64t)
+    }
+
     /// Load a floating-point value into the SIMD&FP register `vreg`.
     fn materialize_fp(&mut self, val: Value, vreg: Vreg) {        let ty = val.ty();
         let size = fp_size(self.cx, ty);
@@ -754,6 +796,20 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             // Population count: a SWAR sequence, narrowed to the `u32` result type.
             sym::ctpop => {
                 let count = self.emit_ctpop(args[0].immediate());
+                let result_ty = self.cx.immediate_backend_type(result_layout);
+                let count = self.intcast(count, result_ty, false);
+                IntrinsicResult::Operand(OperandValue::Immediate(count))
+            }
+            // Count leading zeros (`ctlz_nonzero` shares the lowering; `clz` handles zero anyway).
+            sym::ctlz | sym::ctlz_nonzero => {
+                let count = self.emit_ctlz(args[0].immediate());
+                let result_ty = self.cx.immediate_backend_type(result_layout);
+                let count = self.intcast(count, result_ty, false);
+                IntrinsicResult::Operand(OperandValue::Immediate(count))
+            }
+            // Count trailing zeros, as `clz(rbit(x))` (the `_nonzero` form shares the lowering).
+            sym::cttz | sym::cttz_nonzero => {
+                let count = self.emit_cttz(args[0].immediate());
                 let result_ty = self.cx.immediate_backend_type(result_layout);
                 let count = self.intcast(count, result_ty, false);
                 IntrinsicResult::Operand(OperandValue::Immediate(count))

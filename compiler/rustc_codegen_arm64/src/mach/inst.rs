@@ -60,6 +60,15 @@ pub enum DataProc2 {
     Asrv,
 }
 
+/// One-source data-processing opcode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DataProc1 {
+    /// `clz` — count leading zeros.
+    Clz,
+    /// `rbit` — reverse bit order.
+    Rbit,
+}
+
 /// Conditional-select opcode.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CondSel {
@@ -168,6 +177,9 @@ pub enum Inst {
     MulHigh { signed: bool, rd: Gpr, rn: Gpr, rm: Gpr },
     /// `udiv`/`sdiv`/`lslv`/`lsrv`/`asrv rd, rn, rm`.
     DataProc2 { op: DataProc2, size: OperandSize, rd: Gpr, rn: Gpr, rm: Gpr },
+
+    /// `clz rd, rn` (one-source data-processing).
+    DataProc1 { op: DataProc1, size: OperandSize, rd: Gpr, rn: Gpr },
 
     /// `csel`/`csinc`/`csinv`/`csneg rd, rn, rm, cond`.
     CondSel { op: CondSel, size: OperandSize, rd: Gpr, rn: Gpr, rm: Gpr, cond: Cond },
@@ -385,6 +397,19 @@ impl Inst {
                 (size.sf() << 31)
                     | (0b11010110 << 21)
                     | (rm.encoding() << 16)
+                    | (opcode << 10)
+                    | (rn.encoding() << 5)
+                    | rd.encoding()
+            }
+
+            Inst::DataProc1 { op, size, rd, rn } => {
+                let opcode: u32 = match op {
+                    DataProc1::Clz => 0b000100,
+                    DataProc1::Rbit => 0b000000,
+                };
+                (size.sf() << 31)
+                    | (0b1 << 30)
+                    | (0b11010110 << 21)
                     | (opcode << 10)
                     | (rn.encoding() << 5)
                     | rd.encoding()
@@ -730,6 +755,21 @@ mod tests {
             }
             .encode(),
             0x9AC20820
+        );
+        // clz x0, x1
+        assert_eq!(
+            Inst::DataProc1 { op: DataProc1::Clz, size: OperandSize::S64, rd: X0, rn: X1 }.encode(),
+            0xDAC01020
+        );
+        // clz w0, w1
+        assert_eq!(
+            Inst::DataProc1 { op: DataProc1::Clz, size: OperandSize::S32, rd: X0, rn: X1 }.encode(),
+            0x5AC01020
+        );
+        // rbit x0, x1
+        assert_eq!(
+            Inst::DataProc1 { op: DataProc1::Rbit, size: OperandSize::S64, rd: X0, rn: X1 }.encode(),
+            0xDAC00020
         );
         // csel x0, x1, x2, eq
         assert_eq!(

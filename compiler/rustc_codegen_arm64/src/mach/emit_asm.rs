@@ -7,7 +7,7 @@
 use std::fmt::Write;
 
 use crate::mach::inst::{
-    AddSub, AtomicRmwOp, CondSel, DataProc2, DmbOption, FpOp1, FpOp2, Inst, Label, LogicOp, MemSize,
+    AddSub, AtomicRmwOp, CondSel, DataProc1, DataProc2, DmbOption, FpOp1, FpOp2, Inst, Label, LogicOp, MemSize,
     MovKind, PairIndex,
 };
 use crate::mach::module::{DataSection, MachModule};
@@ -230,6 +230,13 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
             );
         }
 
+        Inst::DataProc1 { op, size, rd, rn } => {
+            let mnem = match op {
+                DataProc1::Clz => "clz",
+                DataProc1::Rbit => "rbit",
+            };
+            line(out, &format!("{mnem} {}, {}", rd.name_zr(size), rn.name_zr(size)));
+        }
         Inst::CondSel { op, size, rd, rn, rm, cond } => {
             let mnem = match op {
                 CondSel::Csel => "csel",
