@@ -1023,7 +1023,13 @@ fn build_param_list<'tcx>(cx: &CodegenCx<'tcx>, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) 
         params.push((ParamLoc::Gpr(Gpr::from_encoding(8)), ptr));
     }
     let mut a = ArgAssign::default();
-    for arg in fn_abi.args.iter() {
+    for (argn, arg) in fn_abi.args.iter().enumerate() {
+        // Apple AArch64 passes every variadic argument on the stack; exhaust the register banks
+        // once the variadic portion begins so the outgoing-argument-area sizing accounts for them.
+        if fn_abi.c_variadic && argn == fn_abi.fixed_count as usize {
+            a.ngrn = 8;
+            a.nsrn = 8;
+        }
         match arg.mode {
             PassMode::Ignore => {}
             PassMode::Direct(_) => {
@@ -3922,7 +3928,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
         match fn_abi {
             Some(abi) => {
-                for arg_abi in abi.args.iter() {
+                for (argn, arg_abi) in abi.args.iter().enumerate() {
+                    // Apple AArch64 passes every variadic argument (those past the last named
+                    // parameter) on the stack, regardless of type; exhaust both register banks
+                    // once the variadic portion begins so the marshalling spills them.
+                    if abi.c_variadic && argn == abi.fixed_count as usize {
+                        a.ngrn = 8;
+                        a.nsrn = 8;
+                    }
                     match arg_abi.mode {
                         PassMode::Ignore => {}
                         PassMode::Cast { ref cast, .. } => {
