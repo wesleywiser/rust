@@ -21,9 +21,17 @@
 //!   `bitmask`, `reduce_all`/`any`, `shuffle`, `extract`) are emitted as per-lane loops over those
 //!   slots. This is correct (it matches the IEEE/portable-SIMD semantics) but not fast, in keeping
 //!   with the rest of the baseline. It is enough for the portable-SIMD substring/slice search that
-//!   `str::contains`/`find` reach. Floating-point lanes and a true NEON register model are still
-//!   unimplemented (float-lane intrinsics panic loudly). `std::collections::HashMap` now gets past
-//!   its `hashbrown` SIMD group scan but is blocked further on thread-local lazy initialization.
+//!   `str::contains`/`find` reach, and for the `hashbrown` SIMD group scan behind
+//!   `std::collections::HashMap`/`HashSet`. Floating-point lanes and a true NEON register model are
+//!   still unimplemented (float-lane intrinsics panic loudly).
+//!
+//! Implemented since the first cut, for reference:
+//!
+//! - **Thread-local storage** uses the macOS thread-local-variable (TLV) model: a thread-local
+//!   static is emitted as a `$tlv$init` initializer in `__thread_data` plus a three-word descriptor
+//!   in `__thread_vars`, and a read loads the descriptor address (`TLVP_LOAD_PAGE21`/`PAGEOFF12`
+//!   relocations) and calls the thunk in its first word to get the per-thread address. This is what
+//!   unblocks `HashMap`/`HashSet`, whose `RandomState` seed is a thread-local.
 
 // tidy-alphabetical-start
 #![feature(rustc_private)]
