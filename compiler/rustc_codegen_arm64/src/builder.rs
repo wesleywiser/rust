@@ -433,6 +433,22 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
     }
 
+    /// Load a value into `reg`, sign-extending sub-word integers (`i8`/`i16`) up to their operation
+    /// width. The default [`materialize`](Self::materialize) zero-extends (e.g. `ldrb`), which is
+    /// correct for width-insensitive ops but wrong for signed compares, divides, and arithmetic
+    /// shifts: there the high bits of the register must carry the sign. Wider integers already span
+    /// their operation width, so they are loaded unchanged.
+    fn materialize_signed(&mut self, val: Value, reg: Gpr) {
+        self.materialize(val, reg);
+        let from = match self.cx.type_data(val.ty()) {
+            TypeData::Int(8) => MemSize::B,
+            TypeData::Int(16) => MemSize::H,
+            _ => return,
+        };
+        let to = op_size(self.cx, val.ty());
+        self.emit(Inst::Sxt { from, to, rd: reg, rn: reg });
+    }
+
     /// Emit a `movz`/`movk` sequence loading the low 64 bits of `bits` into `reg`.
     fn load_imm(&mut self, reg: Gpr, bits: u128, size: OperandSize) {
         // For a 32-bit (`W`) destination only the low 32 bits are meaningful, and `movk` only
@@ -676,11 +692,34 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.spill(X9, ty)
     }
 
+    /// Like [`alu_rrr`](Self::alu_rrr) but sign-extends sub-word operands first, for operations
+    /// whose result depends on the operands' sign (e.g. signed division).
+    fn alu_rrr_signed(
+        &mut self,
+        mk: impl Fn(OperandSize, Gpr, Gpr, Gpr) -> Inst,
+        lhs: Value,
+        rhs: Value,
+    ) -> Value {
+        let ty = lhs.ty();
+        let size = op_size(self.cx, ty);
+        self.materialize_signed(lhs, X9);
+        self.materialize_signed(rhs, X10);
+        self.emit(mk(size, X9, X9, X10));
+        self.spill(X9, ty)
+    }
+
     /// Emit `cmp`/`cset` for an integer comparison, returning an `i1` value.
     fn emit_icmp(&mut self, cond: Cond, lhs: Value, rhs: Value) -> Value {
         let size = op_size(self.cx, lhs.ty());
-        self.materialize(lhs, X9);
-        self.materialize(rhs, X10);
+        // Signed comparisons require the operands sign-extended to the compare width; unsigned and
+        // equality comparisons are already correct with the default zero-extending load.
+        if matches!(cond, Cond::Lt | Cond::Le | Cond::Gt | Cond::Ge) {
+            self.materialize_signed(lhs, X9);
+            self.materialize_signed(rhs, X10);
+        } else {
+            self.materialize(lhs, X9);
+            self.materialize(rhs, X10);
+        }
         self.emit(Inst::AddSubReg {
             op: AddSub::Sub,
             size,
@@ -1128,7 +1167,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.udiv(lhs, rhs)
     }
     fn sdiv(&mut self, lhs: Value, rhs: Value) -> Value {
-        self.alu_rrr(
+        self.alu_rrr_signed(
             |size, rd, rn, rm| Inst::DataProc2 { op: DataProc2::Sdiv, size, rd, rn, rm },
             lhs,
             rhs,
@@ -1179,11 +1218,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         )
     }
     fn ashr(&mut self, lhs: Value, rhs: Value) -> Value {
-        self.alu_rrr(
-            |size, rd, rn, rm| Inst::DataProc2 { op: DataProc2::Asrv, size, rd, rn, rm },
-            lhs,
-            rhs,
-        )
+        // The shifted value must be sign-extended so the vacated high bits carry its sign; the
+        // shift amount is a plain count and is loaded zero-extended.
+        let ty = lhs.ty();
+        let size = op_size(self.cx, ty);
+        self.materialize_signed(lhs, X9);
+        self.materialize(rhs, X10);
+        self.emit(Inst::DataProc2 { op: DataProc2::Asrv, size, rd: X9, rn: X9, rm: X10 });
+        self.spill(X9, ty)
     }
     fn neg(&mut self, v: Value) -> Value {
         let zero = Value::Const { bits: 0, ty: v.ty() };
@@ -1897,8 +1939,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn rem(&mut self, lhs: Value, rhs: Value, div: DataProc2) -> Value {
         let ty = lhs.ty();
         let size = op_size(self.cx, ty);
-        self.materialize(lhs, X9);
-        self.materialize(rhs, X10);
+        // Signed remainder needs sign-extended sub-word operands, exactly like signed division.
+        if div == DataProc2::Sdiv {
+            self.materialize_signed(lhs, X9);
+            self.materialize_signed(rhs, X10);
+        } else {
+            self.materialize(lhs, X9);
+            self.materialize(rhs, X10);
+        }
         // q = lhs / rhs ; rem = lhs - q*rhs  ==  msub rem, q, rhs, lhs
         self.emit(Inst::DataProc2 { op: div, size, rd: X11_HACK, rn: X9, rm: X10 });
         self.emit(Inst::Msub { size, rd: X9, rn: X11_HACK, rm: X10, ra: X9 });

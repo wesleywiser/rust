@@ -877,6 +877,7 @@ impl<'a> Builder<'a> {
                 test::CodegenUnits,
                 test::AssemblyLlvm,
                 test::AssemblyArm64,
+                test::Arm64CodegenBackendUnits,
                 test::Incremental,
                 test::Debuginfo,
                 test::UiFullDeps,

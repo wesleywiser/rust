@@ -181,6 +181,10 @@ pub enum Inst {
     /// `clz rd, rn` (one-source data-processing).
     DataProc1 { op: DataProc1, size: OperandSize, rd: Gpr, rn: Gpr },
 
+    /// `sxtb`/`sxth`/`sxtw rd, wn` — sign-extend the low `from` bits of `rn` to `to` bits (an
+    /// `sbfm` alias). The source is always read as a 32-bit (`W`) register.
+    Sxt { from: MemSize, to: OperandSize, rd: Gpr, rn: Gpr },
+
     /// `csel`/`csinc`/`csinv`/`csneg rd, rn, rm, cond`.
     CondSel { op: CondSel, size: OperandSize, rd: Gpr, rn: Gpr, rm: Gpr, cond: Cond },
 
@@ -411,6 +415,26 @@ impl Inst {
                     | (0b1 << 30)
                     | (0b11010110 << 21)
                     | (opcode << 10)
+                    | (rn.encoding() << 5)
+                    | rd.encoding()
+            }
+
+            Inst::Sxt { from, to, rd, rn } => {
+                // `sbfm rd, rn, #0, #(width-1)` with the sign-extending opcode.
+                let (sf, n): (u32, u32) = match to {
+                    OperandSize::S32 => (0, 0),
+                    OperandSize::S64 => (1, 1),
+                };
+                let imms: u32 = match from {
+                    MemSize::B => 7,
+                    MemSize::H => 15,
+                    MemSize::W => 31,
+                    MemSize::X => panic!("sxt cannot sign-extend from a 64-bit source"),
+                };
+                (sf << 31)
+                    | (0b100110 << 23)
+                    | (n << 22)
+                    | (imms << 10)
                     | (rn.encoding() << 5)
                     | rd.encoding()
             }
@@ -770,6 +794,26 @@ mod tests {
         assert_eq!(
             Inst::DataProc1 { op: DataProc1::Rbit, size: OperandSize::S64, rd: X0, rn: X1 }.encode(),
             0xDAC00020
+        );
+        // sxtb w0, w1
+        assert_eq!(
+            Inst::Sxt { from: MemSize::B, to: OperandSize::S32, rd: X0, rn: X1 }.encode(),
+            0x13001C20
+        );
+        // sxth w0, w1
+        assert_eq!(
+            Inst::Sxt { from: MemSize::H, to: OperandSize::S32, rd: X0, rn: X1 }.encode(),
+            0x13003C20
+        );
+        // sxtb x0, w1
+        assert_eq!(
+            Inst::Sxt { from: MemSize::B, to: OperandSize::S64, rd: X0, rn: X1 }.encode(),
+            0x93401C20
+        );
+        // sxtw x0, w1
+        assert_eq!(
+            Inst::Sxt { from: MemSize::W, to: OperandSize::S64, rd: X0, rn: X1 }.encode(),
+            0x93407C20
         );
         // csel x0, x1, x2, eq
         assert_eq!(

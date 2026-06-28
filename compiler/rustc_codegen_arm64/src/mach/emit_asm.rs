@@ -237,6 +237,16 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
             };
             line(out, &format!("{mnem} {}, {}", rd.name_zr(size), rn.name_zr(size)));
         }
+        Inst::Sxt { from, to, rd, rn } => {
+            let mnem = match from {
+                MemSize::B => "sxtb",
+                MemSize::H => "sxth",
+                MemSize::W => "sxtw",
+                MemSize::X => unreachable!("sxt from X is invalid"),
+            };
+            // The source is always the 32-bit (`W`) view of `rn`.
+            line(out, &format!("{mnem} {}, {}", rd.name_zr(to), rn.name_zr(OperandSize::S32)));
+        }
         Inst::CondSel { op, size, rd, rn, rm, cond } => {
             let mnem = match op {
                 CondSel::Csel => "csel",

@@ -1991,6 +1991,58 @@ impl Step for AssemblyArm64 {
     }
 }
 
+/// Runs the `rustc_codegen_arm64` crate's own unit tests (instruction and immediate encoding, the
+/// machine-code layout pass, etc.). These are pure-Rust tests that do not need an installed
+/// backend, so they are kept separate from the `assembly-arm64` suite.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Arm64CodegenBackendUnits {
+    compilers: RustcPrivateCompilers,
+}
+
+impl Step for Arm64CodegenBackendUnits {
+    type Output = ();
+    const IS_HOST: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.alias("rustc_codegen_arm64").alias("cg_arm64")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        false
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        let compilers =
+            RustcPrivateCompilers::new(run.builder, run.builder.top_stage, run.target);
+        run.builder.ensure(Arm64CodegenBackendUnits { compilers });
+    }
+
+    fn run(self, builder: &Builder<'_>) {
+        let build_compiler = self.compilers.build_compiler();
+        let target = self.compilers.target();
+        let record_failed_tests = builder.ensure(SetupFailedTestsFile);
+
+        // Ensure the rustc-private crates the backend links against are present.
+        builder.ensure(compile::Rustc::new(build_compiler, target));
+
+        let mut cargo = builder::Cargo::new(
+            builder,
+            build_compiler,
+            Mode::Codegen,
+            SourceType::InTree,
+            target,
+            Kind::Test,
+        );
+        cargo
+            .arg("--manifest-path")
+            .arg(builder.src.join("compiler/rustc_codegen_arm64/Cargo.toml"));
+        compile::rustc_cargo_env(builder, &mut cargo, target);
+        cargo.add_rustc_lib_path(builder);
+
+        run_cargo_test(cargo, &[], &[], "cg_arm64", target, builder, record_failed_tests);
+    }
+}
+
 /// Runs the coverage test suite at `tests/coverage` in some or all of the
 /// coverage test modes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
