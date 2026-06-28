@@ -474,9 +474,40 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         Value::Slot { off, ty }
     }
 
+    /// Population count (`ctpop`) via the classic SWAR algorithm. The input is zero-extended to 64
+    /// bits so the unused high bits do not contribute; the result is the count as a 64-bit value
+    /// (the caller narrows it to the intrinsic's result type).
+    fn emit_ctpop(&mut self, v: Value) -> Value {
+        let i64t = self.cx.intern_type(TypeData::Int(64));
+        let x0 = self.intcast(v, i64t, false);
+        let m1 = self.cx.const_uint(i64t, 0x5555_5555_5555_5555);
+        let m2 = self.cx.const_uint(i64t, 0x3333_3333_3333_3333);
+        let m4 = self.cx.const_uint(i64t, 0x0f0f_0f0f_0f0f_0f0f);
+        let h01 = self.cx.const_uint(i64t, 0x0101_0101_0101_0101);
+        let s1 = self.cx.const_uint(i64t, 1);
+        let s2 = self.cx.const_uint(i64t, 2);
+        let s4 = self.cx.const_uint(i64t, 4);
+        let s56 = self.cx.const_uint(i64t, 56);
+        // x -= (x >> 1) & 0x5555...
+        let t = self.lshr(x0, s1);
+        let t = self.and(t, m1);
+        let x = self.sub(x0, t);
+        // x = (x & 0x3333...) + ((x >> 2) & 0x3333...)
+        let lo = self.and(x, m2);
+        let t = self.lshr(x, s2);
+        let hi = self.and(t, m2);
+        let x = self.add(lo, hi);
+        // x = (x + (x >> 4)) & 0x0f0f...
+        let t = self.lshr(x, s4);
+        let s = self.add(x, t);
+        let x = self.and(s, m4);
+        // count = (x * 0x0101...) >> 56
+        let prod = self.mul(x, h01);
+        self.lshr(prod, s56)
+    }
+
     /// Load a floating-point value into the SIMD&FP register `vreg`.
-    fn materialize_fp(&mut self, val: Value, vreg: Vreg) {
-        let ty = val.ty();
+    fn materialize_fp(&mut self, val: Value, vreg: Vreg) {        let ty = val.ty();
         let size = fp_size(self.cx, ty);
         match val {
             Value::Slot { off, .. } => {
@@ -713,13 +744,20 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         &mut self,
         instance: Instance<'tcx>,
         args: &[OperandRef<'tcx, Value>],
-        _result_layout: TyAndLayout<'tcx>,
+        result_layout: TyAndLayout<'tcx>,
         _result_place: Option<PlaceValue<Value>>,
         _span: Span,
     ) -> IntrinsicResult<'tcx, Value> {
         match self.cx.tcx.item_name(instance.def_id()) {
             // `black_box` is an optimization barrier; with no optimizer it is the identity.
             sym::black_box => IntrinsicResult::Operand(args[0].val),
+            // Population count: a SWAR sequence, narrowed to the `u32` result type.
+            sym::ctpop => {
+                let count = self.emit_ctpop(args[0].immediate());
+                let result_ty = self.cx.immediate_backend_type(result_layout);
+                let count = self.intcast(count, result_ty, false);
+                IntrinsicResult::Operand(OperandValue::Immediate(count))
+            }
             // Everything else falls back to the intrinsic's MIR body (if it has one).
             _ => IntrinsicResult::Fallback(instance),
         }
