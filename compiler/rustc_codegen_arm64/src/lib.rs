@@ -37,6 +37,7 @@ use std::sync::Arc;
 mod asm;
 mod builder;
 mod common;
+mod constant;
 mod consts;
 mod context;
 mod debuginfo;

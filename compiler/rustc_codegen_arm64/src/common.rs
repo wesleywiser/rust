@@ -1,8 +1,10 @@
 //! Constant value construction (`ConstCodegenMethods`).
 
 use rustc_abi::{self as abi, Size};
-use rustc_codegen_ssa::traits::{BaseTypeCodegenMethods, ConstCodegenMethods};
-use rustc_middle::mir::interpret::Scalar;
+use rustc_codegen_ssa::traits::{
+    BaseTypeCodegenMethods, ConstCodegenMethods, MiscCodegenMethods,
+};
+use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
 
 use crate::context::{CodegenCx, Type, TypeData, Value};
 use crate::mach::module::{DataItem, DataSection};
@@ -126,9 +128,29 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
                 let bits = int.to_bits(layout.size(self));
                 Value::Const { bits, ty: llty }
             }
-            Scalar::Ptr(..) => {
-                // Pointers into constant allocations require allocation lowering; deferred.
-                todo!("rustc_codegen_arm64: scalar_to_backend for pointer scalars")
+            Scalar::Ptr(ptr, _size) => {
+                // A pointer constant: resolve the allocation it points into to a symbol address and
+                // carry the in-allocation offset as the symbol addend.
+                let (prov, offset) = ptr.prov_and_relative_offset();
+                let alloc_id = prov.alloc_id();
+                let sym = match self.tcx.global_alloc(alloc_id) {
+                    GlobalAlloc::Function { instance, .. } => self.function_sym(self.get_fn(instance)),
+                    GlobalAlloc::Static(def_id) => self.get_static_sym(def_id),
+                    GlobalAlloc::Memory(alloc) => self.alloc_symbol(alloc.inner()),
+                    GlobalAlloc::VTable(ty, dyn_ty) => {
+                        let principal = dyn_ty
+                            .principal()
+                            .map(|p| self.tcx.instantiate_bound_regions_with_erased(p));
+                        let vtable =
+                            self.tcx.global_alloc(self.tcx.vtable_allocation((ty, principal)));
+                        self.alloc_symbol(vtable.unwrap_memory().inner())
+                    }
+                    GlobalAlloc::TypeId { .. } => {
+                        // A `TypeId` has no real address; model it as an integer constant.
+                        return Value::Const { bits: offset.bytes() as u128, ty: llty };
+                    }
+                };
+                Value::Sym { sym, offset: offset.bytes() as i64, ty: llty }
             }
         }
     }

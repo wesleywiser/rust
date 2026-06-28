@@ -46,19 +46,49 @@ pub fn emit_asm(module: &MachModule) -> String {
             DataSection::Bss => {
                 let _ = writeln!(out, "\t.zero\t{}", d.bss_size);
             }
-            _ => {
-                // FIXME: data with embedded relocations is not yet rendered textually; the binary
-                // object path handles those. Plain initializer bytes are emitted here.
-                for chunk in d.bytes.chunks(16) {
-                    let bytes =
-                        chunk.iter().map(|b| format!("0x{b:02x}")).collect::<Vec<_>>().join(", ");
-                    let _ = writeln!(out, "\t.byte\t{bytes}");
-                }
-            }
+            _ => emit_data_bytes(&mut out, &d.bytes, &d.relocs),
         }
     }
 
     out
+}
+
+/// Emit an initializer as `.byte` runs, with each pointer relocation rendered as a `.quad sym`
+/// (`+addend`) directive in place of the eight bytes it covers. The relative offset that the binary
+/// path keeps in the data (Mach-O implicit addend) is read back out here and made explicit.
+fn emit_data_bytes(out: &mut String, bytes: &[u8], relocs: &[crate::mach::func::Reloc]) {
+    use crate::mach::func::RelocKind;
+
+    // Relocations in increasing offset order so we can walk the bytes once.
+    let mut relocs: Vec<&crate::mach::func::Reloc> = relocs.iter().collect();
+    relocs.sort_by_key(|r| r.offset);
+
+    let mut pos: usize = 0;
+    let mut ri = 0;
+    while pos < bytes.len() {
+        if ri < relocs.len() && relocs[ri].offset as usize == pos {
+            let r = relocs[ri];
+            debug_assert_eq!(r.kind, RelocKind::Unsigned64, "only 64-bit pointer relocs in data");
+            // The implicit addend is the little-endian value currently stored at the pointer.
+            let stored = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as i64;
+            let addend = r.addend + stored;
+            if addend != 0 {
+                let _ = writeln!(out, "\t.quad\t{}+{}", r.sym, addend);
+            } else {
+                let _ = writeln!(out, "\t.quad\t{}", r.sym);
+            }
+            pos += 8;
+            ri += 1;
+        } else {
+            // Emit raw bytes up to the next relocation (or the end of the data).
+            let next = relocs.get(ri).map_or(bytes.len(), |r| r.offset as usize);
+            for chunk in bytes[pos..next].chunks(16) {
+                let line = chunk.iter().map(|b| format!("0x{b:02x}")).collect::<Vec<_>>().join(", ");
+                let _ = writeln!(out, "\t.byte\t{line}");
+            }
+            pos = next;
+        }
+    }
 }
 
 /// Local label name for branch targets within a function.

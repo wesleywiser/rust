@@ -717,8 +717,9 @@ impl<'a, 'tcx> AsmBuilderMethods<'tcx> for Builder<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> StaticBuilderMethods for Builder<'a, 'tcx> {
-    fn get_static(&mut self, _def_id: rustc_hir::def_id::DefId) -> Value {
-        todo!("rustc_codegen_arm64: get_static")
+    fn get_static(&mut self, def_id: rustc_hir::def_id::DefId) -> Value {
+        let sym = self.cx.get_static_sym(def_id);
+        Value::Sym { sym, offset: 0, ty: self.ptr_ty() }
     }
 }
 

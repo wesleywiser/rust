@@ -1,20 +1,18 @@
 //! Static item codegen (`StaticCodegenMethods`).
-//!
-//! Full const-allocation lowering (turning a `ConstAllocation` into data bytes plus pointer
-//! relocations) is deferred; these are stubs that will be filled when statics land.
 
 use rustc_codegen_ssa::traits::StaticCodegenMethods;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::interpret::ConstAllocation;
 
-use crate::context::{CodegenCx, Value};
+use crate::context::{CodegenCx, TypeData, Value};
 
 impl<'tcx> StaticCodegenMethods for CodegenCx<'tcx> {
-    fn static_addr_of(&self, _alloc: ConstAllocation<'_>, _kind: Option<&str>) -> Value {
-        todo!("rustc_codegen_arm64: static_addr_of")
+    fn static_addr_of(&self, alloc: ConstAllocation<'_>, _kind: Option<&str>) -> Value {
+        let sym = self.const_alloc_addr(alloc);
+        Value::Sym { sym, offset: 0, ty: self.intern_type(TypeData::Ptr) }
     }
 
-    fn codegen_static(&mut self, _def_id: DefId) {
-        todo!("rustc_codegen_arm64: codegen_static")
+    fn codegen_static(&mut self, def_id: DefId) {
+        self.codegen_static_item(def_id);
     }
 }
