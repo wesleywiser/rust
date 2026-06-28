@@ -2262,6 +2262,13 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let r = self.emit_simd_extract(args[0].immediate(), idx, result_ty);
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
+            // `is_val_statically_known(_)` is an optimization hint with no MIR body. This backend
+            // performs no such analysis, so it conservatively answers `false`; the only effect is
+            // that callers take their runtime (non-constant) path, which is always correct.
+            sym::is_val_statically_known => {
+                let ty = self.cx.immediate_backend_type(result_layout);
+                IntrinsicResult::Operand(OperandValue::Immediate(self.cx.const_int(ty, 0)))
+            }
             // Everything else falls back to the intrinsic's MIR body (if it has one).
             _ => IntrinsicResult::Fallback(instance),
         }
