@@ -224,6 +224,60 @@ pub enum Inst {
     FpToInt { signed: bool, fp: FpSize, int: OperandSize, rd: Gpr, rn: Vreg },
     /// `fcvt` — floating-point precision conversion (`f32`<->`f64`).
     FpCvt { from: FpSize, to: FpSize, rd: Vreg, rn: Vreg },
+
+    /// `ldar`/`ldarb`/`ldarh` — load-acquire (atomic acquire load).
+    LoadAcq { size: MemSize, rt: Gpr, rn: Gpr },
+    /// `stlr`/`stlrb`/`stlrh` — store-release (atomic release store).
+    StoreRel { size: MemSize, rt: Gpr, rn: Gpr },
+    /// LSE atomic read-modify-write: `rt` receives the old `[rn]`; `[rn]` becomes `op(old, rs)`.
+    /// `acquire`/`release` set the `A`/`R` ordering bits.
+    AtomicRmw {
+        op: AtomicRmwOp,
+        acquire: bool,
+        release: bool,
+        size: MemSize,
+        rs: Gpr,
+        rt: Gpr,
+        rn: Gpr,
+    },
+    /// `cas` — compare-and-swap: if `[rn] == rs` then `[rn] <- rt`; `rs` receives the old `[rn]`.
+    AtomicCas { acquire: bool, release: bool, size: MemSize, rs: Gpr, rt: Gpr, rn: Gpr },
+    /// `dmb` — data memory barrier.
+    Dmb { option: DmbOption },
+}
+
+/// LSE atomic read-modify-write opcode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AtomicRmwOp {
+    /// `ldadd` — `mem += rs`.
+    Add,
+    /// `ldclr` — `mem &= ~rs`.
+    Clr,
+    /// `ldeor` — `mem ^= rs`.
+    Eor,
+    /// `ldset` — `mem |= rs`.
+    Set,
+    /// `ldsmax` — signed max.
+    Smax,
+    /// `ldsmin` — signed min.
+    Smin,
+    /// `ldumax` — unsigned max.
+    Umax,
+    /// `ldumin` — unsigned min.
+    Umin,
+    /// `swp` — exchange (`mem <- rs`).
+    Swp,
+}
+
+/// Shareability/domain option for the `dmb` barrier.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DmbOption {
+    /// `ish` — full inner-shareable barrier.
+    Ish,
+    /// `ishld` — inner-shareable load barrier.
+    IshLd,
+    /// `ishst` — inner-shareable store barrier.
+    IshSt,
 }
 
 /// Two-operand floating-point opcode.
@@ -505,6 +559,53 @@ impl Inst {
                     _ => panic!("unsupported fcvt {from:?} -> {to:?}"),
                 };
                 base | (rn.encoding() << 5) | rd.encoding()
+            }
+
+            Inst::LoadAcq { size, rt, rn } => {
+                (size.size_field() << 30) | 0x08DF_FC00 | (rn.encoding() << 5) | rt.encoding()
+            }
+            Inst::StoreRel { size, rt, rn } => {
+                (size.size_field() << 30) | 0x089F_FC00 | (rn.encoding() << 5) | rt.encoding()
+            }
+            Inst::AtomicRmw { op, acquire, release, size, rs, rt, rn } => {
+                let (o3, opc): (u32, u32) = match op {
+                    AtomicRmwOp::Add => (0, 0b000),
+                    AtomicRmwOp::Clr => (0, 0b001),
+                    AtomicRmwOp::Eor => (0, 0b010),
+                    AtomicRmwOp::Set => (0, 0b011),
+                    AtomicRmwOp::Smax => (0, 0b100),
+                    AtomicRmwOp::Smin => (0, 0b101),
+                    AtomicRmwOp::Umax => (0, 0b110),
+                    AtomicRmwOp::Umin => (0, 0b111),
+                    AtomicRmwOp::Swp => (1, 0b000),
+                };
+                (size.size_field() << 30)
+                    | 0x3800_0000
+                    | ((acquire as u32) << 23)
+                    | ((release as u32) << 22)
+                    | (1 << 21)
+                    | (rs.encoding() << 16)
+                    | (o3 << 15)
+                    | (opc << 12)
+                    | (rn.encoding() << 5)
+                    | rt.encoding()
+            }
+            Inst::AtomicCas { acquire, release, size, rs, rt, rn } => {
+                (size.size_field() << 30)
+                    | 0x08A0_7C00
+                    | ((acquire as u32) << 22)
+                    | ((release as u32) << 15)
+                    | (rs.encoding() << 16)
+                    | (rn.encoding() << 5)
+                    | rt.encoding()
+            }
+            Inst::Dmb { option } => {
+                let crm: u32 = match option {
+                    DmbOption::Ish => 0b1011,
+                    DmbOption::IshLd => 0b1001,
+                    DmbOption::IshSt => 0b1010,
+                };
+                0xD503_30BF | (crm << 8)
             }
         }
     }
@@ -821,5 +922,115 @@ mod tests {
             Inst::MulHigh { signed: true, rd: X9, rn: X10, rm: X11 }.encode(),
             0x9B4B7D49
         );
+    }
+
+    #[test]
+    fn atomic_encodings() {
+        // ldar x0, [x1] / ldarb w0, [x1]
+        assert_eq!(Inst::LoadAcq { size: MemSize::X, rt: X0, rn: X1 }.encode(), 0xC8DFFC20);
+        assert_eq!(Inst::LoadAcq { size: MemSize::B, rt: X0, rn: X1 }.encode(), 0x08DFFC20);
+        // stlr x0, [x1] / stlrh w0, [x1]
+        assert_eq!(Inst::StoreRel { size: MemSize::X, rt: X0, rn: X1 }.encode(), 0xC89FFC20);
+        assert_eq!(Inst::StoreRel { size: MemSize::H, rt: X0, rn: X1 }.encode(), 0x489FFC20);
+        // ldaddal x2, x0, [x1]  (rs=x2, rt=x0, rn=x1)
+        assert_eq!(
+            Inst::AtomicRmw {
+                op: AtomicRmwOp::Add,
+                acquire: true,
+                release: true,
+                size: MemSize::X,
+                rs: X2,
+                rt: X0,
+                rn: X1,
+            }
+            .encode(),
+            0xF8E20020
+        );
+        // ldadd x2, x0, [x1] (relaxed)
+        assert_eq!(
+            Inst::AtomicRmw {
+                op: AtomicRmwOp::Add,
+                acquire: false,
+                release: false,
+                size: MemSize::X,
+                rs: X2,
+                rt: X0,
+                rn: X1,
+            }
+            .encode(),
+            0xF8220020
+        );
+        // ldsetal x2, x0, [x1]
+        assert_eq!(
+            Inst::AtomicRmw {
+                op: AtomicRmwOp::Set,
+                acquire: true,
+                release: true,
+                size: MemSize::X,
+                rs: X2,
+                rt: X0,
+                rn: X1,
+            }
+            .encode(),
+            0xF8E23020
+        );
+        // swpal x2, x0, [x1]
+        assert_eq!(
+            Inst::AtomicRmw {
+                op: AtomicRmwOp::Swp,
+                acquire: true,
+                release: true,
+                size: MemSize::X,
+                rs: X2,
+                rt: X0,
+                rn: X1,
+            }
+            .encode(),
+            0xF8E28020
+        );
+        // ldaddalb w2, w0, [x1]
+        assert_eq!(
+            Inst::AtomicRmw {
+                op: AtomicRmwOp::Add,
+                acquire: true,
+                release: true,
+                size: MemSize::B,
+                rs: X2,
+                rt: X0,
+                rn: X1,
+            }
+            .encode(),
+            0x38E20020
+        );
+        // casal x0, x2, [x1]  (rs=x0, rt=x2, rn=x1)
+        assert_eq!(
+            Inst::AtomicCas {
+                acquire: true,
+                release: true,
+                size: MemSize::X,
+                rs: X0,
+                rt: X2,
+                rn: X1,
+            }
+            .encode(),
+            0xC8E0FC22
+        );
+        // casalb w0, w2, [x1]
+        assert_eq!(
+            Inst::AtomicCas {
+                acquire: true,
+                release: true,
+                size: MemSize::B,
+                rs: X0,
+                rt: X2,
+                rn: X1,
+            }
+            .encode(),
+            0x08E0FC22
+        );
+        // dmb ish / ishld / ishst
+        assert_eq!(Inst::Dmb { option: DmbOption::Ish }.encode(), 0xD5033BBF);
+        assert_eq!(Inst::Dmb { option: DmbOption::IshLd }.encode(), 0xD50339BF);
+        assert_eq!(Inst::Dmb { option: DmbOption::IshSt }.encode(), 0xD5033ABF);
     }
 }

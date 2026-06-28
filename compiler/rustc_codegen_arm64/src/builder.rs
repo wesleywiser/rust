@@ -34,8 +34,8 @@ use rustc_target::spec::{HasTargetSpec, Target};
 use crate::context::{BasicBlock, CodegenCx, Function, Type, TypeData, Value};
 use crate::mach::func::MachFunction;
 use crate::mach::inst::{
-    AddSub, CondSel, DataProc2, FpOp1, FpOp2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex,
-    SymRef,
+    AddSub, AtomicRmwOp, CondSel, DataProc2, DmbOption, FpOp1, FpOp2, Inst, Label, LogicOp, MemSize,
+    MovKind, PairIndex, SymRef,
 };
 use crate::mach::reg::{
     Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V16, V17, X0, X1, X2, X9, X10, X12, X13,
@@ -576,6 +576,26 @@ fn real_pred_to_cond(pred: RealPredicate) -> Cond {
         RealPredicate::RealUNO => Cond::Vs,
         other => todo!("rustc_codegen_arm64: float predicate {other:?}"),
     }
+}
+
+/// Memory access width for an atomic of the given byte size.
+fn mem_size_from_bytes(bytes: u64) -> MemSize {
+    match bytes {
+        1 => MemSize::B,
+        2 => MemSize::H,
+        4 => MemSize::W,
+        _ => MemSize::X,
+    }
+}
+
+/// Whether an ordering implies an acquire barrier (sets the LSE `A` bit / selects a load-acquire).
+fn order_acquire(order: AtomicOrdering) -> bool {
+    matches!(order, AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst)
+}
+
+/// Whether an ordering implies a release barrier (sets the LSE `R` bit / selects a store-release).
+fn order_release(order: AtomicOrdering) -> bool {
+    matches!(order, AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst)
 }
 
 impl<'a, 'tcx> CoverageInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
@@ -1127,8 +1147,22 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn volatile_load(&mut self, ty: Type, ptr: Value) -> Value {
         self.load(ty, ptr, Align::ONE)
     }
-    fn atomic_load(&mut self, _ty: Type, _ptr: Value, _order: AtomicOrdering, _size: Size) -> Value {
-        todo!("rustc_codegen_arm64: atomic_load")
+    fn atomic_load(&mut self, ty: Type, ptr: Value, order: AtomicOrdering, size: Size) -> Value {
+        let msize = mem_size_from_bytes(size.bytes());
+        self.materialize(ptr, X9);
+        if order_acquire(order) {
+            self.emit(Inst::LoadAcq { size: msize, rt: X10, rn: X9 });
+        } else {
+            self.emit(Inst::LoadStoreUImm {
+                load: true,
+                signed: false,
+                size: msize,
+                rt: X10,
+                rn: X9,
+                offset: 0,
+            });
+        }
+        self.spill(X10, ty)
     }
     fn load_operand(&mut self, place: PlaceRef<'tcx, Value>) -> OperandRef<'tcx, Value> {
         if place.layout.is_zst() {
@@ -1189,8 +1223,22 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         });
         Value::Undef { ty: self.ptr_ty() }
     }
-    fn atomic_store(&mut self, _val: Value, _ptr: Value, _order: AtomicOrdering, _size: Size) {
-        todo!("rustc_codegen_arm64: atomic_store")
+    fn atomic_store(&mut self, val: Value, ptr: Value, order: AtomicOrdering, size: Size) {
+        let msize = mem_size_from_bytes(size.bytes());
+        self.materialize(ptr, X9);
+        self.materialize(val, X10);
+        if order_release(order) {
+            self.emit(Inst::StoreRel { size: msize, rt: X10, rn: X9 });
+        } else {
+            self.emit(Inst::LoadStoreUImm {
+                load: false,
+                signed: false,
+                size: msize,
+                rt: X10,
+                rn: X9,
+                offset: 0,
+            });
+        }
     }
 
     fn gep(&mut self, ty: Type, ptr: Value, indices: &[Value]) -> Value {
@@ -1508,27 +1556,94 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn atomic_cmpxchg(
         &mut self,
-        _dst: Value,
-        _cmp: Value,
-        _src: Value,
-        _order: AtomicOrdering,
-        _failure_order: AtomicOrdering,
+        dst: Value,
+        cmp: Value,
+        src: Value,
+        order: AtomicOrdering,
+        failure_order: AtomicOrdering,
         _weak: bool,
     ) -> (Value, Value) {
-        todo!("rustc_codegen_arm64: atomic_cmpxchg")
+        // `cas` is always strong, so it implements the weak form too.
+        let ty = cmp.ty();
+        let size = mem_size(self.cx, ty);
+        let acquire = order_acquire(order) || order_acquire(failure_order);
+        let release = order_release(order);
+        let bool_ty = self.cx.intern_type(TypeData::Int(1));
+        self.materialize(dst, X9); // pointer
+        self.materialize(cmp, X10); // comparand (overwritten with the old value)
+        self.materialize(src, X11_HACK); // new value
+        self.materialize(cmp, X12); // keep the original comparand for the success test
+        self.emit(Inst::AtomicCas { acquire, release, size, rs: X10, rt: X11_HACK, rn: X9 });
+        // x10 now holds the old value; the swap succeeded iff it equalled the comparand.
+        let cmp_size = op_size(self.cx, ty);
+        self.emit(Inst::AddSubReg {
+            op: AddSub::Sub,
+            size: cmp_size,
+            set_flags: true,
+            rd: ZR,
+            rn: X10,
+            rm: X12,
+            amount: 0,
+        });
+        self.emit(Inst::CondSel {
+            op: CondSel::Csinc,
+            size: OperandSize::S32,
+            rd: X13,
+            rn: ZR,
+            rm: ZR,
+            cond: Cond::Eq.invert(),
+        });
+        let old = self.spill(X10, ty);
+        let success = self.spill(X13, bool_ty);
+        (old, success)
     }
     fn atomic_rmw(
         &mut self,
-        _op: AtomicRmwBinOp,
-        _dst: Value,
-        _src: Value,
-        _order: AtomicOrdering,
+        op: AtomicRmwBinOp,
+        dst: Value,
+        src: Value,
+        order: AtomicOrdering,
         _ret_ptr: bool,
     ) -> Value {
-        todo!("rustc_codegen_arm64: atomic_rmw")
+        let ty = src.ty();
+        let size = mem_size(self.cx, ty);
+        let acquire = order_acquire(order);
+        let release = order_release(order);
+        // AArch64 lacks atomic subtract/and; express them as add of the negation and clear of the
+        // complement, transforming the operand before the atomic.
+        let (rmw_op, operand) = match op {
+            AtomicRmwBinOp::AtomicXchg => (AtomicRmwOp::Swp, src),
+            AtomicRmwBinOp::AtomicAdd => (AtomicRmwOp::Add, src),
+            AtomicRmwBinOp::AtomicSub => (AtomicRmwOp::Add, self.neg(src)),
+            AtomicRmwBinOp::AtomicAnd => (AtomicRmwOp::Clr, self.not(src)),
+            AtomicRmwBinOp::AtomicOr => (AtomicRmwOp::Set, src),
+            AtomicRmwBinOp::AtomicXor => (AtomicRmwOp::Eor, src),
+            AtomicRmwBinOp::AtomicMax => (AtomicRmwOp::Smax, src),
+            AtomicRmwBinOp::AtomicMin => (AtomicRmwOp::Smin, src),
+            AtomicRmwBinOp::AtomicUMax => (AtomicRmwOp::Umax, src),
+            AtomicRmwBinOp::AtomicUMin => (AtomicRmwOp::Umin, src),
+            // `nand` has no single LSE op (it needs a load/store-exclusive loop); deferred.
+            AtomicRmwBinOp::AtomicNand => todo!("rustc_codegen_arm64: atomic nand"),
+        };
+        self.materialize(dst, X9); // pointer
+        self.materialize(operand, X10); // rs
+        self.emit(Inst::AtomicRmw {
+            op: rmw_op,
+            acquire,
+            release,
+            size,
+            rs: X10,
+            rt: X11_HACK,
+            rn: X9,
+        });
+        self.spill(X11_HACK, ty)
     }
-    fn atomic_fence(&mut self, _order: AtomicOrdering, _scope: SynchronizationScope) {
-        todo!("rustc_codegen_arm64: atomic_fence")
+    fn atomic_fence(&mut self, order: AtomicOrdering, _scope: SynchronizationScope) {
+        let option = match order {
+            AtomicOrdering::Acquire => DmbOption::IshLd,
+            _ => DmbOption::Ish,
+        };
+        self.emit(Inst::Dmb { option });
     }
     fn set_invariant_load(&mut self, _load: Value) {}
 

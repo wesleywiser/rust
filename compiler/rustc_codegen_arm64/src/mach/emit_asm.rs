@@ -7,7 +7,8 @@
 use std::fmt::Write;
 
 use crate::mach::inst::{
-    AddSub, CondSel, DataProc2, FpOp1, FpOp2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex,
+    AddSub, AtomicRmwOp, CondSel, DataProc2, DmbOption, FpOp1, FpOp2, Inst, Label, LogicOp, MemSize,
+    MovKind, PairIndex,
 };
 use crate::mach::module::{DataSection, MachModule};
 use crate::mach::reg::{FpSize, OperandSize, Vreg};
@@ -337,6 +338,103 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
         Inst::FpCvt { from, to, rd, rn } => {
             line(out, &format!("fcvt {}, {}", vname(rd, to), vname(rn, from)));
         }
+
+        Inst::LoadAcq { size, rt, rn } => {
+            line(
+                out,
+                &format!(
+                    "ldar{} {}, [{}]",
+                    mem_suffix(size),
+                    rt.name_zr(gpr_size(size)),
+                    rn.name(OperandSize::S64)
+                ),
+            );
+        }
+        Inst::StoreRel { size, rt, rn } => {
+            line(
+                out,
+                &format!(
+                    "stlr{} {}, [{}]",
+                    mem_suffix(size),
+                    rt.name_zr(gpr_size(size)),
+                    rn.name(OperandSize::S64)
+                ),
+            );
+        }
+        Inst::AtomicRmw { op, acquire, release, size, rs, rt, rn } => {
+            let base = match op {
+                AtomicRmwOp::Add => "ldadd",
+                AtomicRmwOp::Clr => "ldclr",
+                AtomicRmwOp::Eor => "ldeor",
+                AtomicRmwOp::Set => "ldset",
+                AtomicRmwOp::Smax => "ldsmax",
+                AtomicRmwOp::Smin => "ldsmin",
+                AtomicRmwOp::Umax => "ldumax",
+                AtomicRmwOp::Umin => "ldumin",
+                AtomicRmwOp::Swp => "swp",
+            };
+            let gs = gpr_size(size);
+            line(
+                out,
+                &format!(
+                    "{base}{}{} {}, {}, [{}]",
+                    ar_suffix(acquire, release),
+                    mem_suffix(size),
+                    rs.name_zr(gs),
+                    rt.name_zr(gs),
+                    rn.name(OperandSize::S64)
+                ),
+            );
+        }
+        Inst::AtomicCas { acquire, release, size, rs, rt, rn } => {
+            let gs = gpr_size(size);
+            line(
+                out,
+                &format!(
+                    "cas{}{} {}, {}, [{}]",
+                    ar_suffix(acquire, release),
+                    mem_suffix(size),
+                    rs.name_zr(gs),
+                    rt.name_zr(gs),
+                    rn.name(OperandSize::S64)
+                ),
+            );
+        }
+        Inst::Dmb { option } => {
+            let opt = match option {
+                DmbOption::Ish => "ish",
+                DmbOption::IshLd => "ishld",
+                DmbOption::IshSt => "ishst",
+            };
+            line(out, &format!("dmb {opt}"));
+        }
+    }
+}
+
+/// The `b`/`h` mnemonic suffix for a byte/halfword atomic (word/doubleword take none).
+fn mem_suffix(size: MemSize) -> &'static str {
+    match size {
+        MemSize::B => "b",
+        MemSize::H => "h",
+        MemSize::W | MemSize::X => "",
+    }
+}
+
+/// The `a`/`l`/`al` ordering suffix from the acquire/release bits.
+fn ar_suffix(acquire: bool, release: bool) -> &'static str {
+    match (acquire, release) {
+        (true, true) => "al",
+        (true, false) => "a",
+        (false, true) => "l",
+        (false, false) => "",
+    }
+}
+
+/// The GPR view for an atomic of the given access size (`x` for doublewords, otherwise `w`).
+fn gpr_size(size: MemSize) -> OperandSize {
+    match size {
+        MemSize::X => OperandSize::S64,
+        MemSize::B | MemSize::H | MemSize::W => OperandSize::S32,
     }
 }
 
