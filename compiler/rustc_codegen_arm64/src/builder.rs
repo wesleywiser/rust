@@ -21,6 +21,7 @@ use rustc_codegen_ssa::traits::{
     IntrinsicCallBuilderMethods, LayoutTypeCodegenMethods, OverflowOp, StaticBuilderMethods,
 };
 use rustc_codegen_ssa::{MemFlags, RetagInfo};
+use rustc_hir::def::DefKind;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::mir::coverage::CoverageKind;
 use rustc_middle::ty::layout::{
@@ -33,6 +34,7 @@ use rustc_target::spec::{HasTargetSpec, Target};
 
 use crate::context::{BasicBlock, CodegenCx, Function, Type, TypeData, Value};
 use crate::mach::func::MachFunction;
+use crate::mach::frame::FrameLayout;
 use crate::mach::inst::{
     AddSub, AtomicRmwOp, CondSel, DataProc1, DataProc2, DmbOption, FpOp1, FpOp2, Inst, Label,
     LogicOp, MemSize, MovKind, PairIndex, SymRef,
@@ -42,34 +44,6 @@ use crate::mach::reg::{
     ZR,
 };
 
-/// Bump allocator for a function's stack frame. Slots are assigned at increasing offsets above the
-/// reserved outgoing-argument area; the frame size is rounded to 16 bytes at finalization.
-#[derive(Default)]
-pub struct FrameAlloc {
-    /// Current high-water mark in bytes.
-    size: u64,
-}
-
-impl FrameAlloc {
-    /// Reserve `size` bytes at the given alignment, returning the slot's byte offset from `sp`.
-    pub fn alloc(&mut self, size: u64, align: u64) -> u64 {
-        let align = align.max(1);
-        let offset = align_up(self.size, align);
-        self.size = offset + size.max(1);
-        offset
-    }
-
-    /// The 16-byte-aligned frame size.
-    pub fn frame_size(&self) -> u64 {
-        align_up(self.size, 16)
-    }
-}
-
-fn align_up(value: u64, align: u64) -> u64 {
-    debug_assert!(align.is_power_of_two());
-    (value + align - 1) & !(align - 1)
-}
-
 /// State for the function currently being lowered.
 pub struct FunctionBuild {
     pub func: Function,
@@ -77,19 +51,26 @@ pub struct FunctionBuild {
     pub is_global: bool,
     /// Instruction list for each basic block, indexed by block id (which is also its [`Label`]).
     pub blocks: Vec<Vec<Inst>>,
-    pub frame: FrameAlloc,
+    pub frame: FrameLayout,
     /// Spilled location of each physical incoming parameter, indexed by physical param index.
     pub param_slots: Vec<Value>,
 }
 
 impl FunctionBuild {
-    pub fn new(func: Function, name: Box<str>, is_global: bool) -> FunctionBuild {
+    /// Create a function builder. `outgoing_bytes` is the size of the outgoing-argument area
+    /// (computed up front by scanning the function's calls); it fixes where local slots begin.
+    pub fn new(
+        func: Function,
+        name: Box<str>,
+        is_global: bool,
+        outgoing_bytes: u32,
+    ) -> FunctionBuild {
         FunctionBuild {
             func,
             name,
             is_global,
             blocks: Vec::new(),
-            frame: FrameAlloc::default(),
+            frame: FrameLayout::new(outgoing_bytes),
             param_slots: Vec::new(),
         }
     }
@@ -149,7 +130,7 @@ impl FunctionBuild {
 }
 
 /// `sub sp, sp, #frame` (frame assumed to fit in a 12-bit immediate for now).
-fn sub_sp(frame: u64) -> Inst {
+fn sub_sp(frame: u32) -> Inst {
     Inst::AddSubImm {
         op: AddSub::Sub,
         size: OperandSize::S64,
@@ -162,7 +143,7 @@ fn sub_sp(frame: u64) -> Inst {
 }
 
 /// `add sp, sp, #frame`.
-fn add_sp(frame: u64) -> Inst {
+fn add_sp(frame: u32) -> Inst {
     Inst::AddSubImm {
         op: AddSub::Add,
         size: OperandSize::S64,
@@ -190,10 +171,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     }
 
     /// Reserve a stack slot of the given size/alignment, returning its `sp`-relative offset.
-    pub fn alloc_slot(&self, size: u64, align: u64) -> u64 {
+    pub fn alloc_slot(&self, size: u64, align: u64) -> u32 {
         let mut cur = self.cx.cur_fn.borrow_mut();
         let fb = cur.as_mut().expect("no function is currently being built");
-        fb.frame.alloc(size, align)
+        fb.frame.alloc_local(size, align)
     }
 }
 
@@ -300,71 +281,139 @@ fn fp_size(cx: &CodegenCx<'_>, ty: Type) -> FpSize {
     }
 }
 
-/// The incoming physical register class of a parameter in the baseline ABI.
-enum ParamReg {
+/// The incoming physical location of a parameter in the baseline AAPCS64 ABI.
+enum ParamLoc {
     /// Integer/pointer argument in `x0..x7` (or the indirect-return pointer in `x8`).
     Gpr(Gpr),
     /// Floating-point argument in `v0..v7`.
     Fp(Vreg),
+    /// Argument passed on the stack at the given byte offset within the caller's outgoing area.
+    /// The callee reads it at `fp + 16 + offset`; the caller writes it at `sp + offset`.
+    Stack(u32),
 }
 
-/// Assign one scalar parameter to the next integer or floating-point register.
-fn push_scalar_param(
-    cx: &CodegenCx<'_>,
-    params: &mut Vec<(ParamReg, Type)>,
-    ngrn: &mut u8,
-    nsrn: &mut u8,
-    ty: Type,
-) {
-    if type_is_float(cx, ty) {
-        params.push((ParamReg::Fp(Vreg::from_encoding(*nsrn)), ty));
-        *nsrn += 1;
+/// AAPCS64 argument-assignment cursor: the next free integer register (`x{ngrn}`), the next free
+/// floating-point register (`v{nsrn}`), and the next free byte offset on the stack (`nsaa`).
+#[derive(Default)]
+struct ArgAssign {
+    ngrn: u8,
+    nsrn: u8,
+    nsaa: u32,
+}
+
+/// The classified parameter locations of a function signature, plus the total bytes of stack
+/// arguments — which, for a *call* to such a function, is exactly its outgoing-argument-area size.
+struct ParamList {
+    params: Vec<(ParamLoc, Type)>,
+    stack_size: u32,
+}
+
+/// Assign one scalar parameter to its next location: a register from the appropriate bank, or a
+/// stack slot once that bank is exhausted.
+fn push_scalar_param(cx: &CodegenCx<'_>, params: &mut Vec<(ParamLoc, Type)>, a: &mut ArgAssign, ty: Type) {
+    let loc = if type_is_float(cx, ty) {
+        if a.nsrn < 8 {
+            let loc = ParamLoc::Fp(Vreg::from_encoding(a.nsrn));
+            a.nsrn += 1;
+            loc
+        } else {
+            let loc = ParamLoc::Stack(a.nsaa);
+            a.nsaa += 8;
+            loc
+        }
+    } else if a.ngrn < 8 {
+        let loc = ParamLoc::Gpr(Gpr::from_encoding(a.ngrn));
+        a.ngrn += 1;
+        loc
     } else {
-        params.push((ParamReg::Gpr(Gpr::from_encoding(*ngrn)), ty));
-        *ngrn += 1;
-    }
+        let loc = ParamLoc::Stack(a.nsaa);
+        a.nsaa += 8;
+        loc
+    };
+    params.push((loc, ty));
 }
 
-/// Compute the incoming register and backend type of each physical parameter, following the
-/// baseline AAPCS64 split: integer/pointer arguments fill `x0..x7`, floating-point arguments fill
-/// `v0..v7`, and an indirect-return (sret) pointer arrives in `x8`. Stack-passed arguments (once
-/// the register banks are exhausted) are not yet handled.
-fn build_param_list<'tcx>(
-    cx: &CodegenCx<'tcx>,
-    fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
-) -> Vec<(ParamReg, Type)> {
+/// Compute the location and backend type of each physical parameter, following the baseline
+/// AAPCS64 split: integer/pointer arguments fill `x0..x7`, floating-point arguments fill `v0..v7`,
+/// an indirect-return (sret) pointer arrives in `x8`, and anything left once a register bank is
+/// exhausted is passed on the stack (each scalar occupying an 8-byte slot).
+fn build_param_list<'tcx>(cx: &CodegenCx<'tcx>, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> ParamList {
     let mut params = Vec::new();
     let ptr = cx.intern_type(TypeData::Ptr);
     if fn_abi.ret.is_indirect() {
-        // The indirect-return (sret) pointer arrives in x8.
-        params.push((ParamReg::Gpr(Gpr::from_encoding(8)), ptr));
+        // The indirect-return (sret) pointer arrives in x8 (never on the stack).
+        params.push((ParamLoc::Gpr(Gpr::from_encoding(8)), ptr));
     }
-    let mut ngrn: u8 = 0;
-    let mut nsrn: u8 = 0;
+    let mut a = ArgAssign::default();
     for arg in fn_abi.args.iter() {
         match arg.mode {
             PassMode::Ignore => {}
             PassMode::Direct(_) => {
                 let ty = cx.immediate_backend_type(arg.layout);
-                push_scalar_param(cx, &mut params, &mut ngrn, &mut nsrn, ty);
+                push_scalar_param(cx, &mut params, &mut a, ty);
             }
             PassMode::Pair(..) => {
-                let a = cx.scalar_pair_element_backend_type(arg.layout, 0, true);
-                let b = cx.scalar_pair_element_backend_type(arg.layout, 1, true);
-                push_scalar_param(cx, &mut params, &mut ngrn, &mut nsrn, a);
-                push_scalar_param(cx, &mut params, &mut ngrn, &mut nsrn, b);
+                let x = cx.scalar_pair_element_backend_type(arg.layout, 0, true);
+                let y = cx.scalar_pair_element_backend_type(arg.layout, 1, true);
+                push_scalar_param(cx, &mut params, &mut a, x);
+                push_scalar_param(cx, &mut params, &mut a, y);
             }
-            PassMode::Indirect { .. } => {
-                params.push((ParamReg::Gpr(Gpr::from_encoding(ngrn)), ptr));
-                ngrn += 1;
-            }
+            PassMode::Indirect { .. } => push_scalar_param(cx, &mut params, &mut a, ptr),
             PassMode::Cast { .. } => {
-                params.push((ParamReg::Gpr(Gpr::from_encoding(ngrn)), cx.intern_type(TypeData::Int(64))));
-                ngrn += 1;
+                push_scalar_param(cx, &mut params, &mut a, cx.intern_type(TypeData::Int(64)))
             }
         }
     }
-    params
+    ParamList { params, stack_size: a.nsaa }
+}
+
+/// Compute the size of the outgoing-argument area for `instance`: the maximum, over every call in
+/// its MIR body, of the bytes needed for arguments that do not fit in registers. This is done once
+/// up front (before instruction selection) so that local slots can be laid out above the area and
+/// every stack reference emitted with its final offset, without a second pass over the instructions.
+fn outgoing_arg_bytes<'tcx>(cx: &CodegenCx<'tcx>, instance: Instance<'tcx>) -> u32 {
+    let tcx = cx.tcx;
+    let typing_env = cx.typing_env();
+    let mir = tcx.instance_mir(instance.def);
+    let mut max = 0u32;
+    for bb in mir.basic_blocks.iter() {
+        let Some(terminator) = bb.terminator.as_ref() else { continue };
+        let rustc_middle::mir::TerminatorKind::Call { func, args, .. } = &terminator.kind else {
+            continue;
+        };
+        // Monomorphize the callee type (and any C-variadic extra arguments) in this instance.
+        let callee_ty = instance.instantiate_mir_and_normalize_erasing_regions(
+            tcx,
+            typing_env,
+            ty::EarlyBinder::bind(tcx, func.ty(mir, tcx)),
+        );
+        let sig = callee_ty.fn_sig(tcx);
+        let n_fixed = sig.inputs().skip_binder().len().min(args.len());
+        let extra_args = tcx.mk_type_list_from_iter(args[n_fixed..].iter().map(|arg| {
+            instance.instantiate_mir_and_normalize_erasing_regions(
+                tcx,
+                typing_env,
+                ty::EarlyBinder::bind(tcx, arg.node.ty(mir, tcx)),
+            )
+        }));
+        let fn_abi = match *callee_ty.kind() {
+            // A direct call to a resolvable free/associated function: use the instance ABI, which
+            // accounts for `#[track_caller]`'s implicit caller-location argument.
+            ty::FnDef(def_id, generic_args)
+                if matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) =>
+            {
+                match ty::Instance::try_resolve(tcx, typing_env, def_id, generic_args) {
+                    Ok(Some(callee)) => cx.fn_abi_of_instance(callee, extra_args),
+                    _ => cx.fn_abi_of_fn_ptr(sig, extra_args),
+                }
+            }
+            // Tuple-struct/enum constructors and indirect calls: the signature determines the ABI.
+            ty::FnDef(..) | ty::FnPtr(..) => cx.fn_abi_of_fn_ptr(sig, extra_args),
+            _ => continue,
+        };
+        max = max.max(build_param_list(cx, fn_abi).stack_size);
+    }
+    max
 }
 
 /// Spill each incoming parameter register into a frame slot at function entry and record the slots.
@@ -372,38 +421,53 @@ fn setup_params(cx: &CodegenCx<'_>, fb: &mut FunctionBuild, block: BasicBlock) {
     let params = match cx.cur_instance.get() {
         Some(instance) => {
             let fn_abi = cx.fn_abi_of_instance(instance, ty::List::empty());
-            build_param_list(cx, fn_abi)
+            build_param_list(cx, fn_abi).params
         }
         // The synthesized C `main` entry wrapper has no MIR instance. Where `main` is
         // `int main(int argc, char** argv)`, spill those two incoming registers so the generic
         // entry-wrapper builder can read them back via `get_param`.
         None if cx.tcx.sess.target.main_needs_argc_argv => vec![
-            (ParamReg::Gpr(Gpr::from_encoding(0)), cx.intern_type(TypeData::Int(32))),
-            (ParamReg::Gpr(Gpr::from_encoding(1)), cx.intern_type(TypeData::Ptr)),
+            (ParamLoc::Gpr(Gpr::from_encoding(0)), cx.intern_type(TypeData::Int(32))),
+            (ParamLoc::Gpr(Gpr::from_encoding(1)), cx.intern_type(TypeData::Ptr)),
         ],
         None => return,
     };
-    for (reg, ty) in params {
+    for (loc, ty) in params {
         let (size, align) = cx.type_size_align(ty);
-        let off = fb.frame.alloc(size, align) as u32;
-        let inst = match reg {
-            ParamReg::Gpr(reg) => Inst::LoadStoreUImm {
+        let off = fb.frame.alloc_local(size, align);
+        // Move the incoming parameter into its frame slot. Register parameters are stored directly;
+        // a stack parameter is first loaded from the caller-provided incoming area (`fp + 16 + k`)
+        // through a scratch register, then stored into its slot.
+        match loc {
+            ParamLoc::Gpr(reg) => fb.blocks[block.0 as usize].push(Inst::LoadStoreUImm {
                 load: false,
                 signed: false,
                 size: mem_size(cx, ty),
                 rt: reg,
                 rn: SP,
                 offset: off,
-            },
-            ParamReg::Fp(reg) => Inst::LoadStoreFpUImm {
+            }),
+            ParamLoc::Fp(reg) => fb.blocks[block.0 as usize].push(Inst::LoadStoreFpUImm {
                 load: false,
                 size: fp_size(cx, ty),
                 rt: reg,
                 rn: SP,
                 offset: off,
-            },
-        };
-        fb.blocks[block.0 as usize].push(inst);
+            }),
+            ParamLoc::Stack(arg_off) => {
+                let incoming = fb.frame.incoming_arg(arg_off);
+                let block = &mut fb.blocks[block.0 as usize];
+                if type_is_float(cx, ty) {
+                    let size = fp_size(cx, ty);
+                    block.push(Inst::LoadStoreFpUImm { load: true, size, rt: V16, rn: FP, offset: incoming });
+                    block.push(Inst::LoadStoreFpUImm { load: false, size, rt: V16, rn: SP, offset: off });
+                } else {
+                    let size = mem_size(cx, ty);
+                    block.push(Inst::LoadStoreUImm { load: true, signed: false, size, rt: X9, rn: FP, offset: incoming });
+                    block.push(Inst::LoadStoreUImm { load: false, signed: false, size, rt: X9, rn: SP, offset: off });
+                }
+            }
+        }
         fb.param_slots.push(Value::Slot { off, ty });
     }
 }
@@ -1095,7 +1159,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 (decl.sym, decl.is_global)
             };
             let name = cx.sym_name(sym);
-            let mut fb = FunctionBuild::new(llfn, name, is_global);
+            // Determine the frame layout up front: scan the function's calls for the outgoing
+            // stack-argument requirement so local slots can be placed above that area directly.
+            let outgoing = match cx.cur_instance.get() {
+                Some(instance) => outgoing_arg_bytes(cx, instance),
+                None => 0,
+            };
+            let mut fb = FunctionBuild::new(llfn, name, is_global, outgoing);
             let entry = fb.new_block();
             setup_params(cx, &mut fb, entry);
             *cx.cur_fn.borrow_mut() = Some(fb);
@@ -2134,18 +2204,44 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     ) -> Value {
         let indirect_ret = fn_abi.is_some_and(|a| a.ret.is_indirect());
         // Marshal physical arguments into the integer (`x0..x7`) and floating-point (`v0..v7`)
-        // register banks; an sret pointer goes in x8.
+        // register banks; an sret pointer goes in x8. Once a bank is exhausted the remaining
+        // arguments are written into the outgoing-argument area at the bottom of our frame
+        // (`sp + nsaa`), which the frame-layout pre-pass sized so they never overlap local slots.
         let mut ngrn: u8 = 0;
         let mut nsrn: u8 = 0;
+        let mut nsaa: u32 = 0;
         for (i, &arg) in args.iter().enumerate() {
             if indirect_ret && i == 0 {
                 self.materialize(arg, Gpr::from_encoding(8));
             } else if type_is_float(self.cx, arg.ty()) {
-                self.materialize_fp(arg, Vreg::from_encoding(nsrn));
-                nsrn += 1;
-            } else {
+                if nsrn < 8 {
+                    self.materialize_fp(arg, Vreg::from_encoding(nsrn));
+                    nsrn += 1;
+                } else {
+                    self.materialize_fp(arg, V16);
+                    self.emit(Inst::LoadStoreFpUImm {
+                        load: false,
+                        size: fp_size(self.cx, arg.ty()),
+                        rt: V16,
+                        rn: SP,
+                        offset: nsaa,
+                    });
+                    nsaa += 8;
+                }
+            } else if ngrn < 8 {
                 self.materialize(arg, Gpr::from_encoding(ngrn));
                 ngrn += 1;
+            } else {
+                self.materialize(arg, X9);
+                self.emit(Inst::LoadStoreUImm {
+                    load: false,
+                    signed: false,
+                    size: mem_size(self.cx, arg.ty()),
+                    rt: X9,
+                    rn: SP,
+                    offset: nsaa,
+                });
+                nsaa += 8;
             }
         }
         // Emit the call. Direct calls reference the symbol (BRANCH26 relocation); otherwise the

@@ -7,6 +7,7 @@
 
 pub mod emit_asm;
 pub mod emit_obj;
+pub mod frame;
 pub mod func;
 pub mod inst;
 pub mod module;

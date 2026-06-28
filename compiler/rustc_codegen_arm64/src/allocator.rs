@@ -44,7 +44,7 @@ fn mach_symbol(tcx: TyCtxt<'_>, name: &str) -> String {
 /// A forwarder `wrapper(args..) -> target(args..)` that returns the target's result. The function
 /// id is irrelevant for a standalone shim function (it is unused by `FunctionBuild::finish`).
 fn forwarder(name: String, target: &str) -> MachFunction {
-    let mut fb = FunctionBuild::new(Function(0), name.into(), true);
+    let mut fb = FunctionBuild::new(Function(0), name.into(), true, 0);
     let block = fb.new_block();
     fb.blocks[block.0 as usize].push(Inst::Bl { sym: SymRef::new(target) });
     fb.blocks[block.0 as usize].push(Inst::Ret { rn: LR });
@@ -53,7 +53,7 @@ fn forwarder(name: String, target: &str) -> MachFunction {
 
 /// An `extern "C"` function that immediately returns.
 fn empty(name: String) -> MachFunction {
-    let mut fb = FunctionBuild::new(Function(0), name.into(), true);
+    let mut fb = FunctionBuild::new(Function(0), name.into(), true, 0);
     let block = fb.new_block();
     fb.blocks[block.0 as usize].push(Inst::Ret { rn: LR });
     fb.finish()
