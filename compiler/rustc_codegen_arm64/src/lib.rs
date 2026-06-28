@@ -15,6 +15,12 @@
 //!   register-pair value model (lo/hi `Gpr`s with carry-aware add/sub/shift/cmp) or lowering to the
 //!   `compiler_builtins` libcalls (`__multi3`, `__udivti3`, `__umodti3`, `__ashlti3`, ...).
 //!   Compile-time-constant 128-bit values still work because const-eval folds them before codegen.
+//!
+//! - **SIMD / vector types.** The vector (`simd_*`) intrinsics and NEON value model are not
+//!   implemented, so code that monomorphizes to explicit SIMD is rejected (`simd_extract` and
+//!   friends ICE as not-overridden). This blocks `std::collections::HashMap`, whose `hashbrown`
+//!   group scan uses NEON. Implementing it needs a vector value/register model plus the NEON
+//!   load/store, compare, and lane-extract instructions.
 
 // tidy-alphabetical-start
 #![feature(rustc_private)]

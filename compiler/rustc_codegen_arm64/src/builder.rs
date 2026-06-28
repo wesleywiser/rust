@@ -548,6 +548,68 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.spill(X9, i64t)
     }
 
+    /// Saturating add/sub for an integer of width `n`. Operands are widened to 64 bits (sign- or
+    /// zero-extended per `signed`) and the wrapping result is computed there. For `n < 64` that
+    /// widened result cannot overflow 64 bits, so clamping into the `n`-bit range is exact; at
+    /// `n == 64` the 64-bit overflow is detected directly (carry/borrow for unsigned, operand/result
+    /// sign logic for signed) and the result is replaced with the saturation bound.
+    fn emit_saturating(
+        &mut self,
+        a: Value,
+        b: Value,
+        is_add: bool,
+        signed: bool,
+        result_ty: Type,
+    ) -> Value {
+        let n = match self.cx.type_data(result_ty) {
+            TypeData::Int(bits) => bits,
+            _ => 64,
+        };
+        let i64t = self.cx.intern_type(TypeData::Int(64));
+        let a64 = self.intcast(a, i64t, signed);
+        let b64 = self.intcast(b, i64t, signed);
+        let s = if is_add { self.add(a64, b64) } else { self.sub(a64, b64) };
+        let zero = self.cx.const_uint(i64t, 0);
+
+        let clamped = if signed {
+            let max = self.cx.const_uint(i64t, ((1i128 << (n - 1)) - 1) as u64);
+            let min = self.cx.const_uint(i64t, (-(1i128 << (n - 1))) as i64 as u64);
+            if n < 64 {
+                let too_high = self.icmp(IntPredicate::IntSGT, s, max);
+                let s = self.select(too_high, max, s);
+                let too_low = self.icmp(IntPredicate::IntSLT, s, min);
+                self.select(too_low, min, s)
+            } else {
+                // Signed overflow: add -> operands share a sign that the result doesn't; sub ->
+                // operands differ in sign and the result's sign differs from `a`. Both reduce to a
+                // sign bit set in the AND of two xors.
+                let axs = self.xor(a64, s);
+                let term2 = if is_add { self.xor(b64, s) } else { self.xor(a64, b64) };
+                let ovf_bits = self.and(axs, term2);
+                let ovf = self.icmp(IntPredicate::IntSLT, ovf_bits, zero);
+                let a_neg = self.icmp(IntPredicate::IntSLT, a64, zero);
+                let bound = self.select(a_neg, min, max);
+                self.select(ovf, bound, s)
+            }
+        } else if is_add {
+            if n < 64 {
+                let max = self.cx.const_uint(i64t, ((1u128 << n) - 1) as u64);
+                let too_high = self.icmp(IntPredicate::IntUGT, s, max);
+                self.select(too_high, max, s)
+            } else {
+                // Carry: the 64-bit sum wrapped iff it is now less than one of the operands.
+                let max = self.cx.const_uint(i64t, u64::MAX);
+                let ovf = self.icmp(IntPredicate::IntULT, s, a64);
+                self.select(ovf, max, s)
+            }
+        } else {
+            // Unsigned subtract saturates to 0 on borrow (`a < b`); valid for every width.
+            let borrow = self.icmp(IntPredicate::IntULT, a64, b64);
+            self.select(borrow, zero, s)
+        };
+        self.trunc(clamped, result_ty)
+    }
+
     /// Load a floating-point value into the SIMD&FP register `vreg`.
     fn materialize_fp(&mut self, val: Value, vreg: Vreg) {        let ty = val.ty();
         let size = fp_size(self.cx, ty);
@@ -790,7 +852,8 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         _result_place: Option<PlaceValue<Value>>,
         _span: Span,
     ) -> IntrinsicResult<'tcx, Value> {
-        match self.cx.tcx.item_name(instance.def_id()) {
+        let name = self.cx.tcx.item_name(instance.def_id());
+        match name {
             // `black_box` is an optimization barrier; with no optimizer it is the identity.
             sym::black_box => IntrinsicResult::Operand(args[0].val),
             // Population count: a SWAR sequence, narrowed to the `u32` result type.
@@ -813,6 +876,20 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let result_ty = self.cx.immediate_backend_type(result_layout);
                 let count = self.intcast(count, result_ty, false);
                 IntrinsicResult::Operand(OperandValue::Immediate(count))
+            }
+            // Saturating add/sub, clamped to the integer type's range.
+            sym::saturating_add | sym::saturating_sub => {
+                let is_add = name == sym::saturating_add;
+                let signed = matches!(result_layout.ty.kind(), ty::Int(_));
+                let result_ty = self.cx.immediate_backend_type(result_layout);
+                let r = self.emit_saturating(
+                    args[0].immediate(),
+                    args[1].immediate(),
+                    is_add,
+                    signed,
+                    result_ty,
+                );
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
             // Everything else falls back to the intrinsic's MIR body (if it has one).
             _ => IntrinsicResult::Fallback(instance),
