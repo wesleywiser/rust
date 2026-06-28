@@ -27,7 +27,7 @@ use rustc_middle::ty::layout::{
     FnAbiOf, FnAbiOfHelpers, HasTyCtxt, HasTypingEnv, LayoutOfHelpers, TyAndLayout,
 };
 use rustc_middle::ty::{self, AtomicOrdering, Instance, Ty, TyCtxt};
-use rustc_span::Span;
+use rustc_span::{Span, sym};
 use rustc_target::callconv::{ArgAbi, FnAbi, PassMode};
 use rustc_target::spec::{HasTargetSpec, Target};
 
@@ -265,6 +265,11 @@ impl<'tcx> FnAbiOfHelpers<'tcx> for Builder<'_, 'tcx> {
 /// Integer operand size for a backend type.
 fn op_size(cx: &CodegenCx<'_>, ty: Type) -> OperandSize {
     match cx.type_data(ty) {
+        // 128-bit integers would need a register pair (or libcalls); silently truncating them to a
+        // single 64-bit register would miscompile, so fail loudly until they are implemented.
+        TypeData::Int(bits) if bits > 64 => {
+            todo!("{bits}-bit integer operations are not yet supported by the arm64 backend")
+        }
         TypeData::Int(bits) => OperandSize::from_bits(bits as u64),
         _ => OperandSize::S64,
     }
@@ -686,13 +691,17 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn codegen_intrinsic_call(
         &mut self,
         instance: Instance<'tcx>,
-        _args: &[OperandRef<'tcx, Value>],
+        args: &[OperandRef<'tcx, Value>],
         _result_layout: TyAndLayout<'tcx>,
         _result_place: Option<PlaceValue<Value>>,
         _span: Span,
     ) -> IntrinsicResult<'tcx, Value> {
-        // Fall back to the intrinsic's MIR body for now.
-        IntrinsicResult::Fallback(instance)
+        match self.cx.tcx.item_name(instance.def_id()) {
+            // `black_box` is an optimization barrier; with no optimizer it is the identity.
+            sym::black_box => IntrinsicResult::Operand(args[0].val),
+            // Everything else falls back to the intrinsic's MIR body (if it has one).
+            _ => IntrinsicResult::Fallback(instance),
+        }
     }
     fn codegen_llvm_intrinsic_call(
         &mut self,
