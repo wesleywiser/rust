@@ -40,8 +40,8 @@ use crate::mach::inst::{
     LogicOp, MemSize, MovKind, PairIndex, SymRef,
 };
 use crate::mach::reg::{
-    Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V1, V16, V17, X0, X1, X2, X9, X10, X11,
-    X12, X13, X16, ZR,
+    Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V1, V16, V17, X0, X1, X2, X3, X9, X10,
+    X11, X12, X13, X16, ZR,
 };
 
 /// State for the function currently being lowered.
@@ -1115,6 +1115,63 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.spill(X9, bool_ty)
     }
 
+    /// A 128-bit binary op implemented by a compiler-builtins libcall taking two `i128` arguments in
+    /// the `x0:x1` and `x2:x3` register pairs and returning an `i128` in `x0:x1` (division and
+    /// remainder: `__udivti3`/`__divti3`/`__umodti3`/`__modti3`).
+    fn int128_bin_libcall(&mut self, sym: &str, lhs: Value, rhs: Value) -> Value {
+        let ty = lhs.ty();
+        self.materialize128(lhs, X0, X1);
+        self.materialize128(rhs, X2, X3);
+        self.emit(Inst::Bl { sym: SymRef::new(sym) });
+        self.spill128(X0, X1, ty)
+    }
+
+    /// A 128-bit shift implemented by a compiler-builtins libcall (`__ashlti3`/`__lshrti3`/
+    /// `__ashrti3`): the value is in `x0:x1`, the count (already masked to `< 128` by the generic
+    /// codegen) in `w2`, and the result returns in `x0:x1`.
+    fn int128_shift(&mut self, sym: &str, lhs: Value, rhs: Value) -> Value {
+        let ty = lhs.ty();
+        self.materialize128(lhs, X0, X1);
+        if self.is_int128(rhs.ty()) {
+            // The shift amount arrives as an i128 (extended to the value's type); its low word is
+            // the count.
+            self.materialize128(rhs, X2, X9);
+        } else {
+            self.materialize(rhs, X2);
+        }
+        self.emit(Inst::Bl { sym: SymRef::new(sym) });
+        self.spill128(X0, X1, ty)
+    }
+
+    /// Convert a 128-bit integer to a float via a compiler-builtins libcall (`__float[un]tidf` /
+    /// `__float[un]tisf`): the integer is in `x0:x1`, the result returns in `d0`/`s0`.
+    fn int128_to_fp(&mut self, signed: bool, val: Value, dest_ty: Type) -> Value {
+        let sym = match (fp_size(self.cx, dest_ty), signed) {
+            (FpSize::S64, true) => "___floattidf",
+            (FpSize::S64, false) => "___floatuntidf",
+            (FpSize::S32, true) => "___floattisf",
+            (FpSize::S32, false) => "___floatuntisf",
+        };
+        self.materialize128(val, X0, X1);
+        self.emit(Inst::Bl { sym: SymRef::new(sym) });
+        self.spill_fp(V0, dest_ty)
+    }
+
+    /// Convert a float to a 128-bit integer via a compiler-builtins libcall (`__fix[uns]dfti` /
+    /// `__fix[uns]sfti`): the float is in `d0`/`s0`, the result returns in `x0:x1`. These saturate
+    /// out-of-range inputs and map NaN to zero, matching Rust's `as` semantics.
+    fn fp_to_int128(&mut self, signed: bool, val: Value, dest_ty: Type) -> Value {
+        let sym = match (fp_size(self.cx, val.ty()), signed) {
+            (FpSize::S64, true) => "___fixdfti",
+            (FpSize::S64, false) => "___fixunsdfti",
+            (FpSize::S32, true) => "___fixsfti",
+            (FpSize::S32, false) => "___fixunssfti",
+        };
+        self.materialize_fp(val, V0);
+        self.emit(Inst::Bl { sym: SymRef::new(sym) });
+        self.spill128(X0, X1, dest_ty)
+    }
+
     /// Population count (`ctpop`) via the classic SWAR algorithm. The input is zero-extended to 64
     /// bits so the unused high bits do not contribute; the result is the count as a 64-bit value
     /// (the caller narrows it to the intrinsic's result type).
@@ -2121,6 +2178,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.alu_rrr(|size, rd, rn, rm| Inst::Madd { size, rd, rn, rm, ra: ZR }, lhs, rhs)
     }
     fn udiv(&mut self, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_bin_libcall("___udivti3", lhs, rhs);
+        }
         self.alu_rrr(
             |size, rd, rn, rm| Inst::DataProc2 { op: DataProc2::Udiv, size, rd, rn, rm },
             lhs,
@@ -2131,6 +2191,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.udiv(lhs, rhs)
     }
     fn sdiv(&mut self, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_bin_libcall("___divti3", lhs, rhs);
+        }
         self.alu_rrr_signed(
             |size, rd, rn, rm| Inst::DataProc2 { op: DataProc2::Sdiv, size, rd, rn, rm },
             lhs,
@@ -2141,9 +2204,15 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.sdiv(lhs, rhs)
     }
     fn urem(&mut self, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_bin_libcall("___umodti3", lhs, rhs);
+        }
         self.rem(lhs, rhs, DataProc2::Udiv)
     }
     fn srem(&mut self, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_bin_libcall("___modti3", lhs, rhs);
+        }
         self.rem(lhs, rhs, DataProc2::Sdiv)
     }
     fn and(&mut self, lhs: Value, rhs: Value) -> Value {
@@ -2177,6 +2246,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         )
     }
     fn shl(&mut self, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_shift("___ashlti3", lhs, rhs);
+        }
         self.alu_rrr(
             |size, rd, rn, rm| Inst::DataProc2 { op: DataProc2::Lslv, size, rd, rn, rm },
             lhs,
@@ -2184,6 +2256,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         )
     }
     fn lshr(&mut self, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_shift("___lshrti3", lhs, rhs);
+        }
         self.alu_rrr(
             |size, rd, rn, rm| Inst::DataProc2 { op: DataProc2::Lsrv, size, rd, rn, rm },
             lhs,
@@ -2191,6 +2266,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         )
     }
     fn ashr(&mut self, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_shift("___ashrti3", lhs, rhs);
+        }
         // The shifted value must be sign-extended so the vacated high bits carry its sign; the
         // shift amount is a plain count and is loaded zero-extended.
         let ty = lhs.ty();
@@ -2625,6 +2703,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.fptosi(val, dest_ty)
     }
     fn fptoui(&mut self, val: Value, dest_ty: Type) -> Value {
+        if self.is_int128(dest_ty) {
+            return self.fp_to_int128(false, val, dest_ty);
+        }
         let fp = fp_size(self.cx, val.ty());
         let int = op_size(self.cx, dest_ty);
         self.materialize_fp(val, V16);
@@ -2632,6 +2713,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.clamp_fp_to_int(X9, dest_ty, false)
     }
     fn fptosi(&mut self, val: Value, dest_ty: Type) -> Value {
+        if self.is_int128(dest_ty) {
+            return self.fp_to_int128(true, val, dest_ty);
+        }
         let fp = fp_size(self.cx, val.ty());
         let int = op_size(self.cx, dest_ty);
         self.materialize_fp(val, V16);
@@ -2639,6 +2723,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.clamp_fp_to_int(X9, dest_ty, true)
     }
     fn uitofp(&mut self, val: Value, dest_ty: Type) -> Value {
+        if self.is_int128(val.ty()) {
+            return self.int128_to_fp(false, val, dest_ty);
+        }
         // Zero-extend the source to 64 bits so any integer width converts correctly.
         let i64ty = self.cx.intern_type(TypeData::Int(64));
         let wide = self.zext(val, i64ty);
@@ -2648,6 +2735,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.spill_fp(V16, dest_ty)
     }
     fn sitofp(&mut self, val: Value, dest_ty: Type) -> Value {
+        if self.is_int128(val.ty()) {
+            return self.int128_to_fp(true, val, dest_ty);
+        }
         // Sign-extend the source to 64 bits so any integer width converts correctly.
         let i64ty = self.cx.intern_type(TypeData::Int(64));
         let wide = self.sext(val, i64ty);
