@@ -234,6 +234,7 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
             let mnem = match op {
                 DataProc1::Clz => "clz",
                 DataProc1::Rbit => "rbit",
+                DataProc1::Rev => "rev",
             };
             line(out, &format!("{mnem} {}, {}", rd.name_zr(size), rn.name_zr(size)));
         }

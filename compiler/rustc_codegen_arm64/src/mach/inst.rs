@@ -67,6 +67,8 @@ pub enum DataProc1 {
     Clz,
     /// `rbit` — reverse bit order.
     Rbit,
+    /// `rev` — reverse byte order (full register width).
+    Rev,
 }
 
 /// Conditional-select opcode.
@@ -410,6 +412,12 @@ impl Inst {
                 let opcode: u32 = match op {
                     DataProc1::Clz => 0b000100,
                     DataProc1::Rbit => 0b000000,
+                    // Full-width byte reverse: `rev` (32-bit) vs `rev` (64-bit, aka REV64) differ
+                    // in the opcode field.
+                    DataProc1::Rev => match size {
+                        OperandSize::S32 => 0b000010,
+                        OperandSize::S64 => 0b000011,
+                    },
                 };
                 (size.sf() << 31)
                     | (0b1 << 30)
@@ -794,6 +802,16 @@ mod tests {
         assert_eq!(
             Inst::DataProc1 { op: DataProc1::Rbit, size: OperandSize::S64, rd: X0, rn: X1 }.encode(),
             0xDAC00020
+        );
+        // rev w0, w1
+        assert_eq!(
+            Inst::DataProc1 { op: DataProc1::Rev, size: OperandSize::S32, rd: X0, rn: X1 }.encode(),
+            0x5AC00820
+        );
+        // rev x0, x1
+        assert_eq!(
+            Inst::DataProc1 { op: DataProc1::Rev, size: OperandSize::S64, rd: X0, rn: X1 }.encode(),
+            0xDAC00C20
         );
         // sxtb w0, w1
         assert_eq!(

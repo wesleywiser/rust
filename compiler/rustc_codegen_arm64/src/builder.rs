@@ -564,6 +564,25 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.spill(X9, i64t)
     }
 
+    /// Reverse bits (`rbit`) or bytes (`rev`) of a value within its own width. The hardware op
+    /// reverses the whole 32/64-bit register, so for a sub-word type the reversed low-`N` bits land
+    /// in the register's top end and are shifted back down by `op_bits - N`.
+    fn emit_reverse(&mut self, v: Value, op: DataProc1) -> Value {
+        let (n, op_bits) = match self.cx.type_data(v.ty()) {
+            TypeData::Int(b) if b <= 32 => (b, 32u32),
+            TypeData::Int(b) => (b, 64),
+            _ => (64, 64),
+        };
+        let size = op_size(self.cx, v.ty());
+        self.materialize(v, X9);
+        self.emit(Inst::DataProc1 { op, size, rd: X9, rn: X9 });
+        if n < op_bits {
+            self.load_imm(X10, (op_bits - n) as u128, size);
+            self.emit(Inst::DataProc2 { op: DataProc2::Lsrv, size, rd: X9, rn: X9, rm: X10 });
+        }
+        self.spill(X9, v.ty())
+    }
+
     /// Clamp the result of a float-to-int conversion (in `raw_reg`, saturated by the hardware only
     /// to the 32/64-bit operation width) into the destination type's own range, then narrow to it.
     /// AArch64's `fcvtzs`/`fcvtzu` saturate to the 32- or 64-bit register, so for an `i8`/`i16`/etc.
@@ -949,6 +968,17 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let result_ty = self.cx.immediate_backend_type(result_layout);
                 let count = self.intcast(count, result_ty, false);
                 IntrinsicResult::Operand(OperandValue::Immediate(count))
+            }
+            // Byte reverse (`swap_bytes`) and bit reverse (`reverse_bits`).
+            sym::bswap => {
+                IntrinsicResult::Operand(OperandValue::Immediate(
+                    self.emit_reverse(args[0].immediate(), DataProc1::Rev),
+                ))
+            }
+            sym::bitreverse => {
+                IntrinsicResult::Operand(OperandValue::Immediate(
+                    self.emit_reverse(args[0].immediate(), DataProc1::Rbit),
+                ))
             }
             // Saturating add/sub, clamped to the integer type's range.
             sym::saturating_add | sym::saturating_sub => {
