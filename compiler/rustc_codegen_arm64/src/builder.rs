@@ -2056,7 +2056,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             sym::catch_unwind => {
                 let try_func = args[0].immediate();
                 let data = args[1].immediate();
-                self.emit_call_core(None, try_func, &[data]);
+                self.emit_call_core(None, None, try_func, &[data]);
                 let ret_ty = self.cx.immediate_backend_type(result_layout);
                 let zero = self.cx.const_int(ret_ty, 0);
                 IntrinsicResult::Operand(OperandValue::Immediate(zero))
@@ -2476,7 +2476,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
     fn invoke(
         &mut self,
-        _llty: Type,
+        llty: Type,
         _fn_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: Value,
@@ -2488,7 +2488,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     ) -> Value {
         // Baseline model: emit the call and fall through to the normal successor. The unwind edge
         // (`_catch`) is not wired up; an unwind through this call aborts (panic=abort semantics).
-        let ret = self.emit_call_core(fn_abi, llfn, args);
+        let ret_fallback = match self.cx.type_data(llty) {
+            TypeData::Func { ret, .. } => Some(ret),
+            _ => None,
+        };
+        let ret = self.emit_call_core(fn_abi, ret_fallback, llfn, args);
         self.br(then);
         ret
     }
@@ -3470,7 +3474,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn call(
         &mut self,
-        _llty: Type,
+        llty: Type,
         _caller_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         fn_val: Value,
@@ -3478,7 +3482,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         _funclet: Option<&()>,
         _callee_instance: Option<Instance<'tcx>>,
     ) -> Value {
-        self.emit_call_core(fn_abi, fn_val, args)
+        // When the caller supplies no `FnAbi` (e.g. the entry-point wrapper calling `lang_start`),
+        // recover the return type from the function type so the result is still collected.
+        let ret_fallback = match self.cx.type_data(llty) {
+            TypeData::Func { ret, .. } => Some(ret),
+            _ => None,
+        };
+        self.emit_call_core(fn_abi, ret_fallback, fn_val, args)
     }
     fn tail_call(
         &mut self,
@@ -3573,6 +3583,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn emit_call_core(
         &mut self,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
+        ret_ty_fallback: Option<Type>,
         fn_val: Value,
         args: &[Value],
     ) -> Value {
@@ -3632,10 +3643,17 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 self.emit(Inst::Blr { rn: X9 });
             }
         }
-        // Collect the return value from x0 / v0 (scalar baseline).
-        match fn_abi {
-            Some(a) if !a.ret.is_indirect() && !a.ret.is_ignore() => {
-                let ty = self.cx.immediate_backend_type(a.ret.layout);
+        // Collect the return value from x0 / v0 (scalar baseline). With a concrete `fn_abi` we
+        // honor its return mode; without one — e.g. the synthesized C `main` wrapper's call to
+        // `lang_start`, which passes the function type but no `FnAbi` — we fall back to the
+        // callee's declared return type so the result (the process exit code!) isn't dropped.
+        let ret_ty = match fn_abi {
+            Some(a) if a.ret.is_indirect() || a.ret.is_ignore() => None,
+            Some(a) => Some(self.cx.immediate_backend_type(a.ret.layout)),
+            None => ret_ty_fallback.filter(|t| !matches!(self.cx.type_data(*t), TypeData::Void)),
+        };
+        match ret_ty {
+            Some(ty) => {
                 match self.cx.type_data(ty) {
                     TypeData::Pair(fa, fb) => {
                         // `PassMode::Pair`: field 0 comes back in x0/v0, field 1 in x1/v1; pack
