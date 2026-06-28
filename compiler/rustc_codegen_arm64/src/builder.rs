@@ -1064,7 +1064,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.spill_fp(V16, ty)
     }
     fn not(&mut self, v: Value) -> Value {
-        let all_ones = Value::Const { bits: u128::MAX, ty: v.ty() };
+        // Complement within the value's own bit width. This matters for `bool` (`i1`): `!true` must
+        // be `0`, but xoring with a full-width all-ones and truncating to the 1-byte slot would
+        // leave `0xfe`, which reads as truthy. Masking to the type width keeps `!bool` in `{0, 1}`.
+        let mask = match self.cx.type_data(v.ty()) {
+            TypeData::Int(bits) if bits < 128 => (1u128 << bits) - 1,
+            _ => u128::MAX,
+        };
+        let all_ones = Value::Const { bits: mask, ty: v.ty() };
         self.xor(v, all_ones)
     }
 
