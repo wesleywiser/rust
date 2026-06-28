@@ -7,7 +7,7 @@
 
 use std::ops::Deref;
 
-use rustc_abi::{Align, HasDataLayout, Scalar, Size, TargetDataLayout, WrappingRange};
+use rustc_abi::{Align, BackendRepr, HasDataLayout, Scalar, Size, TargetDataLayout, WrappingRange};
 use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_codegen_ssa::common::{
     AtomicRmwBinOp, IntPredicate, RealPredicate, SynchronizationScope,
@@ -17,7 +17,7 @@ use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
 use rustc_codegen_ssa::mir::place::{PlaceRef, PlaceValue};
 use rustc_codegen_ssa::traits::{
     AbiBuilderMethods, ArgAbiBuilderMethods, AsmBuilderMethods, BackendTypes, BuilderMethods,
-    CoverageInfoBuilderMethods, DebugInfoBuilderMethods, InlineAsmOperandRef,
+    ConstCodegenMethods, CoverageInfoBuilderMethods, DebugInfoBuilderMethods, InlineAsmOperandRef,
     IntrinsicCallBuilderMethods, LayoutTypeCodegenMethods, OverflowOp, StaticBuilderMethods,
 };
 use rustc_codegen_ssa::{MemFlags, RetagInfo};
@@ -435,7 +435,15 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
     /// Emit a `movz`/`movk` sequence loading the low 64 bits of `bits` into `reg`.
     fn load_imm(&mut self, reg: Gpr, bits: u128, size: OperandSize) {
-        let bits = bits as u64;
+        // For a 32-bit (`W`) destination only the low 32 bits are meaningful, and `movk` only
+        // permits shifts of 0 or 16 (the `hw` field is 1 bit); emitting a shift of 32/48 on a `W`
+        // register is an illegal encoding that faults as SIGILL at runtime. Mask the value to the
+        // destination width and restrict the move-wide chunks accordingly.
+        let (mask, shifts): (u64, &[u8]) = match size {
+            OperandSize::S32 => (0xffff_ffff, &[16]),
+            OperandSize::S64 => (u64::MAX, &[16, 32, 48]),
+        };
+        let bits = bits as u64 & mask;
         self.emit(Inst::MovWide {
             kind: MovKind::Zero,
             size,
@@ -443,7 +451,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             imm16: (bits & 0xffff) as u16,
             shift: 0,
         });
-        for shift in [16u8, 32, 48] {
+        for &shift in shifts {
             let chunk = ((bits >> shift) & 0xffff) as u16;
             if chunk != 0 {
                 self.emit(Inst::MovWide { kind: MovKind::Keep, size, rd: reg, imm16: chunk, shift });
@@ -1190,21 +1198,25 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         if place.layout.is_zst() {
             return OperandRef::zero_sized(place.layout);
         }
-        if self.cx.is_backend_immediate(place.layout) {
+        let val = if self.cx.is_backend_immediate(place.layout) {
             let ty = self.cx.immediate_backend_type(place.layout);
-            let val = self.load(ty, place.val.llval, place.val.align);
-            OperandRef {
-                val: OperandValue::Immediate(val),
-                layout: place.layout,
-                move_annotation: None,
-            }
+            OperandValue::Immediate(self.load(ty, place.val.llval, place.val.align))
+        } else if let BackendRepr::ScalarPair(a, b) = place.layout.backend_repr {
+            // A scalar pair (e.g. a wide pointer or an enum variant with a niche): load each
+            // component separately so the operand is a `Pair`. The generic codegen requires this
+            // representation for scalar-pair layouts (a `Ref` here triggers a "non-pair" ICE).
+            let b_offset = a.size(self.cx).align_to(b.align(self.cx).abi);
+            let ty_a = self.cx.scalar_pair_element_backend_type(place.layout, 0, true);
+            let ty_b = self.cx.scalar_pair_element_backend_type(place.layout, 1, true);
+            let off = self.const_usize(b_offset.bytes());
+            let ptr_b = self.inbounds_ptradd(place.val.llval, off);
+            let a_val = self.load(ty_a, place.val.llval, place.val.align);
+            let b_val = self.load(ty_b, ptr_b, place.val.align);
+            OperandValue::Pair(a_val, b_val)
         } else {
-            OperandRef {
-                val: OperandValue::Ref(place.val),
-                layout: place.layout,
-                move_annotation: None,
-            }
-        }
+            OperandValue::Ref(place.val)
+        };
+        OperandRef { val, layout: place.layout, move_annotation: None }
     }
 
     fn write_operand_repeatedly(
