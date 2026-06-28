@@ -270,6 +270,339 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let fb = cur.as_mut().expect("no function is currently being built");
         fb.frame.alloc_local(size, align)
     }
+
+    /// Copy `size` bytes from `[src]` into the frame slot at `dst_off`, using descending
+    /// power-of-two chunks through the `x10` scratch (`src` must not be `x10`/`x16`).
+    fn copy_ptr_to_slot(&mut self, dst_off: u64, src: Gpr, size: u64) {
+        let mut o = 0u64;
+        for chunk in [8u64, 4, 2, 1] {
+            let msize = mem_size_from_bytes(chunk);
+            while o + chunk <= size {
+                self.emit(Inst::LoadStoreUImm {
+                    load: true,
+                    signed: false,
+                    size: msize,
+                    rt: X10,
+                    rn: src,
+                    offset: o,
+                });
+                self.emit_mem_gpr(false, false, msize, X10, SP, dst_off + o);
+                o += chunk;
+            }
+        }
+    }
+
+    /// Copy `size` bytes from the frame slot at `src_off` into `[dst]` (mirror of
+    /// [`copy_ptr_to_slot`](Self::copy_ptr_to_slot)).
+    fn copy_slot_to_ptr(&mut self, src_off: u64, dst: Gpr, size: u64) {
+        let mut o = 0u64;
+        for chunk in [8u64, 4, 2, 1] {
+            let msize = mem_size_from_bytes(chunk);
+            while o + chunk <= size {
+                self.emit_mem_gpr(true, false, msize, X10, SP, src_off + o);
+                self.emit(Inst::LoadStoreUImm {
+                    load: false,
+                    signed: false,
+                    size: msize,
+                    rt: X10,
+                    rn: dst,
+                    offset: o,
+                });
+                o += chunk;
+            }
+        }
+    }
+
+    /// The lane element type, lane count, and element byte size of a vector backend type.
+    fn vector_info(&self, vec_ty: Type) -> (Type, u64, u64) {
+        match self.cx.type_data(vec_ty) {
+            TypeData::Vector(elem, count) => {
+                let (es, _) = self.cx.type_size_align(elem);
+                (elem, count, es)
+            }
+            other => panic!("rustc_codegen_arm64: expected a vector type, found {other:?}"),
+        }
+    }
+
+    /// The `sp`-relative offset of a vector operand's data. Runtime vectors already live in a frame
+    /// slot; a constant vector (a `Sym` pointing at read-only data, produced by `const_vector`) is
+    /// copied into a fresh slot first.
+    fn vector_to_slot(&mut self, val: Value) -> Option<u64> {
+        match val {
+            Value::Slot { off, .. } => Some(off),
+            Value::Sym { sym, offset, ty } => {
+                let (size, align) = self.cx.type_size_align(ty);
+                let off = self.alloc_slot(size, align);
+                let symref = SymRef { name: self.cx.sym_name(sym), addend: offset };
+                self.emit(Inst::Adrp { rd: X9, sym: symref.clone() });
+                self.emit(Inst::AddLo { rd: X9, rn: X9, sym: symref });
+                self.copy_ptr_to_slot(off, X9, size);
+                Some(off)
+            }
+            _ => None,
+        }
+    }
+
+    /// `simd_splat`: broadcast a scalar into every lane of a fresh vector slot. Integer lanes only;
+    /// the string/slice SIMD search code that reaches this only uses byte vectors.
+    fn emit_simd_splat(&mut self, scalar: Value, vec_ty: Type) -> Value {
+        let (elem, count, es) = self.vector_info(vec_ty);
+        assert!(
+            !type_is_float(self.cx, elem),
+            "rustc_codegen_arm64: floating-point SIMD lanes are not yet supported"
+        );
+        let (size, align) = self.cx.type_size_align(vec_ty);
+        let off = self.alloc_slot(size, align);
+        self.materialize(scalar, X10);
+        let msize = mem_size(self.cx, elem);
+        for i in 0..count {
+            self.emit_mem_gpr(false, false, msize, X10, SP, off + i * es);
+        }
+        Value::Slot { off, ty: vec_ty }
+    }
+
+    /// `simd_eq`/`simd_ne`/`simd_lt`/`simd_le`/`simd_gt`/`simd_ge`: lane-wise comparison producing a
+    /// mask whose lanes are all-ones where `cond` holds. Sub-word signed comparisons sign-extend the
+    /// lanes first (the loads zero-extend). Integer lanes only.
+    fn emit_simd_cmp(&mut self, cond: Cond, signed: bool, a: Value, b: Value, mask_ty: Type) -> Value {
+        let (elem, count, es) = self.vector_info(a.ty());
+        assert!(
+            !type_is_float(self.cx, elem),
+            "rustc_codegen_arm64: floating-point SIMD lanes are not yet supported"
+        );
+        let aoff = self.vector_to_slot(a);
+        let boff = self.vector_to_slot(b);
+        let (Some(aoff), Some(boff)) = (aoff, boff) else {
+            return Value::Undef { ty: mask_ty };
+        };
+        let (melem, _mcount, mes) = self.vector_info(mask_ty);
+        let (size, align) = self.cx.type_size_align(mask_ty);
+        let roff = self.alloc_slot(size, align);
+        let emsize = mem_size(self.cx, elem);
+        let mmsize = mem_size(self.cx, melem);
+        for i in 0..count {
+            self.emit_mem_gpr(true, false, emsize, X10, SP, aoff + i * es);
+            self.emit_mem_gpr(true, false, emsize, X11_HACK, SP, boff + i * es);
+            if signed {
+                self.sign_extend_reg(X10, es);
+                self.sign_extend_reg(X11_HACK, es);
+            }
+            self.emit(Inst::AddSubReg {
+                op: AddSub::Sub,
+                size: OperandSize::S64,
+                set_flags: true,
+                rd: ZR,
+                rn: X10,
+                rm: X11_HACK,
+                amount: 0,
+            });
+            // csetm: all-ones where `cond` holds (`csinv rd, zr, zr, !cond`).
+            self.emit(Inst::CondSel {
+                op: CondSel::Csinv,
+                size: OperandSize::S64,
+                rd: X10,
+                rn: ZR,
+                rm: ZR,
+                cond: cond.invert(),
+            });
+            self.emit_mem_gpr(false, false, mmsize, X10, SP, roff + i * mes);
+        }
+        Value::Slot { off: roff, ty: mask_ty }
+    }
+
+    /// Sign-extend the low `es*8` bits of `reg` to 64 bits (`es` is a lane's byte width).
+    fn sign_extend_reg(&mut self, reg: Gpr, es: u64) {
+        let from = match es {
+            1 => MemSize::B,
+            2 => MemSize::H,
+            4 => MemSize::W,
+            _ => return,
+        };
+        self.emit(Inst::Sxt { from, to: OperandSize::S64, rd: reg, rn: reg });
+    }
+
+    /// `simd_and`/`simd_or`/`simd_xor`: lane-wise bitwise operation. Integer lanes only.
+    fn emit_simd_binop(&mut self, op: LogicOp, a: Value, b: Value) -> Value {
+        let vec_ty = a.ty();
+        let (elem, count, es) = self.vector_info(vec_ty);
+        let aoff = self.vector_to_slot(a);
+        let boff = self.vector_to_slot(b);
+        let (Some(aoff), Some(boff)) = (aoff, boff) else {
+            return Value::Undef { ty: vec_ty };
+        };
+        let (size, align) = self.cx.type_size_align(vec_ty);
+        let roff = self.alloc_slot(size, align);
+        let msize = mem_size(self.cx, elem);
+        for i in 0..count {
+            self.emit_mem_gpr(true, false, msize, X10, SP, aoff + i * es);
+            self.emit_mem_gpr(true, false, msize, X11_HACK, SP, boff + i * es);
+            self.emit(Inst::Logical {
+                op,
+                size: OperandSize::S64,
+                rd: X10,
+                rn: X10,
+                rm: X11_HACK,
+                amount: 0,
+            });
+            self.emit_mem_gpr(false, false, msize, X10, SP, roff + i * es);
+        }
+        Value::Slot { off: roff, ty: vec_ty }
+    }
+
+    /// `simd_bitmask`: pack the most-significant bit of each lane into an integer, lane 0 in the
+    /// least-significant bit (little-endian). The lanes are guaranteed to be 0 or all-ones, so the
+    /// MSB test reduces to "lane is non-zero". Integer lanes only.
+    fn emit_simd_bitmask(&mut self, x: Value, result_ty: Type) -> Value {
+        let (elem, count, es) = self.vector_info(x.ty());
+        let Some(xoff) = self.vector_to_slot(x) else {
+            return Value::Undef { ty: result_ty };
+        };
+        let emsize = mem_size(self.cx, elem);
+        self.load_imm(X10, 0, OperandSize::S64);
+        for i in 0..count {
+            self.emit_mem_gpr(true, false, emsize, X11_HACK, SP, xoff + i * es);
+            // bit i = the lane's most-significant bit: sign-extend the lane, then test `< 0`.
+            self.sign_extend_reg(X11_HACK, es);
+            self.emit(Inst::AddSubImm {
+                op: AddSub::Sub,
+                size: OperandSize::S64,
+                set_flags: true,
+                rd: ZR,
+                rn: X11_HACK,
+                imm12: 0,
+                shift12: false,
+            });
+            self.emit(Inst::CondSel {
+                op: CondSel::Csinc,
+                size: OperandSize::S64,
+                rd: X11_HACK,
+                rn: ZR,
+                rm: ZR,
+                cond: Cond::Lt.invert(),
+            });
+            // Accumulate `(bit << i)` into the result.
+            self.emit(Inst::Logical {
+                op: LogicOp::Orr,
+                size: OperandSize::S64,
+                rd: X10,
+                rn: X10,
+                rm: X11_HACK,
+                amount: i as u8,
+            });
+        }
+        self.spill(X10, result_ty)
+    }
+
+    /// `simd_reduce_all`/`simd_reduce_any`: fold every lane's truth value with AND/OR into a single
+    /// boolean. Lanes are tested for non-zero (masks hold 0 or all-ones). Integer lanes only.
+    fn emit_simd_reduce_bool(&mut self, x: Value, all: bool, result_ty: Type) -> Value {
+        let (elem, count, es) = self.vector_info(x.ty());
+        let Some(xoff) = self.vector_to_slot(x) else {
+            return Value::Undef { ty: result_ty };
+        };
+        let emsize = mem_size(self.cx, elem);
+        // `all` folds with AND from an initial `true`; `any` folds with OR from `false`.
+        self.load_imm(X10, if all { 1 } else { 0 }, OperandSize::S64);
+        let fold = if all { LogicOp::And } else { LogicOp::Orr };
+        for i in 0..count {
+            self.emit_mem_gpr(true, false, emsize, X11_HACK, SP, xoff + i * es);
+            self.emit(Inst::AddSubImm {
+                op: AddSub::Sub,
+                size: OperandSize::S64,
+                set_flags: true,
+                rd: ZR,
+                rn: X11_HACK,
+                imm12: 0,
+                shift12: false,
+            });
+            self.emit(Inst::CondSel {
+                op: CondSel::Csinc,
+                size: OperandSize::S64,
+                rd: X11_HACK,
+                rn: ZR,
+                rm: ZR,
+                cond: Cond::Eq,
+            });
+            self.emit(Inst::Logical {
+                op: fold,
+                size: OperandSize::S64,
+                rd: X10,
+                rn: X10,
+                rm: X11_HACK,
+                amount: 0,
+            });
+        }
+        self.spill(X10, result_ty)
+    }
+
+    /// `simd_shuffle`: build a result vector by gathering lanes from the concatenation `x ++ y` at
+    /// the (runtime-read) indices in `idx`. Implemented for byte lanes: the inputs are laid out
+    /// contiguously in a scratch buffer and each result lane is a register-indexed byte load.
+    fn emit_simd_shuffle(&mut self, x: Value, y: Value, idx: Value, result_ty: Type) -> Value {
+        let (elem, n, es) = self.vector_info(x.ty());
+        assert!(
+            es == 1 && !type_is_float(self.cx, elem),
+            "rustc_codegen_arm64: only byte-lane SIMD shuffles are supported"
+        );
+        let (_, out_n, _) = self.vector_info(result_ty);
+        let (idx_elem, _, idx_es) = self.vector_info(idx.ty());
+        let xoff = self.vector_to_slot(x);
+        let yoff = self.vector_to_slot(y);
+        let ioff = self.vector_to_slot(idx);
+        let (Some(xoff), Some(yoff), Some(ioff)) = (xoff, yoff, ioff) else {
+            return Value::Undef { ty: result_ty };
+        };
+        // Concatenate the inputs into a `2*n`-byte buffer so an index in `0..2*n` is a byte offset.
+        let buf_off = self.alloc_slot(2 * n, 1);
+        for j in 0..n {
+            self.emit_mem_gpr(true, false, MemSize::B, X10, SP, xoff + j);
+            self.emit_mem_gpr(false, false, MemSize::B, X10, SP, buf_off + j);
+            self.emit_mem_gpr(true, false, MemSize::B, X10, SP, yoff + j);
+            self.emit_mem_gpr(false, false, MemSize::B, X10, SP, buf_off + n + j);
+        }
+        let (out_size, out_align) = self.cx.type_size_align(result_ty);
+        let res_off = self.alloc_slot(out_size, out_align);
+        let idxmsize = mem_size(self.cx, idx_elem);
+        for i in 0..out_n {
+            self.emit_mem_gpr(true, false, idxmsize, X12, SP, ioff + i * idx_es);
+            self.emit_frame_addr(X13, buf_off);
+            self.emit(Inst::AddSubReg {
+                op: AddSub::Add,
+                size: OperandSize::S64,
+                set_flags: false,
+                rd: X13,
+                rn: X13,
+                rm: X12,
+                amount: 0,
+            });
+            self.emit(Inst::LoadStoreUImm {
+                load: true,
+                signed: false,
+                size: MemSize::B,
+                rt: X10,
+                rn: X13,
+                offset: 0,
+            });
+            self.emit_mem_gpr(false, false, MemSize::B, X10, SP, res_off + i);
+        }
+        Value::Slot { off: res_off, ty: result_ty }
+    }
+
+    /// `simd_extract`: read a single lane (at the constant index `idx`) out of a vector.
+    fn emit_simd_extract(&mut self, x: Value, idx: u64, result_ty: Type) -> Value {
+        let (elem, _count, es) = self.vector_info(x.ty());
+        let Some(xoff) = self.vector_to_slot(x) else {
+            return Value::Undef { ty: result_ty };
+        };
+        let lane_off = xoff + idx * es;
+        if type_is_float(self.cx, elem) {
+            self.emit_mem_fp(true, fp_size(self.cx, elem), V16, SP, lane_off);
+            self.spill_fp(V16, result_ty)
+        } else {
+            self.emit_mem_gpr(true, false, mem_size(self.cx, elem), X10, SP, lane_off);
+            self.spill(X10, result_ty)
+        }
+    }
 }
 
 impl<'a, 'tcx> Deref for Builder<'a, 'tcx> {
@@ -563,6 +896,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Load a value into `reg`, emitting whatever is needed (immediate move, frame load, or address
     /// formation).
     fn materialize(&mut self, val: Value, reg: Gpr) {
+        debug_assert!(
+            !matches!(self.cx.type_data(val.ty()), TypeData::Vector(..)),
+            "a vector value cannot be materialized into a scalar register; it must be processed \
+             lane by lane from its frame slot"
+        );
         match val {
             Value::Const { bits, ty } => self.load_imm(reg, bits, op_size(self.cx, ty)),
             Value::Undef { ty } => self.load_imm(reg, 0, op_size(self.cx, ty)),
@@ -1284,6 +1622,92 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let r = self.fp_powi(args[0].immediate(), args[1].immediate());
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
+            // Integer-lane SIMD intrinsics, lowered scalarly (lane by lane in memory). These are
+            // reached by the portable-SIMD substring/slice search in `core` (`u8x16`/`mask8x16`).
+            sym::simd_splat => {
+                let vec_ty = self.cx.immediate_backend_type(result_layout);
+                let r = self.emit_simd_splat(args[0].immediate(), vec_ty);
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_eq
+            | sym::simd_ne
+            | sym::simd_lt
+            | sym::simd_le
+            | sym::simd_gt
+            | sym::simd_ge => {
+                // The comparison's signedness comes from the lane element type (the backend `Int`
+                // type does not record it).
+                let signed = args[0]
+                    .layout
+                    .ty
+                    .simd_size_and_type(self.cx.tcx)
+                    .1
+                    .is_signed();
+                let pred = match name {
+                    sym::simd_eq => IntPredicate::IntEQ,
+                    sym::simd_ne => IntPredicate::IntNE,
+                    sym::simd_lt if signed => IntPredicate::IntSLT,
+                    sym::simd_lt => IntPredicate::IntULT,
+                    sym::simd_le if signed => IntPredicate::IntSLE,
+                    sym::simd_le => IntPredicate::IntULE,
+                    sym::simd_gt if signed => IntPredicate::IntSGT,
+                    sym::simd_gt => IntPredicate::IntUGT,
+                    sym::simd_ge if signed => IntPredicate::IntSGE,
+                    _ => IntPredicate::IntUGE,
+                };
+                let cond = int_pred_to_cond(pred);
+                let mask_ty = self.cx.immediate_backend_type(result_layout);
+                let r = self.emit_simd_cmp(
+                    cond,
+                    signed,
+                    args[0].immediate(),
+                    args[1].immediate(),
+                    mask_ty,
+                );
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_and => {
+                let r = self.emit_simd_binop(LogicOp::And, args[0].immediate(), args[1].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_or => {
+                let r = self.emit_simd_binop(LogicOp::Orr, args[0].immediate(), args[1].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_xor => {
+                let r = self.emit_simd_binop(LogicOp::Eor, args[0].immediate(), args[1].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_bitmask => {
+                let result_ty = self.cx.immediate_backend_type(result_layout);
+                let r = self.emit_simd_bitmask(args[0].immediate(), result_ty);
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_reduce_all | sym::simd_reduce_any => {
+                let result_ty = self.cx.immediate_backend_type(result_layout);
+                let all = name == sym::simd_reduce_all;
+                let r = self.emit_simd_reduce_bool(args[0].immediate(), all, result_ty);
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_shuffle => {
+                let result_ty = self.cx.immediate_backend_type(result_layout);
+                let r = self.emit_simd_shuffle(
+                    args[0].immediate(),
+                    args[1].immediate(),
+                    args[2].immediate(),
+                    result_ty,
+                );
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_extract => {
+                let idx = match args[1].immediate() {
+                    Value::Const { bits, .. } => bits as u64,
+                    _ => 0,
+                };
+                let result_ty = self.cx.immediate_backend_type(result_layout);
+                let r = self.emit_simd_extract(args[0].immediate(), idx, result_ty);
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
             // Everything else falls back to the intrinsic's MIR body (if it has one).
             _ => IntrinsicResult::Fallback(instance),
         }
@@ -1781,8 +2205,17 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn load(&mut self, ty: Type, ptr: Value, _align: Align) -> Value {
-        if let TypeData::Pair(..) = self.cx.type_data(ty) {
-            return self.load_pair(ty, ptr);
+        match self.cx.type_data(ty) {
+            TypeData::Pair(..) => return self.load_pair(ty, ptr),
+            TypeData::Vector(..) => {
+                // A vector lives in a frame slot; load it by copying its bytes out of `[ptr]`.
+                let (size, align) = self.cx.type_size_align(ty);
+                let off = self.alloc_slot(size, align);
+                self.materialize(ptr, X9);
+                self.copy_ptr_to_slot(off, X9, size);
+                return Value::Slot { off, ty };
+            }
+            _ => {}
         }
         self.materialize(ptr, X9);
         self.emit(Inst::LoadStoreUImm {
@@ -1864,6 +2297,15 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     ) -> Value {
         if let TypeData::Pair(..) = self.cx.type_data(val.ty()) {
             self.store_pair(val, ptr);
+            return Value::Undef { ty: self.ptr_ty() };
+        }
+        if let TypeData::Vector(..) = self.cx.type_data(val.ty()) {
+            // Store a vector by copying its slot bytes into `[ptr]`.
+            if let Some(off) = self.vector_to_slot(val) {
+                let (size, _) = self.cx.type_size_align(val.ty());
+                self.materialize(ptr, X9);
+                self.copy_slot_to_ptr(off, X9, size);
+            }
             return Value::Undef { ty: self.ptr_ty() };
         }
         self.materialize(ptr, X9);

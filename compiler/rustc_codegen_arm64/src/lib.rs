@@ -16,11 +16,14 @@
 //!   `compiler_builtins` libcalls (`__multi3`, `__udivti3`, `__umodti3`, `__ashlti3`, ...).
 //!   Compile-time-constant 128-bit values still work because const-eval folds them before codegen.
 //!
-//! - **SIMD / vector types.** The vector (`simd_*`) intrinsics and NEON value model are not
-//!   implemented, so code that monomorphizes to explicit SIMD is rejected (`simd_extract` and
-//!   friends ICE as not-overridden). This blocks `std::collections::HashMap`, whose `hashbrown`
-//!   group scan uses NEON. Implementing it needs a vector value/register model plus the NEON
-//!   load/store, compare, and lane-extract instructions.
+//! - **SIMD / vector types.** Integer-lane SIMD is supported by a *scalar* lowering: vector values
+//!   live in frame slots and the `simd_*` intrinsics (`splat`, the comparisons, bitwise ops,
+//!   `bitmask`, `reduce_all`/`any`, `shuffle`, `extract`) are emitted as per-lane loops over those
+//!   slots. This is correct (it matches the IEEE/portable-SIMD semantics) but not fast, in keeping
+//!   with the rest of the baseline. It is enough for the portable-SIMD substring/slice search that
+//!   `str::contains`/`find` reach. Floating-point lanes and a true NEON register model are still
+//!   unimplemented (float-lane intrinsics panic loudly). `std::collections::HashMap` now gets past
+//!   its `hashbrown` SIMD group scan but is blocked further on thread-local lazy initialization.
 
 // tidy-alphabetical-start
 #![feature(rustc_private)]

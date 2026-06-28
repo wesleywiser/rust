@@ -105,8 +105,32 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
         // lowering; the scalar `Value` model can't represent them directly.
         todo!("rustc_codegen_arm64: const_struct")
     }
-    fn const_vector(&self, _elts: &[Value]) -> Value {
-        todo!("rustc_codegen_arm64: const_vector")
+    fn const_vector(&self, elts: &[Value]) -> Value {
+        // Serialize the lane constants into read-only data and return a pointer to it (typed as the
+        // vector). The builder copies this into a frame slot on first use (`vector_to_slot`).
+        let mut bytes = Vec::new();
+        let mut elem = self.intern_type(TypeData::Int(8));
+        for &elt in elts {
+            if let Value::Const { bits, ty } = elt {
+                elem = ty;
+                let (es, _) = self.type_size_align(ty);
+                bytes.extend_from_slice(&bits.to_le_bytes()[..es as usize]);
+            }
+        }
+        let vec_ty = self.intern_type(TypeData::Vector(elem, elts.len() as u64));
+        let (_, align) = self.type_size_align(vec_ty);
+        let name = self.mangle(&self.generate_local_symbol_name("vec"));
+        let sym = self.intern_sym(&name);
+        self.module.borrow_mut().push_data(DataItem {
+            name: name.into(),
+            is_global: false,
+            section: DataSection::ReadOnly,
+            align: align.max(1) as u32,
+            bytes,
+            bss_size: 0,
+            relocs: Vec::new(),
+        });
+        Value::Sym { sym, offset: 0, ty: vec_ty }
     }
 
     fn const_to_opt_uint(&self, v: Value) -> Option<u64> {
