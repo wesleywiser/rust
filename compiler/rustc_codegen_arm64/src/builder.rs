@@ -1343,8 +1343,57 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         if let OverflowOp::Mul = oop {
             return self.checked_mul(signed, val_ty, lhs, rhs);
         }
+        let n = match self.cx.type_data(val_ty) {
+            TypeData::Int(b) => b,
+            _ => 64,
+        };
         let size = op_size(self.cx, lhs.ty());
+        let op_bits = match size {
+            OperandSize::S32 => 32,
+            OperandSize::S64 => 64,
+        };
         let bool_ty = self.cx.intern_type(TypeData::Int(1));
+        // Sub-word add/sub: the NZCV flags reflect 32/64-bit overflow, not the narrow type's, so
+        // `100i8 + 100i8` shows no flag overflow. Widen the operands (the op-width sum/difference
+        // then cannot itself overflow), compute, and range-check against the type's bounds.
+        if n < op_bits {
+            let op_ty = self.cx.intern_type(TypeData::Int(op_bits));
+            if signed {
+                self.materialize_signed(lhs, X9);
+                self.materialize_signed(rhs, X10);
+            } else {
+                self.materialize(lhs, X9);
+                self.materialize(rhs, X10);
+            }
+            let addsub = match oop {
+                OverflowOp::Add => AddSub::Add,
+                OverflowOp::Sub => AddSub::Sub,
+                OverflowOp::Mul => unreachable!(),
+            };
+            self.emit(Inst::AddSubReg {
+                op: addsub,
+                size,
+                set_flags: false,
+                rd: X9,
+                rn: X9,
+                rm: X10,
+                amount: 0,
+            });
+            let wide = self.spill(X9, op_ty);
+            let overflow = if signed {
+                let max = self.cx.const_uint(op_ty, ((1i128 << (n - 1)) - 1) as u64);
+                let min = self.cx.const_uint(op_ty, (-(1i128 << (n - 1))) as i64 as u64);
+                let hi = self.icmp(IntPredicate::IntSGT, wide, max);
+                let lo = self.icmp(IntPredicate::IntSLT, wide, min);
+                self.or(hi, lo)
+            } else {
+                // Unsigned: a borrow on subtract wraps the op-width result above the max too.
+                let max = self.cx.const_uint(op_ty, ((1u128 << n) - 1) as u64);
+                self.icmp(IntPredicate::IntUGT, wide, max)
+            };
+            let result = self.trunc(wide, val_ty);
+            return (result, overflow);
+        }
         self.materialize(lhs, X9);
         self.materialize(rhs, X10);
         let overflow_cond = match oop {
