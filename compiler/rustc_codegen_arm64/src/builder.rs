@@ -1952,7 +1952,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         instance: Instance<'tcx>,
         args: &[OperandRef<'tcx, Value>],
         result_layout: TyAndLayout<'tcx>,
-        _result_place: Option<PlaceValue<Value>>,
+        result_place: Option<PlaceValue<Value>>,
         _span: Span,
     ) -> IntrinsicResult<'tcx, Value> {
         let name = self.cx.tcx.item_name(instance.def_id());
@@ -2017,11 +2017,38 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let eq = self.icmp(IntPredicate::IntEQ, cmp, zero);
                 IntrinsicResult::Operand(OperandValue::Immediate(eq))
             }
-            // A volatile load of a (scalar) value through a pointer.
+            // A volatile load through a pointer. A scalar (or scalar-pair) result is produced as
+            // an operand directly; a non-scalar (aggregate) result must be copied into the caller's
+            // result place — `OperandValue::Immediate` cannot represent an aggregate, and doing so
+            // silently truncated the value to one register, corrupting the surrounding bytes (this
+            // is how a `ptr::read_volatile::<MaybeUninit<T>>` of a large `T`, as used by
+            // crossbeam-deque's work-stealing buffer, was miscompiled).
             sym::volatile_load | sym::unaligned_volatile_load => {
-                let ty = self.cx.immediate_backend_type(result_layout);
-                let load = self.volatile_load(ty, args[0].immediate());
-                IntrinsicResult::Operand(OperandValue::Immediate(load))
+                let ptr = args[0].immediate();
+                if self.cx.is_backend_immediate(result_layout) {
+                    let ty = self.cx.immediate_backend_type(result_layout);
+                    let load = self.volatile_load(ty, ptr);
+                    IntrinsicResult::Operand(OperandValue::Immediate(load))
+                } else if let BackendRepr::ScalarPair(a, b) = result_layout.backend_repr {
+                    // A scalar pair (e.g. a wide pointer): load each half as its own scalar so the
+                    // operand is a `Pair`, mirroring `load_operand`.
+                    let b_offset = a.size(self.cx).align_to(b.align(self.cx).abi);
+                    let ty_a = self.cx.scalar_pair_element_backend_type(result_layout, 0, true);
+                    let ty_b = self.cx.scalar_pair_element_backend_type(result_layout, 1, true);
+                    let off = self.const_usize(b_offset.bytes());
+                    let ptr_b = self.inbounds_ptradd(ptr, off);
+                    let a_val = self.volatile_load(ty_a, ptr);
+                    let b_val = self.volatile_load(ty_b, ptr_b);
+                    IntrinsicResult::Operand(OperandValue::Pair(a_val, b_val))
+                } else {
+                    // Aggregate: copy the bytes into the result place. A non-scalar volatile load is
+                    // only emitted for a place destination, so `result_place` is always `Some` here.
+                    let dest = result_place
+                        .expect("volatile_load of a non-scalar type requires a result place");
+                    let size = self.const_usize(result_layout.size.bytes());
+                    self.memcpy(dest.llval, dest.align, ptr, Align::ONE, size, MemFlags::empty(), None);
+                    IntrinsicResult::WroteIntoPlace
+                }
             }
             // `catch_unwind(try, data, catch)`: this backend aborts on panic (it emits no unwind
             // tables), so the catch path is never reached. Run the try function and report that no
