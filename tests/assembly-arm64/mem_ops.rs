@@ -2,27 +2,40 @@
 //@ only-aarch64
 //@ only-macos
 //@ compile-flags: -Zcodegen-backend=arm64 -Coverflow-checks=off
-//! Bulk memory operations lower to libc calls (`memcpy`/`memmove`/`memset`) with arguments in
-//! `x0`/`x1`/`x2`.
+//! Bulk memory operations lower to libc calls with arguments marshalled into `x0` (dst/ptr), `x1`
+//! (src, or the fill byte for `memset`), and `x2` (size). Calling the intrinsics directly keeps the
+//! call inline so the argument marshalling and the exact callee symbol are pinned in this function
+//! (the safe `core::ptr` wrappers would instead emit a call into a separate, non-inlined helper).
+#![feature(core_intrinsics)]
 #![crate_type = "lib"]
 
-// CHECK-LABEL: _do_copy:
-// CHECK: bl _memcpy
+// CHECK-LABEL: _mcopy:
+// CHECK: ldr x0, [sp, #0]
+// CHECK-NEXT: ldr x1, [sp, #8]
+// CHECK-NEXT: ldr x2, [sp, #24]
+// CHECK-NEXT: bl _memcpy
 #[no_mangle]
-pub unsafe extern "C" fn do_copy(dst: *mut u8, src: *const u8) {
-    core::ptr::copy_nonoverlapping(src, dst, 64);
+pub unsafe extern "C" fn mcopy(dst: *mut u8, src: *const u8, n: usize) {
+    core::intrinsics::copy_nonoverlapping(src, dst, n);
 }
 
-// CHECK-LABEL: _do_move:
-// CHECK: bl _memmove
+// CHECK-LABEL: _mmove:
+// CHECK: ldr x0, [sp, #0]
+// CHECK-NEXT: ldr x1, [sp, #8]
+// CHECK-NEXT: ldr x2, [sp, #24]
+// CHECK-NEXT: bl _memmove
 #[no_mangle]
-pub unsafe extern "C" fn do_move(dst: *mut u8, src: *const u8) {
-    core::ptr::copy(src, dst, 64);
+pub unsafe extern "C" fn mmove(dst: *mut u8, src: *const u8, n: usize) {
+    core::intrinsics::copy(src, dst, n);
 }
 
-// CHECK-LABEL: _do_fill:
-// CHECK: bl _memset
+// `memset` takes the fill byte in `w1` (loaded with a byte load), not a full register.
+// CHECK-LABEL: _mset:
+// CHECK: ldr x0, [sp, #0]
+// CHECK-NEXT: ldrb w1, [sp, #8]
+// CHECK-NEXT: ldr x2, [sp, #24]
+// CHECK-NEXT: bl _memset
 #[no_mangle]
-pub unsafe extern "C" fn do_fill(dst: *mut u8, val: u8) {
-    core::ptr::write_bytes(dst, val, 64);
+pub unsafe extern "C" fn mset(dst: *mut u8, val: u8, n: usize) {
+    core::intrinsics::write_bytes(dst, val, n);
 }
