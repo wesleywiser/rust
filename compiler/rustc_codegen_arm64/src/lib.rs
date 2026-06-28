@@ -10,11 +10,11 @@
 //! These are deliberately unimplemented; the backend fails loudly (via `todo!`) rather than
 //! miscompiling when it hits them, so they show up as clear ICEs instead of wrong runtime results.
 //!
-//! - **128-bit integers (`i128`/`u128`).** Values wider than a register are not modelled; runtime
-//!   128-bit arithmetic is rejected in `builder::op_size`. Implementing this needs either a
-//!   register-pair value model (lo/hi `Gpr`s with carry-aware add/sub/shift/cmp) or lowering to the
-//!   `compiler_builtins` libcalls (`__multi3`, `__udivti3`, `__umodti3`, `__ashlti3`, ...).
-//!   Compile-time-constant 128-bit values still work because const-eval folds them before codegen.
+//! - **128-bit overflow-checked multiply.** `i128`/`u128` are otherwise fully supported (see below),
+//!   but the overflow-detecting *multiply* (`checked_mul`/`overflowing_mul`, and `*` in a
+//!   debug/overflow-checked build) is not: it needs a long inline partial-product sequence (the
+//!   signed case especially), so `builder::checked_binop` raises a `todo!` for it. `wrapping_mul`
+//!   and `*` with overflow checks off use the plain 128-bit multiply and work.
 //!
 //! - **SIMD / vector types.** Integer-lane SIMD is supported by a *scalar* lowering: vector values
 //!   live in frame slots and the `simd_*` intrinsics (`splat`, the comparisons, bitwise ops,
@@ -26,6 +26,15 @@
 //!   still unimplemented (float-lane intrinsics panic loudly).
 //!
 //! Implemented since the first cut, for reference:
+//!
+//! - **128-bit integers (`i128`/`u128`).** Modelled as a low/high pair of 64-bit words in a 16-byte
+//!   frame slot, passed in two consecutive integer registers (the Apple AArch64 ABI does not
+//!   even-align them) and returned in `x0:x1`. Add/sub use a carry chain (`adds`/`adc`,
+//!   `subs`/`sbc`); multiply is the inline schoolbook 64-bit partial-product expansion; the six
+//!   comparisons do a full 128-bit subtract and read the flags; and division, remainder, shifts, and
+//!   the float conversions go to the `compiler_builtins` libcalls (`__udivti3`, `__modti3`,
+//!   `__ashlti3`, `__floattidf`, `__fixunsdfti`, ...). `ctlz`/`cttz`/`ctpop`/`bswap`/`bitreverse`
+//!   operate per word. The one gap is overflow-checked multiply (above).
 //!
 //! - **Thread-local storage** uses the macOS thread-local-variable (TLV) model: a thread-local
 //!   static is emitted as a `$tlv$init` initializer in `__thread_data` plus a three-word descriptor

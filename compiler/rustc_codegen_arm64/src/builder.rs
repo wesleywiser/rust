@@ -673,9 +673,10 @@ impl<'tcx> FnAbiOfHelpers<'tcx> for Builder<'_, 'tcx> {
 /// Integer operand size for a backend type.
 fn op_size(cx: &CodegenCx<'_>, ty: Type) -> OperandSize {
     match cx.type_data(ty) {
-        // 128-bit integers would need a register pair (or libcalls); silently truncating them to a
-        // single 64-bit register would miscompile, so fail loudly until they are implemented.
-        // See the "Future work" section in `lib.rs` for the intended implementation strategy.
+        // 128-bit integers are handled as a low/high word pair by dedicated paths in the builder,
+        // which never call this. Reaching here with one means an i128 operation was not routed to
+        // its 128-bit path (e.g. overflow-checked multiply, still unimplemented); fail loudly rather
+        // than silently truncating to a single 64-bit register.
         TypeData::Int(bits) if bits > 64 => {
             todo!("{bits}-bit integer operations are not yet supported by the arm64 backend")
         }
@@ -1115,6 +1116,34 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.spill(X9, bool_ty)
     }
 
+    /// 128-bit overflow-checked add/subtract: returns `(result, overflowed)`. The carry chain sets
+    /// the flags on the high word; unsigned overflow is the carry-out (`hs`) for add / borrow
+    /// (`lo`) for subtract, and signed overflow is the `V` flag (`vs`).
+    fn checked128_addsub(&mut self, oop: OverflowOp, signed: bool, lhs: Value, rhs: Value) -> (Value, Value) {
+        let ty = lhs.ty();
+        let bool_ty = self.cx.intern_type(TypeData::Int(1));
+        let op = match oop {
+            OverflowOp::Add => AddSub::Add,
+            OverflowOp::Sub => AddSub::Sub,
+            OverflowOp::Mul => unreachable!("128-bit checked mul is handled separately"),
+        };
+        self.materialize128(lhs, X9, X10);
+        self.materialize128(rhs, X11, X12);
+        self.emit(Inst::AddSubReg { op, size: OperandSize::S64, set_flags: true, rd: X9, rn: X9, rm: X11, amount: 0 });
+        self.emit(Inst::AddSubCarry { op, size: OperandSize::S64, set_flags: true, rd: X10, rn: X10, rm: X12 });
+        let cond = match (op, signed) {
+            (AddSub::Add, false) => Cond::Hs,
+            (AddSub::Sub, false) => Cond::Lo,
+            (_, true) => Cond::Vs,
+        };
+        // Read the overflow flag before spilling the result words (stores do not affect NZCV, but
+        // reading it first keeps the dependency obvious).
+        self.emit(Inst::CondSel { op: CondSel::Csinc, size: OperandSize::S32, rd: X13, rn: ZR, rm: ZR, cond: cond.invert() });
+        let result = self.spill128(X9, X10, ty);
+        let overflow = self.spill(X13, bool_ty);
+        (result, overflow)
+    }
+
     /// A 128-bit binary op implemented by a compiler-builtins libcall taking two `i128` arguments in
     /// the `x0:x1` and `x2:x3` register pairs and returning an `i128` in `x0:x1` (division and
     /// remainder: `__udivti3`/`__divti3`/`__umodti3`/`__modti3`).
@@ -1263,6 +1292,63 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             self.emit(Inst::DataProc2 { op: DataProc2::Lsrv, size, rd: X9, rn: X9, rm: X10 });
         }
         self.spill(X9, v.ty())
+    }
+
+    /// Split a 128-bit value into its low and high 64-bit words as separate `i64` values.
+    fn int128_split(&mut self, v: Value) -> (Value, Value) {
+        let i64t = self.cx.intern_type(TypeData::Int(64));
+        self.materialize128(v, X9, X10);
+        let lo = self.spill(X9, i64t);
+        let hi = self.spill(X10, i64t);
+        (lo, hi)
+    }
+
+    /// `ctpop` of a 128-bit value: the population counts of the two words summed (returned as a
+    /// 64-bit count for the caller to narrow).
+    fn emit_ctpop128(&mut self, v: Value) -> Value {
+        let (lo, hi) = self.int128_split(v);
+        let clo = self.emit_ctpop(lo);
+        let chi = self.emit_ctpop(hi);
+        self.add(clo, chi)
+    }
+
+    /// `ctlz` of a 128-bit value: `clz(hi)` unless the high word is zero, in which case
+    /// `64 + clz(lo)` (and `ctlz(0) == 128` falls out).
+    fn emit_ctlz128(&mut self, v: Value) -> Value {
+        let i64t = self.cx.intern_type(TypeData::Int(64));
+        let (lo, hi) = self.int128_split(v);
+        let clz_lo = self.emit_ctlz(lo);
+        let clz_hi = self.emit_ctlz(hi);
+        let sixtyfour = self.cx.const_uint(i64t, 64);
+        let lo_plus = self.add(clz_lo, sixtyfour);
+        let zero = self.cx.const_uint(i64t, 0);
+        let hi_is_zero = self.icmp(IntPredicate::IntEQ, hi, zero);
+        self.select(hi_is_zero, lo_plus, clz_hi)
+    }
+
+    /// `cttz` of a 128-bit value: `cttz(lo)` unless the low word is zero, in which case
+    /// `64 + cttz(hi)` (and `cttz(0) == 128` falls out).
+    fn emit_cttz128(&mut self, v: Value) -> Value {
+        let i64t = self.cx.intern_type(TypeData::Int(64));
+        let (lo, hi) = self.int128_split(v);
+        let ctz_lo = self.emit_cttz(lo);
+        let ctz_hi = self.emit_cttz(hi);
+        let sixtyfour = self.cx.const_uint(i64t, 64);
+        let hi_plus = self.add(ctz_hi, sixtyfour);
+        let zero = self.cx.const_uint(i64t, 0);
+        let lo_is_zero = self.icmp(IntPredicate::IntEQ, lo, zero);
+        self.select(lo_is_zero, hi_plus, ctz_lo)
+    }
+
+    /// `bswap`/`bitreverse` of a 128-bit value: reverse each 64-bit word and swap the two words
+    /// (reversing the full 16 bytes / 128 bits).
+    fn emit_reverse128(&mut self, v: Value, op: DataProc1) -> Value {
+        let ty = v.ty();
+        self.materialize128(v, X9, X10); // lo = X9, hi = X10
+        self.emit(Inst::DataProc1 { op, size: OperandSize::S64, rd: X9, rn: X9 });
+        self.emit(Inst::DataProc1 { op, size: OperandSize::S64, rd: X10, rn: X10 });
+        // Reversed low word becomes the high word and vice versa.
+        self.spill128(X10, X9, ty)
     }
 
     /// Clamp the result of a float-to-int conversion (in `raw_reg`, saturated by the hardware only
@@ -1689,35 +1775,38 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             sym::black_box => IntrinsicResult::Operand(args[0].val),
             // Population count: a SWAR sequence, narrowed to the `u32` result type.
             sym::ctpop => {
-                let count = self.emit_ctpop(args[0].immediate());
+                let v = args[0].immediate();
+                let count = if self.is_int128(v.ty()) { self.emit_ctpop128(v) } else { self.emit_ctpop(v) };
                 let result_ty = self.cx.immediate_backend_type(result_layout);
                 let count = self.intcast(count, result_ty, false);
                 IntrinsicResult::Operand(OperandValue::Immediate(count))
             }
             // Count leading zeros (`ctlz_nonzero` shares the lowering; `clz` handles zero anyway).
             sym::ctlz | sym::ctlz_nonzero => {
-                let count = self.emit_ctlz(args[0].immediate());
+                let v = args[0].immediate();
+                let count = if self.is_int128(v.ty()) { self.emit_ctlz128(v) } else { self.emit_ctlz(v) };
                 let result_ty = self.cx.immediate_backend_type(result_layout);
                 let count = self.intcast(count, result_ty, false);
                 IntrinsicResult::Operand(OperandValue::Immediate(count))
             }
             // Count trailing zeros, as `clz(rbit(x))` (the `_nonzero` form shares the lowering).
             sym::cttz | sym::cttz_nonzero => {
-                let count = self.emit_cttz(args[0].immediate());
+                let v = args[0].immediate();
+                let count = if self.is_int128(v.ty()) { self.emit_cttz128(v) } else { self.emit_cttz(v) };
                 let result_ty = self.cx.immediate_backend_type(result_layout);
                 let count = self.intcast(count, result_ty, false);
                 IntrinsicResult::Operand(OperandValue::Immediate(count))
             }
             // Byte reverse (`swap_bytes`) and bit reverse (`reverse_bits`).
             sym::bswap => {
-                IntrinsicResult::Operand(OperandValue::Immediate(
-                    self.emit_reverse(args[0].immediate(), DataProc1::Rev),
-                ))
+                let v = args[0].immediate();
+                let r = if self.is_int128(v.ty()) { self.emit_reverse128(v, DataProc1::Rev) } else { self.emit_reverse(v, DataProc1::Rev) };
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
             sym::bitreverse => {
-                IntrinsicResult::Operand(OperandValue::Immediate(
-                    self.emit_reverse(args[0].immediate(), DataProc1::Rbit),
-                ))
+                let v = args[0].immediate();
+                let r = if self.is_int128(v.ty()) { self.emit_reverse128(v, DataProc1::Rbit) } else { self.emit_reverse(v, DataProc1::Rbit) };
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
             // `compare_bytes` has `memcmp` semantics: the sign of the first differing byte, as i32.
             sym::compare_bytes => {
@@ -2357,6 +2446,15 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     ) -> (Value, Value) {
         let signed = ty.is_signed();
         let val_ty = lhs.ty();
+        if self.is_int128(val_ty) {
+            if let OverflowOp::Mul = oop {
+                // 128-bit overflow-checked multiply needs a long inline partial-product sequence
+                // (signed especially); not yet implemented, so fail loudly. `wrapping_mul`/`*` with
+                // overflow checks off use the plain 128-bit multiply and work.
+                todo!("rustc_codegen_arm64: 128-bit overflow-checked multiplication");
+            }
+            return self.checked128_addsub(oop, signed, lhs, rhs);
+        }
         if let OverflowOp::Mul = oop {
             return self.checked_mul(signed, val_ty, lhs, rhs);
         }
