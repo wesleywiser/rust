@@ -280,6 +280,8 @@ pub enum Inst {
     AtomicCas { acquire: bool, release: bool, size: MemSize, rs: Gpr, rt: Gpr, rn: Gpr },
     /// `dmb` — data memory barrier.
     Dmb { option: DmbOption },
+    /// `isb sy` — instruction synchronization barrier (used by `spin_loop` hints).
+    Isb,
 }
 
 /// LSE atomic read-modify-write opcode.
@@ -740,6 +742,7 @@ impl Inst {
                 };
                 0xD503_30BF | (crm << 8)
             }
+            Inst::Isb => 0xD503_3FDF,
         }
     }
 }
@@ -1391,5 +1394,7 @@ mod tests {
         assert_eq!(Inst::Dmb { option: DmbOption::Ish }.encode(), 0xD5033BBF);
         assert_eq!(Inst::Dmb { option: DmbOption::IshLd }.encode(), 0xD50339BF);
         assert_eq!(Inst::Dmb { option: DmbOption::IshSt }.encode(), 0xD5033ABF);
+        // isb sy
+        assert_eq!(Inst::Isb.encode(), 0xD5033FDF);
     }
 }

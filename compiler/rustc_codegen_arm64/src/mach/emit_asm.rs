@@ -504,6 +504,7 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
             };
             line(out, &format!("dmb {opt}"));
         }
+        Inst::Isb => line(out, "isb"),
     }
 }
 

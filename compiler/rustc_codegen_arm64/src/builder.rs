@@ -25,7 +25,7 @@ use rustc_hir::def::DefKind;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::mir::coverage::CoverageKind;
 use rustc_middle::ty::layout::{
-    FnAbiOf, FnAbiOfHelpers, HasTyCtxt, HasTypingEnv, LayoutOfHelpers, TyAndLayout,
+    FnAbiOf, FnAbiOfHelpers, HasTyCtxt, HasTypingEnv, LayoutOf, LayoutOfHelpers, TyAndLayout,
 };
 use rustc_middle::ty::{self, AtomicOrdering, Instance, Ty, TyCtxt};
 use rustc_span::{Span, sym};
@@ -449,8 +449,131 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         Value::Slot { off: roff, ty: vec_ty }
     }
 
-    /// `simd_bitmask`: pack the most-significant bit of each lane into an integer, lane 0 in the
-    /// least-significant bit (little-endian). The lanes are guaranteed to be 0 or all-ones, so the
+    /// `simd_shl`/`simd_shr`: lane-wise variable shift (each lane of `a` shifted by the
+    /// corresponding lane of `b`). For a right shift, `arith` selects arithmetic (sign-propagating)
+    /// vs logical; the lane is sign-extended first for the arithmetic case so the sign fills from
+    /// the lane's own top bit rather than the zero-extended register's. Integer lanes only.
+    fn emit_simd_shift(&mut self, a: Value, b: Value, left: bool, arith: bool) -> Value {
+        let vec_ty = a.ty();
+        let (elem, count, es) = self.vector_info(vec_ty);
+        let aoff = self.vector_to_slot(a);
+        let boff = self.vector_to_slot(b);
+        let (Some(aoff), Some(boff)) = (aoff, boff) else {
+            return Value::Undef { ty: vec_ty };
+        };
+        let (size, align) = self.cx.type_size_align(vec_ty);
+        let roff = self.alloc_slot(size, align);
+        let msize = mem_size(self.cx, elem);
+        let op = if left {
+            DataProc2::Lslv
+        } else if arith {
+            DataProc2::Asrv
+        } else {
+            DataProc2::Lsrv
+        };
+        for i in 0..count {
+            self.emit_mem_gpr(true, false, msize, X10, SP, aoff + i * es);
+            if !left && arith {
+                self.sign_extend_reg(X10, es);
+            }
+            self.emit_mem_gpr(true, false, msize, X11_HACK, SP, boff + i * es);
+            self.emit(Inst::DataProc2 { op, size: OperandSize::S64, rd: X10, rn: X10, rm: X11_HACK });
+            self.emit_mem_gpr(false, false, msize, X10, SP, roff + i * es);
+        }
+        Value::Slot { off: roff, ty: vec_ty }
+    }
+
+    /// `simd_cast`/`simd_as`: lane-wise integer cast (`as` per lane). Narrowing truncates (store the
+    /// low destination-width bytes); widening zero- or sign-extends per the *source* lane's
+    /// signedness. The lane count is unchanged. Integer lanes only.
+    fn emit_simd_cast(&mut self, src: Value, src_signed: bool, dst_ty: Type) -> Value {
+        let (src_elem, count, src_es) = self.vector_info(src.ty());
+        let (dst_elem, _dcount, dst_es) = self.vector_info(dst_ty);
+        assert!(
+            !type_is_float(self.cx, src_elem) && !type_is_float(self.cx, dst_elem),
+            "rustc_codegen_arm64: floating-point SIMD lane casts are not yet supported"
+        );
+        let Some(soff) = self.vector_to_slot(src) else {
+            return Value::Undef { ty: dst_ty };
+        };
+        let (size, align) = self.cx.type_size_align(dst_ty);
+        let roff = self.alloc_slot(size, align);
+        let src_msize = mem_size(self.cx, src_elem);
+        let dst_msize = mem_size(self.cx, dst_elem);
+        for i in 0..count {
+            self.emit_mem_gpr(true, false, src_msize, X10, SP, soff + i * src_es);
+            // Sign-extend only when widening a signed source; truncation just drops high bytes and
+            // zero-extension is already what the load produced.
+            if src_signed && dst_es > src_es {
+                self.sign_extend_reg(X10, src_es);
+            }
+            self.emit_mem_gpr(false, false, dst_msize, X10, SP, roff + i * dst_es);
+        }
+        Value::Slot { off: roff, ty: dst_ty }
+    }
+
+    /// `llvm.aarch64.neon.umaxp` (`vpmaxq_u8` etc.): pairwise unsigned maximum. For inputs `a` and
+    /// `b` of `N` lanes, the result's first `N/2` lanes are the maxima of adjacent pairs of `a` and
+    /// the second `N/2` lanes the maxima of adjacent pairs of `b`. Integer lanes only.
+    fn emit_neon_umaxp(&mut self, a: Value, b: Value) -> Value {
+        let vec_ty = a.ty();
+        let (elem, count, es) = self.vector_info(vec_ty);
+        let aoff = self.vector_to_slot(a);
+        let boff = self.vector_to_slot(b);
+        let (Some(aoff), Some(boff)) = (aoff, boff) else {
+            return Value::Undef { ty: vec_ty };
+        };
+        let (size, align) = self.cx.type_size_align(vec_ty);
+        let roff = self.alloc_slot(size, align);
+        let msize = mem_size(self.cx, elem);
+        let half = count / 2;
+        for (src_off, base) in [(aoff, 0u64), (boff, half)] {
+            for j in 0..half {
+                self.emit_mem_gpr(true, false, msize, X10, SP, src_off + (2 * j) * es);
+                self.emit_mem_gpr(true, false, msize, X11_HACK, SP, src_off + (2 * j + 1) * es);
+                // x10 = max(x10, x11): keep x10 when it is the (unsigned) greater, else x11.
+                self.emit(Inst::AddSubReg { op: AddSub::Sub, size: OperandSize::S64, set_flags: true, rd: ZR, rn: X10, rm: X11_HACK, amount: 0 });
+                self.emit(Inst::CondSel { op: CondSel::Csel, size: OperandSize::S64, rd: X10, rn: X10, rm: X11_HACK, cond: Cond::Hs });
+                self.emit_mem_gpr(false, false, msize, X10, SP, roff + (base + j) * es);
+            }
+        }
+        Value::Slot { off: roff, ty: vec_ty }
+    }
+
+    /// `llvm.aarch64.neon.tbl1` (`vqtbl1q_u8`, used by aho-corasick's Teddy matcher): a byte table
+    /// lookup. For each index lane `i`, `result[i] = table[index[i]]` when `index[i]` is in range,
+    /// otherwise `0` (per the LLVM LangRef / NEON `TBL`). The table lives in a frame slot, so the
+    /// per-lane read is a register-indexed byte load; the index is clamped to keep the load
+    /// in-bounds and the result masked to zero when the original index was out of range.
+    fn emit_neon_tbl1(&mut self, table: Value, indices: Value) -> Value {
+        let result_ty = indices.ty();
+        let (_telem, tcount, _tes) = self.vector_info(table.ty());
+        let (ielem, icount, ies) = self.vector_info(result_ty);
+        let toff = self.vector_to_slot(table);
+        let ioff = self.vector_to_slot(indices);
+        let (Some(toff), Some(ioff)) = (toff, ioff) else {
+            return Value::Undef { ty: result_ty };
+        };
+        let (size, align) = self.cx.type_size_align(result_ty);
+        let roff = self.alloc_slot(size, align);
+        let imsize = mem_size(self.cx, ielem);
+        for i in 0..icount {
+            self.emit_mem_gpr(true, false, imsize, X10, SP, ioff + i * ies);
+            // cmp index, #tcount  -> sets the carry used by both selects below.
+            self.emit(Inst::AddSubImm { op: AddSub::Sub, size: OperandSize::S64, set_flags: true, rd: ZR, rn: X10, imm12: tcount as u16, shift12: false });
+            // Safe load index (the original index when in range, else 0) and an all-ones/zero mask.
+            self.emit(Inst::CondSel { op: CondSel::Csel, size: OperandSize::S64, rd: X12, rn: X10, rm: ZR, cond: Cond::Lo });
+            self.emit(Inst::CondSel { op: CondSel::Csinv, size: OperandSize::S64, rd: X9, rn: ZR, rm: ZR, cond: Cond::Lo.invert() });
+            self.emit_frame_addr(X13, toff);
+            self.emit(Inst::AddSubReg { op: AddSub::Add, size: OperandSize::S64, set_flags: false, rd: X13, rn: X13, rm: X12, amount: 0 });
+            self.emit(Inst::LoadStoreUImm { load: true, signed: false, size: MemSize::B, rt: X11_HACK, rn: X13, offset: 0 });
+            self.emit(Inst::Logical { op: LogicOp::And, size: OperandSize::S64, rd: X11_HACK, rn: X11_HACK, rm: X9, amount: 0 });
+            self.emit_mem_gpr(false, false, imsize, X11_HACK, SP, roff + i * ies);
+        }
+        Value::Slot { off: roff, ty: result_ty }
+    }
+
+
     /// MSB test reduces to "lane is non-zero". Integer lanes only.
     fn emit_simd_bitmask(&mut self, x: Value, result_ty: Type) -> Value {
         let (elem, count, es) = self.vector_info(x.ty());
@@ -807,8 +930,20 @@ fn build_param_list<'tcx>(cx: &CodegenCx<'tcx>, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) 
                 push_scalar_param(cx, &mut params, &mut a, y);
             }
             PassMode::Indirect { .. } => push_scalar_param(cx, &mut params, &mut a, ptr),
-            PassMode::Cast { .. } => {
-                push_scalar_param(cx, &mut params, &mut a, cx.intern_type(TypeData::Int(64)))
+            PassMode::Cast { ref cast, .. } => {
+                // A cast aggregate is passed in its ABI register form. Use the real cast register
+                // type so the param is spilled/stored at its true width: typing it as a plain
+                // `i64` (8 bytes) for, say, a 4-byte aggregate would store past the aggregate and
+                // corrupt the adjacent stack slot.
+                let cast_ty = cx.cast_backend_type(cast);
+                match cx.type_data(cast_ty) {
+                    TypeData::Int(_) | TypeData::Float(_) => {
+                        push_scalar_param(cx, &mut params, &mut a, cast_ty)
+                    }
+                    // Two-register and HFA casts keep the existing single-`i64` placement for now
+                    // (only 1-register casts were observed to be mis-sized); see `store_fn_arg`.
+                    _ => push_scalar_param(cx, &mut params, &mut a, cx.intern_type(TypeData::Int(64))),
+                }
             }
         }
     }
@@ -1777,10 +1912,27 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 ))
                 .store(self, dst);
             }
-            PassMode::Cast { .. } => {
+            PassMode::Cast { ref cast, .. } => {
                 let val = self.get_param(*idx);
                 *idx += 1;
-                OperandValue::Immediate(val).store(self, dst);
+                let cast_ty = self.cx.cast_backend_type(cast);
+                match self.cx.type_data(cast_ty) {
+                    TypeData::Int(_) | TypeData::Float(_) => {
+                        // 1-register cast: copy only the bytes that overlap the aggregate, since the
+                        // cast register may be wider than the aggregate (e.g. a 4-byte struct in an
+                        // `i32`, or a 3-byte struct in an `i32`). A full store of the register would
+                        // overflow the aggregate and clobber adjacent memory.
+                        let cast_size = self.cx.type_size_align(cast_ty).0;
+                        let copy = cast_size.min(dst.layout.size.bytes());
+                        if let Value::Slot { off, .. } = val {
+                            self.materialize(dst.val.llval, X9);
+                            self.copy_slot_to_ptr(off, X9, copy);
+                        } else {
+                            OperandValue::Immediate(val).store(self, dst);
+                        }
+                    }
+                    _ => OperandValue::Immediate(val).store(self, dst),
+                }
             }
         }
     }
@@ -1850,6 +2002,37 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 self.emit(Inst::Bl { sym: SymRef::new("_memcmp") });
                 let result_ty = self.cx.immediate_backend_type(result_layout);
                 IntrinsicResult::Operand(OperandValue::Immediate(self.spill(X0, result_ty)))
+            }
+            // `raw_eq(a, b)`: bytewise equality of two `&T`, i.e. `memcmp(a, b, size_of::<T>()) == 0`.
+            sym::raw_eq => {
+                let t = instance.args.type_at(0);
+                let size = self.cx.layout_of(t).size.bytes();
+                self.materialize(args[0].immediate(), X0);
+                self.materialize(args[1].immediate(), X1);
+                self.load_imm(X2, size as u128, OperandSize::S64);
+                self.emit(Inst::Bl { sym: SymRef::new("_memcmp") });
+                let i32t = self.cx.intern_type(TypeData::Int(32));
+                let cmp = self.spill(X0, i32t);
+                let zero = self.cx.const_int(i32t, 0);
+                let eq = self.icmp(IntPredicate::IntEQ, cmp, zero);
+                IntrinsicResult::Operand(OperandValue::Immediate(eq))
+            }
+            // A volatile load of a (scalar) value through a pointer.
+            sym::volatile_load | sym::unaligned_volatile_load => {
+                let ty = self.cx.immediate_backend_type(result_layout);
+                let load = self.volatile_load(ty, args[0].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(load))
+            }
+            // `catch_unwind(try, data, catch)`: this backend aborts on panic (it emits no unwind
+            // tables), so the catch path is never reached. Run the try function and report that no
+            // panic was caught (return 0) — exactly the panic=abort lowering.
+            sym::catch_unwind => {
+                let try_func = args[0].immediate();
+                let data = args[1].immediate();
+                self.emit_call_core(None, try_func, &[data]);
+                let ret_ty = self.cx.immediate_backend_type(result_layout);
+                let zero = self.cx.const_int(ret_ty, 0);
+                IntrinsicResult::Operand(OperandValue::Immediate(zero))
             }
             // Saturating add/sub, clamped to the integer type's range.
             sym::saturating_add | sym::saturating_sub => {
@@ -2008,6 +2191,20 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let r = self.emit_simd_binop(LogicOp::Eor, args[0].immediate(), args[1].immediate());
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
+            sym::simd_shl | sym::simd_shr => {
+                // The right shift is arithmetic for signed lanes, logical for unsigned.
+                let signed = args[0].layout.ty.simd_size_and_type(self.cx.tcx).1.is_signed();
+                let left = name == sym::simd_shl;
+                let r = self.emit_simd_shift(args[0].immediate(), args[1].immediate(), left, signed);
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_cast | sym::simd_as => {
+                // Lane-wise integer cast; widening of a signed source sign-extends.
+                let src_signed = args[0].layout.ty.simd_size_and_type(self.cx.tcx).1.is_signed();
+                let dst_ty = self.cx.immediate_backend_type(result_layout);
+                let r = self.emit_simd_cast(args[0].immediate(), src_signed, dst_ty);
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
             sym::simd_bitmask => {
                 let result_ty = self.cx.immediate_backend_type(result_layout);
                 let r = self.emit_simd_bitmask(args[0].immediate(), result_ty);
@@ -2044,11 +2241,25 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     }
     fn codegen_llvm_intrinsic_call(
         &mut self,
-        _instance: Instance<'tcx>,
-        _args: &[OperandRef<'tcx, Value>],
+        instance: Instance<'tcx>,
+        args: &[OperandRef<'tcx, Value>],
         _is_cleanup: bool,
     ) -> Value {
-        todo!("rustc_codegen_arm64: codegen_llvm_intrinsic_call")
+        let sym = self.cx.tcx.symbol_name(instance).name;
+        // `isb` is a CPU pipeline hint (emitted by `spin_loop`); emit the real barrier.
+        if sym == "llvm.aarch64.isb" {
+            self.emit(Inst::Isb);
+            return Value::Undef { ty: self.ptr_ty() };
+        }
+        // Pairwise unsigned maximum (`vpmaxq_u8`, used by memchr's "any match?" fast path).
+        if sym.starts_with("llvm.aarch64.neon.umaxp") {
+            return self.emit_neon_umaxp(args[0].immediate(), args[1].immediate());
+        }
+        // Byte table lookup (`vqtbl1q_u8`, used by aho-corasick's Teddy matcher).
+        if sym.starts_with("llvm.aarch64.neon.tbl1") {
+            return self.emit_neon_tbl1(args[0].immediate(), args[1].immediate());
+        }
+        todo!("rustc_codegen_arm64: codegen_llvm_intrinsic_call: {sym}")
     }
     fn abort(&mut self) {
         self.emit(Inst::Brk { imm16: 1 });
@@ -2680,11 +2891,55 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn write_operand_repeatedly(
         &mut self,
-        _elem: OperandRef<'tcx, Value>,
-        _count: u64,
-        _dest: PlaceRef<'tcx, Value>,
+        cg_elem: OperandRef<'tcx, Value>,
+        count: u64,
+        dest: PlaceRef<'tcx, Value>,
     ) {
-        todo!("rustc_codegen_arm64: write_operand_repeatedly")
+        // Initialize `dest` (an array place) with `count` copies of `cg_elem`. The generic codegen
+        // only calls this when the element is not a memset-able byte. Emit a runtime loop that walks
+        // a pointer from the first element to one past the last, storing the element at each step.
+        // Unlike the LLVM backend this carries the induction pointer in a frame slot (this backend
+        // has no SSA phi); the slot is read in the loop header and updated in the body.
+        if count == 0 {
+            return;
+        }
+        let elem_ty = self.cx.backend_type(cg_elem.layout);
+        let ptr_ty = self.ptr_ty();
+        let align = dest.val.align;
+        let zero = self.const_usize(0);
+        let count_v = self.const_usize(count);
+        let start = dest.project_index(self, zero).val.llval;
+        let end = dest.project_index(self, count_v).val.llval;
+
+        // Induction pointer and loop bound, each held in a fixed 8-byte frame slot.
+        let cur_off = self.alloc_slot(8, 8);
+        self.materialize(start, X9);
+        self.emit_mem_gpr(false, false, MemSize::X, X9, SP, cur_off);
+        let end_off = self.alloc_slot(8, 8);
+        self.materialize(end, X9);
+        self.emit_mem_gpr(false, false, MemSize::X, X9, SP, end_off);
+
+        let header = self.append_sibling_block("repeat_header");
+        let body = self.append_sibling_block("repeat_body");
+        let next = self.append_sibling_block("repeat_next");
+        self.br(header);
+
+        self.switch_to_block(header);
+        let cur = Value::Slot { off: cur_off, ty: ptr_ty };
+        let end_v = Value::Slot { off: end_off, ty: ptr_ty };
+        let keep_going = self.icmp(IntPredicate::IntNE, cur, end_v);
+        self.cond_br(keep_going, body, next);
+
+        self.switch_to_block(body);
+        let cur = Value::Slot { off: cur_off, ty: ptr_ty };
+        cg_elem.val.store(self, PlaceRef::new_sized_aligned(cur, cg_elem.layout, align));
+        let one = self.const_usize(1);
+        let advanced = self.gep(elem_ty, cur, &[one]);
+        self.materialize(advanced, X9);
+        self.emit_mem_gpr(false, false, MemSize::X, X9, SP, cur_off);
+        self.br(header);
+
+        self.switch_to_block(next);
     }
 
     fn range_metadata(&mut self, _load: Value, _range: WrappingRange) {}
