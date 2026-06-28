@@ -177,6 +177,23 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
                 );
             }
         }
+        Inst::AddSubCarry { op, size, set_flags, rd, rn, rm } => {
+            let mnem = match (op, set_flags) {
+                (AddSub::Add, false) => "adc",
+                (AddSub::Add, true) => "adcs",
+                (AddSub::Sub, false) => "sbc",
+                (AddSub::Sub, true) => "sbcs",
+            };
+            line(
+                out,
+                &format!(
+                    "{mnem} {}, {}, {}",
+                    rd.name_zr(size),
+                    rn.name_zr(size),
+                    rm.name_zr(size)
+                ),
+            );
+        }
         Inst::AddSubExtReg { op, size, rd, rn, rm } => {
             let mnem = match op {
                 AddSub::Add => "add",

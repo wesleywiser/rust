@@ -40,8 +40,8 @@ use crate::mach::inst::{
     LogicOp, MemSize, MovKind, PairIndex, SymRef,
 };
 use crate::mach::reg::{
-    Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V1, V16, V17, X0, X1, X2, X9, X10, X12,
-    X13, X16, ZR,
+    Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V1, V16, V17, X0, X1, X2, X9, X10, X11,
+    X12, X13, X16, ZR,
 };
 
 /// State for the function currently being lowered.
@@ -712,6 +712,8 @@ fn fp_size(cx: &CodegenCx<'_>, ty: Type) -> FpSize {
 enum ParamLoc {
     /// Integer/pointer argument in `x0..x7` (or the indirect-return pointer in `x8`).
     Gpr(Gpr),
+    /// A 128-bit integer argument occupying two consecutive integer registers (low, high).
+    GprPair(Gpr, Gpr),
     /// Floating-point argument in `v0..v7`.
     Fp(Vreg),
     /// Argument passed on the stack at the given byte offset within the caller's outgoing area.
@@ -738,6 +740,24 @@ struct ParamList {
 /// Assign one scalar parameter to its next location: a register from the appropriate bank, or a
 /// stack slot once that bank is exhausted.
 fn push_scalar_param(cx: &CodegenCx<'_>, params: &mut Vec<(ParamLoc, Type)>, a: &mut ArgAssign, ty: Type) {
+    // A 128-bit integer takes two *consecutive* integer registers (the Apple AArch64 ABI does not
+    // even-align them); if fewer than two remain it is passed on the stack, 16-byte aligned, and the
+    // remaining single register is left unused.
+    if matches!(cx.type_data(ty), TypeData::Int(b) if b > 64) {
+        if a.ngrn <= 6 {
+            let lo = Gpr::from_encoding(a.ngrn);
+            let hi = Gpr::from_encoding(a.ngrn + 1);
+            a.ngrn += 2;
+            params.push((ParamLoc::GprPair(lo, hi), ty));
+        } else {
+            a.ngrn = 8;
+            a.nsaa = (a.nsaa + 15) & !15;
+            let off = a.nsaa;
+            a.nsaa += 16;
+            params.push((ParamLoc::Stack(off), ty));
+        }
+        return;
+    }
     let loc = if type_is_float(cx, ty) {
         if a.nsrn < 8 {
             let loc = ParamLoc::Fp(Vreg::from_encoding(a.nsrn));
@@ -870,6 +890,12 @@ fn setup_params(cx: &CodegenCx<'_>, fb: &mut FunctionBuild, block: BasicBlock) {
                 let out = &mut fb.blocks[block.0 as usize];
                 push_mem_gpr(out, false, false, mem_size(cx, ty), reg, SP, off);
             }
+            ParamLoc::GprPair(lo, hi) => {
+                // A 128-bit integer arrives in two consecutive registers; store both words.
+                let out = &mut fb.blocks[block.0 as usize];
+                push_mem_gpr(out, false, false, MemSize::X, lo, SP, off);
+                push_mem_gpr(out, false, false, MemSize::X, hi, SP, off + 8);
+            }
             ParamLoc::Fp(reg) => {
                 let out = &mut fb.blocks[block.0 as usize];
                 push_mem_fp(out, false, fp_size(cx, ty), reg, SP, off);
@@ -877,7 +903,13 @@ fn setup_params(cx: &CodegenCx<'_>, fb: &mut FunctionBuild, block: BasicBlock) {
             ParamLoc::Stack(arg_off) => {
                 let incoming = fb.frame.incoming_arg(arg_off as u64);
                 let out = &mut fb.blocks[block.0 as usize];
-                if type_is_float(cx, ty) {
+                if matches!(cx.type_data(ty), TypeData::Int(b) if b > 64) {
+                    // A 128-bit integer on the stack: copy both incoming words into the slot.
+                    push_mem_gpr(out, true, false, MemSize::X, X9, FP, incoming);
+                    push_mem_gpr(out, false, false, MemSize::X, X9, SP, off);
+                    push_mem_gpr(out, true, false, MemSize::X, X9, FP, incoming + 8);
+                    push_mem_gpr(out, false, false, MemSize::X, X9, SP, off + 8);
+                } else if type_is_float(cx, ty) {
                     let size = fp_size(cx, ty);
                     push_mem_fp(out, true, size, V16, FP, incoming);
                     push_mem_fp(out, false, size, V16, SP, off);
@@ -900,6 +932,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             !matches!(self.cx.type_data(val.ty()), TypeData::Vector(..)),
             "a vector value cannot be materialized into a scalar register; it must be processed \
              lane by lane from its frame slot"
+        );
+        // A 128-bit integer does not fit in one register and must be handled as a low/high word
+        // pair (see `materialize128`). Reaching here with one means an i128 operation was not routed
+        // to its dedicated path; fail loudly rather than silently load only the low 64 bits.
+        assert!(
+            !matches!(self.cx.type_data(val.ty()), TypeData::Int(b) if b > 64),
+            "rustc_codegen_arm64: a 128-bit value cannot be materialized into a single register"
         );
         match val {
             Value::Const { bits, ty } => self.load_imm(reg, bits, op_size(self.cx, ty)),
@@ -963,6 +1002,117 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let off = self.alloc_slot(size, align);
         self.emit_mem_gpr(false, false, mem_size(self.cx, ty), reg, SP, off);
         Value::Slot { off, ty }
+    }
+
+    /// Whether `ty` is a 128-bit integer (handled as a low/high 64-bit word pair).
+    fn is_int128(&self, ty: Type) -> bool {
+        matches!(self.cx.type_data(ty), TypeData::Int(b) if b > 64)
+    }
+
+    /// Load a 128-bit value into the register pair `(lo, hi)` (low word in `lo`, high in `hi`).
+    fn materialize128(&mut self, val: Value, lo: Gpr, hi: Gpr) {
+        match val {
+            Value::Const { bits, .. } => {
+                self.load_imm(lo, bits, OperandSize::S64);
+                self.load_imm(hi, bits >> 64, OperandSize::S64);
+            }
+            Value::Undef { .. } => {
+                self.load_imm(lo, 0, OperandSize::S64);
+                self.load_imm(hi, 0, OperandSize::S64);
+            }
+            Value::Slot { off, .. } => {
+                self.emit_mem_gpr(true, false, MemSize::X, lo, SP, off);
+                self.emit_mem_gpr(true, false, MemSize::X, hi, SP, off + 8);
+            }
+            Value::Sym { .. } => {
+                panic!("rustc_codegen_arm64: a symbol address cannot be a 128-bit integer value")
+            }
+        }
+    }
+
+    /// Store the register pair `(lo, hi)` into a fresh 16-byte frame slot and return it.
+    fn spill128(&mut self, lo: Gpr, hi: Gpr, ty: Type) -> Value {
+        let (size, align) = self.cx.type_size_align(ty);
+        let off = self.alloc_slot(size, align);
+        self.emit_mem_gpr(false, false, MemSize::X, lo, SP, off);
+        self.emit_mem_gpr(false, false, MemSize::X, hi, SP, off + 8);
+        Value::Slot { off, ty }
+    }
+
+    /// Emit a carry-chained 128-bit add or subtract: `(lo, hi) op= (b_lo, b_hi)`. With `set_flags`,
+    /// the final `NZCV` reflects the full 128-bit result (used for overflow detection).
+    fn int128_addsub(&mut self, op: AddSub, lhs: Value, rhs: Value, set_flags: bool) -> Value {
+        let ty = lhs.ty();
+        self.materialize128(lhs, X9, X10);
+        self.materialize128(rhs, X11, X12);
+        // Low word sets the carry; high word consumes it.
+        self.emit(Inst::AddSubReg { op, size: OperandSize::S64, set_flags: true, rd: X9, rn: X9, rm: X11, amount: 0 });
+        self.emit(Inst::AddSubCarry { op, size: OperandSize::S64, set_flags, rd: X10, rn: X10, rm: X12 });
+        self.spill128(X9, X10, ty)
+    }
+
+    /// Emit a per-word 128-bit bitwise logical op (`and`/`orr`/`eor`).
+    fn int128_logical(&mut self, op: LogicOp, lhs: Value, rhs: Value) -> Value {
+        let ty = lhs.ty();
+        self.materialize128(lhs, X9, X10);
+        self.materialize128(rhs, X11, X12);
+        self.emit(Inst::Logical { op, size: OperandSize::S64, rd: X9, rn: X9, rm: X11, amount: 0 });
+        self.emit(Inst::Logical { op, size: OperandSize::S64, rd: X10, rn: X10, rm: X12, amount: 0 });
+        self.spill128(X9, X10, ty)
+    }
+
+    /// 128 x 128 -> low 128-bit multiply, inline via 64-bit partial products (no libcall):
+    /// `result_lo = a_lo*b_lo`, `result_hi = hi64(a_lo*b_lo) + a_hi*b_lo + a_lo*b_hi`.
+    fn int128_mul(&mut self, lhs: Value, rhs: Value) -> Value {
+        let ty = lhs.ty();
+        self.materialize128(lhs, X9, X10); // a = (a_lo=X9, a_hi=X10)
+        self.materialize128(rhs, X11, X12); // b = (b_lo=X11, b_hi=X12)
+        // X13 = hi64(a_lo * b_lo)
+        self.emit(Inst::MulHigh { signed: false, rd: X13, rn: X9, rm: X11 });
+        // X13 += a_hi * b_lo
+        self.emit(Inst::Madd { size: OperandSize::S64, rd: X13, rn: X10, rm: X11, ra: X13 });
+        // result_hi (X13) = a_lo * b_hi + X13
+        self.emit(Inst::Madd { size: OperandSize::S64, rd: X13, rn: X9, rm: X12, ra: X13 });
+        // result_lo (X9) = a_lo * b_lo
+        self.emit(Inst::Madd { size: OperandSize::S64, rd: X9, rn: X9, rm: X11, ra: ZR });
+        self.spill128(X9, X13, ty)
+    }
+
+    /// A 128-bit comparison returning an `i1`. Equality compares both words and folds with `orr`;
+    /// ordered comparisons do a full 128-bit subtract (`subs`/`sbcs`) and read the flags, swapping
+    /// operands for the `>`/`<=` forms (see the per-case table in `icmp`).
+    fn int128_icmp(&mut self, op: IntPredicate, lhs: Value, rhs: Value) -> Value {
+        let bool_ty = self.cx.intern_type(TypeData::Int(1));
+        if matches!(op, IntPredicate::IntEQ | IntPredicate::IntNE) {
+            self.materialize128(lhs, X9, X10);
+            self.materialize128(rhs, X11, X12);
+            self.emit(Inst::Logical { op: LogicOp::Eor, size: OperandSize::S64, rd: X9, rn: X9, rm: X11, amount: 0 });
+            self.emit(Inst::Logical { op: LogicOp::Eor, size: OperandSize::S64, rd: X10, rn: X10, rm: X12, amount: 0 });
+            self.emit(Inst::Logical { op: LogicOp::Orr, size: OperandSize::S64, rd: X9, rn: X9, rm: X10, amount: 0 });
+            self.emit(Inst::AddSubImm { op: AddSub::Sub, size: OperandSize::S64, set_flags: true, rd: ZR, rn: X9, imm12: 0, shift12: false });
+            let cond = if matches!(op, IntPredicate::IntEQ) { Cond::Eq } else { Cond::Ne };
+            self.emit(Inst::CondSel { op: CondSel::Csinc, size: OperandSize::S32, rd: X9, rn: ZR, rm: ZR, cond: cond.invert() });
+            return self.spill(X9, bool_ty);
+        }
+        // Ordered: (first, second, cond). `>`/`<=` swap operands so all four reduce to lt/ge tests.
+        let (swap, cond) = match op {
+            IntPredicate::IntULT => (false, Cond::Lo),
+            IntPredicate::IntSLT => (false, Cond::Lt),
+            IntPredicate::IntUGE => (false, Cond::Hs),
+            IntPredicate::IntSGE => (false, Cond::Ge),
+            IntPredicate::IntUGT => (true, Cond::Lo),
+            IntPredicate::IntSGT => (true, Cond::Lt),
+            IntPredicate::IntULE => (true, Cond::Hs),
+            IntPredicate::IntSLE => (true, Cond::Ge),
+            IntPredicate::IntEQ | IntPredicate::IntNE => unreachable!(),
+        };
+        let (first, second) = if swap { (rhs, lhs) } else { (lhs, rhs) };
+        self.materialize128(first, X9, X10);
+        self.materialize128(second, X11, X12);
+        self.emit(Inst::AddSubReg { op: AddSub::Sub, size: OperandSize::S64, set_flags: true, rd: ZR, rn: X9, rm: X11, amount: 0 });
+        self.emit(Inst::AddSubCarry { op: AddSub::Sub, size: OperandSize::S64, set_flags: true, rd: ZR, rn: X10, rm: X12 });
+        self.emit(Inst::CondSel { op: CondSel::Csinc, size: OperandSize::S32, rd: X9, rn: ZR, rm: ZR, cond: cond.invert() });
+        self.spill(X9, bool_ty)
     }
 
     /// Population count (`ctpop`) via the classic SWAR algorithm. The input is zero-extended to 64
@@ -1862,6 +2012,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             }
         } else if type_is_float(self.cx, v.ty()) {
             self.materialize_fp(v, V0);
+        } else if self.is_int128(v.ty()) {
+            // A 128-bit integer is returned in the x0:x1 register pair.
+            self.materialize128(v, X0, X1);
         } else {
             self.materialize(v, X0);
         }
@@ -1926,6 +2079,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn add(&mut self, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_addsub(AddSub::Add, lhs, rhs, false);
+        }
         self.alu_rrr(
             |size, rd, rn, rm| Inst::AddSubReg {
                 op: AddSub::Add,
@@ -1941,6 +2097,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         )
     }
     fn sub(&mut self, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_addsub(AddSub::Sub, lhs, rhs, false);
+        }
         self.alu_rrr(
             |size, rd, rn, rm| Inst::AddSubReg {
                 op: AddSub::Sub,
@@ -1956,6 +2115,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         )
     }
     fn mul(&mut self, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_mul(lhs, rhs);
+        }
         self.alu_rrr(|size, rd, rn, rm| Inst::Madd { size, rd, rn, rm, ra: ZR }, lhs, rhs)
     }
     fn udiv(&mut self, lhs: Value, rhs: Value) -> Value {
@@ -1985,6 +2147,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.rem(lhs, rhs, DataProc2::Sdiv)
     }
     fn and(&mut self, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_logical(LogicOp::And, lhs, rhs);
+        }
         self.alu_rrr(
             |size, rd, rn, rm| Inst::Logical { op: LogicOp::And, size, rd, rn, rm, amount: 0 },
             lhs,
@@ -1992,6 +2157,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         )
     }
     fn or(&mut self, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_logical(LogicOp::Orr, lhs, rhs);
+        }
         self.alu_rrr(
             |size, rd, rn, rm| Inst::Logical { op: LogicOp::Orr, size, rd, rn, rm, amount: 0 },
             lhs,
@@ -1999,6 +2167,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         )
     }
     fn xor(&mut self, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_logical(LogicOp::Eor, lhs, rhs);
+        }
         self.alu_rrr(
             |size, rd, rn, rm| Inst::Logical { op: LogicOp::Eor, size, rd, rn, rm, amount: 0 },
             lhs,
@@ -2233,6 +2404,15 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 self.copy_ptr_to_slot(off, X9, size);
                 return Value::Slot { off, ty };
             }
+            TypeData::Int(b) if b > 64 => {
+                // A 128-bit integer occupies 16 bytes; a single-register load would drop the high
+                // word. Copy the whole value into a fresh slot.
+                let (size, align) = self.cx.type_size_align(ty);
+                let off = self.alloc_slot(size, align);
+                self.materialize(ptr, X9);
+                self.copy_ptr_to_slot(off, X9, size);
+                return Value::Slot { off, ty };
+            }
             _ => {}
         }
         self.materialize(ptr, X9);
@@ -2326,6 +2506,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             }
             return Value::Undef { ty: self.ptr_ty() };
         }
+        if self.is_int128(val.ty()) {
+            // A 128-bit integer is stored as its two 64-bit words.
+            self.materialize(ptr, X9);
+            self.materialize128(val, X10, X11);
+            self.emit(Inst::LoadStoreUImm { load: false, signed: false, size: MemSize::X, rt: X10, rn: X9, offset: 0 });
+            self.emit(Inst::LoadStoreUImm { load: false, signed: false, size: MemSize::X, rt: X11, rn: X9, offset: 8 });
+            return Value::Undef { ty: self.ptr_ty() };
+        }
         self.materialize(ptr, X9);
         self.materialize(val, X10);
         self.emit(Inst::LoadStoreUImm {
@@ -2382,6 +2570,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.retype(val, dest_ty)
     }
     fn sext(&mut self, val: Value, dest_ty: Type) -> Value {
+        if self.is_int128(dest_ty) {
+            // Sign-extend the source to 64 bits (the low word), then replicate its sign bit across
+            // the high word (`asr #63`).
+            let i64ty = self.cx.intern_type(TypeData::Int(64));
+            let lo64 = self.sext(val, i64ty);
+            self.materialize(lo64, X9);
+            self.load_imm(X11, 63, OperandSize::S64);
+            self.emit(Inst::DataProc2 { op: DataProc2::Asrv, size: OperandSize::S64, rd: X10, rn: X9, rm: X11 });
+            return self.spill128(X9, X10, dest_ty);
+        }
         let src_bits = match self.cx.type_data(val.ty()) {
             TypeData::Int(b) => b,
             _ => 64,
@@ -2408,6 +2606,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.spill(X9, dest_ty)
     }
     fn zext(&mut self, val: Value, dest_ty: Type) -> Value {
+        if self.is_int128(dest_ty) {
+            // Zero-extend the source into the low word; the high word is zero.
+            self.materialize(val, X9);
+            self.load_imm(X10, 0, OperandSize::S64);
+            return self.spill128(X9, X10, dest_ty);
+        }
         // Materializing a slot zero-extends (e.g. `ldrb`); re-spill at the wider type.
         self.materialize(val, X9);
         self.spill(X9, dest_ty)
@@ -2497,6 +2701,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn icmp(&mut self, op: IntPredicate, lhs: Value, rhs: Value) -> Value {
+        if self.is_int128(lhs.ty()) {
+            return self.int128_icmp(op, lhs, rhs);
+        }
         let cond = int_pred_to_cond(op);
         self.emit_icmp(cond, lhs, rhs)
     }
@@ -2559,6 +2766,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn select(&mut self, cond: Value, then_val: Value, else_val: Value) -> Value {
         let ty = then_val.ty();
+        if self.is_int128(ty) {
+            // Select each 64-bit word independently after a single `cmp cond, #0`.
+            self.materialize(cond, X9);
+            self.emit(Inst::AddSubImm { op: AddSub::Sub, size: OperandSize::S32, set_flags: true, rd: ZR, rn: X9, imm12: 0, shift12: false });
+            self.materialize128(then_val, X10, X11);
+            self.materialize128(else_val, X12, X13);
+            self.emit(Inst::CondSel { op: CondSel::Csel, size: OperandSize::S64, rd: X10, rn: X10, rm: X12, cond: Cond::Ne });
+            self.emit(Inst::CondSel { op: CondSel::Csel, size: OperandSize::S64, rd: X11, rn: X11, rm: X13, cond: Cond::Ne });
+            return self.spill128(X10, X11, ty);
+        }
         let size = op_size(self.cx, ty);
         self.materialize(cond, X9);
         // cmp cond, #0 -> flags; ne means cond is true
@@ -2878,6 +3095,21 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     self.emit_mem_fp(false, fp_size(self.cx, arg.ty()), V16, SP, nsaa as u64);
                     nsaa += 8;
                 }
+            } else if self.is_int128(arg.ty()) {
+                // A 128-bit integer takes two consecutive registers, else a 16-byte stack slot.
+                if ngrn <= 6 {
+                    let lo = Gpr::from_encoding(ngrn);
+                    let hi = Gpr::from_encoding(ngrn + 1);
+                    self.materialize128(arg, lo, hi);
+                    ngrn += 2;
+                } else {
+                    ngrn = 8;
+                    nsaa = (nsaa + 15) & !15;
+                    self.materialize128(arg, X9, X10);
+                    self.emit_mem_gpr(false, false, MemSize::X, X9, SP, nsaa as u64);
+                    self.emit_mem_gpr(false, false, MemSize::X, X10, SP, nsaa as u64 + 8);
+                    nsaa += 16;
+                }
             } else if ngrn < 8 {
                 self.materialize(arg, Gpr::from_encoding(ngrn));
                 ngrn += 1;
@@ -2938,6 +3170,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         Value::Slot { off: base, ty }
                     }
                     _ if type_is_float(self.cx, ty) => self.spill_fp(V0, ty),
+                    _ if self.is_int128(ty) => self.spill128(X0, X1, ty),
                     _ => self.spill(X0, ty),
                 }
             }

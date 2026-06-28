@@ -168,6 +168,11 @@ pub enum Inst {
         rm: Gpr,
         amount: u8,
     },
+    /// `adc`/`adcs`/`sbc`/`sbcs rd, rn, rm` — add/subtract with carry, propagating the carry flag.
+    /// Used to chain 64-bit operations into 128-bit arithmetic (the high word consumes the carry the
+    /// low word produced). `negs`/`ngc` are the `rn == xzr` forms. With `set_flags`, the resulting
+    /// `NZCV` reflects the full 128-bit result for overflow detection.
+    AddSubCarry { op: AddSub, size: OperandSize, set_flags: bool, rd: Gpr, rn: Gpr, rm: Gpr },
     /// `add`/`sub rd, rn, rm` (extended-register form, `UXTX #0`). Unlike the shifted-register
     /// form, this permits the stack pointer as `rd`/`rn`, so it is used to adjust `sp` by, or form
     /// frame addresses from, an offset materialized in a register (for frames too large for an
@@ -387,6 +392,19 @@ impl Inst {
                     | (0b01011 << 24)
                     | (rm.encoding() << 16)
                     | ((amount as u32) << 10)
+                    | (rn.encoding() << 5)
+                    | rd.encoding()
+            }
+            Inst::AddSubCarry { op, size, set_flags, rd, rn, rm } => {
+                let op_bit = match op {
+                    AddSub::Add => 0,
+                    AddSub::Sub => 1,
+                };
+                (size.sf() << 31)
+                    | (op_bit << 30)
+                    | ((set_flags as u32) << 29)
+                    | (0b11010000 << 21)
+                    | (rm.encoding() << 16)
                     | (rn.encoding() << 5)
                     | rd.encoding()
             }
@@ -1180,6 +1198,88 @@ mod tests {
             }
             .encode(),
             0xF97FFFE0
+        );
+    }
+
+    #[test]
+    fn carry_encodings() {
+        // adc x0, x1, x2 — add the low-word carry into the high word.
+        assert_eq!(
+            Inst::AddSubCarry {
+                op: AddSub::Add,
+                size: OperandSize::S64,
+                set_flags: false,
+                rd: X0,
+                rn: X1,
+                rm: X2,
+            }
+            .encode(),
+            0x9A020020
+        );
+        // adcs x0, x1, x2 — same, setting flags (for overflow detection).
+        assert_eq!(
+            Inst::AddSubCarry {
+                op: AddSub::Add,
+                size: OperandSize::S64,
+                set_flags: true,
+                rd: X0,
+                rn: X1,
+                rm: X2,
+            }
+            .encode(),
+            0xBA020020
+        );
+        // sbc x0, x1, x2 — subtract with borrow.
+        assert_eq!(
+            Inst::AddSubCarry {
+                op: AddSub::Sub,
+                size: OperandSize::S64,
+                set_flags: false,
+                rd: X0,
+                rn: X1,
+                rm: X2,
+            }
+            .encode(),
+            0xDA020020
+        );
+        // sbcs x0, x1, x2 — subtract with borrow, setting flags.
+        assert_eq!(
+            Inst::AddSubCarry {
+                op: AddSub::Sub,
+                size: OperandSize::S64,
+                set_flags: true,
+                rd: X0,
+                rn: X1,
+                rm: X2,
+            }
+            .encode(),
+            0xFA020020
+        );
+        // adc w5, w6, w7 — 32-bit form.
+        assert_eq!(
+            Inst::AddSubCarry {
+                op: AddSub::Add,
+                size: OperandSize::S32,
+                set_flags: false,
+                rd: X5,
+                rn: X6,
+                rm: X7,
+            }
+            .encode(),
+            0x1A0700C5
+        );
+        // sbcs xzr, x1, x3 — the discard-result form used by 128-bit comparison.
+        assert_eq!(
+            Inst::AddSubCarry {
+                op: AddSub::Sub,
+                size: OperandSize::S64,
+                set_flags: true,
+                rd: ZR,
+                rn: X1,
+                rm: X3,
+            }
+            .encode(),
+            0xFA03003F
         );
     }
 
