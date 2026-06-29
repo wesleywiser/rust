@@ -2364,6 +2364,26 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             TypeData::Int(bits) => bits,
             _ => 64,
         };
+        // 128-bit operands can't go through the i64 path below (it would truncate them). Add/sub at
+        // full width with hardware carry/overflow detection, then clamp to the type's bounds: signed
+        // overflow saturates to MIN when `a < 0` (same-sign add or `a - b` going negative) else MAX;
+        // unsigned add saturates to MAX on carry, unsigned sub to 0 on borrow.
+        if n == 128 {
+            let oop = if is_add { OverflowOp::Add } else { OverflowOp::Sub };
+            let (s, overflow) = self.checked128_addsub(oop, signed, a, b);
+            let bound = if signed {
+                let zero = Value::Const { bits: 0, ty: result_ty };
+                let min = Value::Const { bits: 1u128 << 127, ty: result_ty };
+                let max = Value::Const { bits: (1u128 << 127) - 1, ty: result_ty };
+                let a_neg = self.icmp(IntPredicate::IntSLT, a, zero);
+                self.select(a_neg, min, max)
+            } else if is_add {
+                Value::Const { bits: u128::MAX, ty: result_ty }
+            } else {
+                Value::Const { bits: 0, ty: result_ty }
+            };
+            return self.select(overflow, bound, s);
+        }
         let i64t = self.cx.intern_type(TypeData::Int(64));
         let a64 = self.intcast(a, i64t, signed);
         let b64 = self.intcast(b, i64t, signed);
