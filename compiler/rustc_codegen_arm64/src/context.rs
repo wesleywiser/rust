@@ -148,6 +148,8 @@ pub struct CodegenCx<'tcx> {
     vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ty::ExistentialTraitRef<'tcx>>), Value>>,
     /// Symbol interned for each predefined `static` item.
     pub statics: RefCell<FxHashMap<rustc_hir::def_id::DefId, Sym>>,
+    /// Foreign (dylib-imported) static symbols whose address must be loaded via the GOT.
+    pub got_syms: RefCell<rustc_data_structures::fx::FxHashSet<Sym>>,
     /// Symbol emitted for each anonymous constant allocation (string literals, `&CONST`, promoted
     /// constants, vtables), keyed by allocation content so identical constants are deduplicated.
     pub static_consts: RefCell<FxHashMap<rustc_middle::mir::interpret::Allocation, Sym>>,
@@ -171,6 +173,7 @@ impl<'tcx> CodegenCx<'tcx> {
             declared_fns: RefCell::new(FxHashMap::default()),
             vtables: RefCell::new(FxHashMap::default()),
             statics: RefCell::new(FxHashMap::default()),
+            got_syms: RefCell::new(rustc_data_structures::fx::FxHashSet::default()),
             static_consts: RefCell::new(FxHashMap::default()),
             eh_personality: Cell::new(None),
             local_gen_sym_counter: Cell::new(0),

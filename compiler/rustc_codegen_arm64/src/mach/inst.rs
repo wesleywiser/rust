@@ -240,6 +240,11 @@ pub enum Inst {
     /// `ldr rt, [rn, <sym>@TLVPPAGEOFF]` — load the descriptor address (records a `TlvpPageOff12`
     /// relocation that patches the scaled 12-bit immediate).
     LdrTlvLo { rt: Gpr, rn: Gpr, sym: SymRef },
+    /// `adrp rd, <sym>@GOTPAGE` — GOT entry page (records a `GotLoadPage21` relocation). Used for
+    /// dylib-imported statics (e.g. `_mach_task_self_`) whose address is only known via the GOT.
+    AdrpGot { rd: Gpr, sym: SymRef },
+    /// `ldr rt, [rn, <sym>@GOTPAGEOFF]` — load the GOT slot (records a `GotLoadPageOff12`).
+    LdrGotLo { rt: Gpr, rn: Gpr, sym: SymRef },
 
     /// `fadd`/`fsub`/`fmul`/`fdiv` two-operand FP.
     FpDataProc2 { op: FpOp2, size: FpSize, rd: Vreg, rn: Vreg, rm: Vreg },
@@ -588,6 +593,9 @@ impl Inst {
             Inst::AdrpTlv { rd, .. } => 0x90000000 | rd.encoding(),
             // `ldr rt, [rn, #0]` (64-bit); the `TlvpPageOff12` relocation patches the immediate.
             Inst::LdrTlvLo { rt, rn, .. } => 0xF940_0000 | (rn.encoding() << 5) | rt.encoding(),
+            // GOT page/offset; encode like adrp + 64-bit ldr, the GOT relocations patch them.
+            Inst::AdrpGot { rd, .. } => 0x90000000 | rd.encoding(),
+            Inst::LdrGotLo { rt, rn, .. } => 0xF940_0000 | (rn.encoding() << 5) | rt.encoding(),
             Inst::AddLo { rd, rn, .. } => {
                 encode_add_sub_imm(AddSub::Add, OperandSize::S64, false, rd, rn, 0, false)
             }

@@ -44,6 +44,15 @@ use crate::mach::reg::{
     X10, X11, X12, X13, X16, ZR,
 };
 
+/// Lane-wise SIMD arithmetic operation kind for [`Builder::emit_simd_arith`].
+#[derive(Clone, Copy)]
+enum SimdArith {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
 /// State for the function currently being lowered.
 pub struct FunctionBuild {
     pub func: Function,
@@ -490,6 +499,49 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         Value::Slot { off: roff, ty: vec_ty }
     }
 
+    /// Lane-wise SIMD arithmetic (`simd_add`/`simd_sub`/`simd_mul`/`simd_div`). Integer lanes use
+    /// GPR add/sub/mul; floating-point lanes use the FP unit. `div` is float-only here.
+    fn emit_simd_arith(&mut self, a: Value, b: Value, kind: SimdArith) -> Value {
+        let vec_ty = a.ty();
+        let (elem, count, es) = self.vector_info(vec_ty);
+        let aoff = self.vector_to_slot(a);
+        let boff = self.vector_to_slot(b);
+        let (Some(aoff), Some(boff)) = (aoff, boff) else {
+            return Value::Undef { ty: vec_ty };
+        };
+        let (size, align) = self.cx.type_size_align(vec_ty);
+        let roff = self.alloc_slot(size, align);
+        if type_is_float(self.cx, elem) {
+            let fs = fp_size(self.cx, elem);
+            let op = match kind {
+                SimdArith::Add => crate::mach::inst::FpOp2::Fadd,
+                SimdArith::Sub => crate::mach::inst::FpOp2::Fsub,
+                SimdArith::Mul => crate::mach::inst::FpOp2::Fmul,
+                SimdArith::Div => crate::mach::inst::FpOp2::Fdiv,
+            };
+            for i in 0..count {
+                self.emit_mem_fp(true, fs, V16, SP, aoff + i * es);
+                self.emit_mem_fp(true, fs, V17, SP, boff + i * es);
+                self.emit(Inst::FpDataProc2 { op, size: fs, rd: V16, rn: V16, rm: V17 });
+                self.emit_mem_fp(false, fs, V16, SP, roff + i * es);
+            }
+            return Value::Slot { off: roff, ty: vec_ty };
+        }
+        let msize = mem_size(self.cx, elem);
+        for i in 0..count {
+            self.emit_mem_gpr(true, false, msize, X10, SP, aoff + i * es);
+            self.emit_mem_gpr(true, false, msize, X11_HACK, SP, boff + i * es);
+            match kind {
+                SimdArith::Add => self.emit(Inst::AddSubReg { op: AddSub::Add, size: OperandSize::S64, set_flags: false, rd: X10, rn: X10, rm: X11_HACK, amount: 0 }),
+                SimdArith::Sub => self.emit(Inst::AddSubReg { op: AddSub::Sub, size: OperandSize::S64, set_flags: false, rd: X10, rn: X10, rm: X11_HACK, amount: 0 }),
+                SimdArith::Mul => self.emit(Inst::Madd { size: OperandSize::S64, rd: X10, rn: X10, rm: X11_HACK, ra: ZR }),
+                SimdArith::Div => panic!("rustc_codegen_arm64: integer SIMD division is not supported"),
+            }
+            self.emit_mem_gpr(false, false, msize, X10, SP, roff + i * es);
+        }
+        Value::Slot { off: roff, ty: vec_ty }
+    }
+
     /// `simd_shl`/`simd_shr`: lane-wise variable shift (each lane of `a` shifted by the
     /// corresponding lane of `b`). For a right shift, `arith` selects arithmetic (sign-propagating)
     /// vs logical; the lane is sign-extended first for the arithmetic case so the sign fills from
@@ -703,11 +755,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// the (runtime-read) indices in `idx`. Implemented for byte lanes: the inputs are laid out
     /// contiguously in a scratch buffer and each result lane is a register-indexed byte load.
     fn emit_simd_shuffle(&mut self, x: Value, y: Value, idx: Value, result_ty: Type) -> Value {
-        let (elem, n, es) = self.vector_info(x.ty());
-        assert!(
-            es == 1 && !type_is_float(self.cx, elem),
-            "rustc_codegen_arm64: only byte-lane SIMD shuffles are supported"
-        );
+        let (_elem, n, es) = self.vector_info(x.ty());
         let (_, out_n, _) = self.vector_info(result_ty);
         let (idx_elem, _, idx_es) = self.vector_info(idx.ty());
         let xoff = self.vector_to_slot(x);
@@ -716,13 +764,15 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let (Some(xoff), Some(yoff), Some(ioff)) = (xoff, yoff, ioff) else {
             return Value::Undef { ty: result_ty };
         };
-        // Concatenate the inputs into a `2*n`-byte buffer so an index in `0..2*n` is a byte offset.
-        let buf_off = self.alloc_slot(2 * n, 1);
-        for j in 0..n {
+        let lane = mem_size_for_bytes(es);
+        let shift = es.trailing_zeros() as u8; // log2(element size); lanes are power-of-two sized
+        // Concatenate the inputs into a `2*n`-lane buffer so an index in `0..2*n` selects a lane.
+        let buf_off = self.alloc_slot(2 * n * es, es);
+        for j in 0..(n * es) {
             self.emit_mem_gpr(true, false, MemSize::B, X10, SP, xoff + j);
             self.emit_mem_gpr(false, false, MemSize::B, X10, SP, buf_off + j);
             self.emit_mem_gpr(true, false, MemSize::B, X10, SP, yoff + j);
-            self.emit_mem_gpr(false, false, MemSize::B, X10, SP, buf_off + n + j);
+            self.emit_mem_gpr(false, false, MemSize::B, X10, SP, buf_off + n * es + j);
         }
         let (out_size, out_align) = self.cx.type_size_align(result_ty);
         let res_off = self.alloc_slot(out_size, out_align);
@@ -730,6 +780,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         for i in 0..out_n {
             self.emit_mem_gpr(true, false, idxmsize, X12, SP, ioff + i * idx_es);
             self.emit_frame_addr(X13, buf_off);
+            // addr = buf + (index << log2(es))
             self.emit(Inst::AddSubReg {
                 op: AddSub::Add,
                 size: OperandSize::S64,
@@ -737,17 +788,17 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 rd: X13,
                 rn: X13,
                 rm: X12,
-                amount: 0,
+                amount: shift,
             });
             self.emit(Inst::LoadStoreUImm {
                 load: true,
                 signed: false,
-                size: MemSize::B,
+                size: lane,
                 rt: X10,
                 rn: X13,
                 offset: 0,
             });
-            self.emit_mem_gpr(false, false, MemSize::B, X10, SP, res_off + i);
+            self.emit_mem_gpr(false, false, lane, X10, SP, res_off + i * es);
         }
         Value::Slot { off: res_off, ty: result_ty }
     }
@@ -853,6 +904,16 @@ fn op_size(cx: &CodegenCx<'_>, ty: Type) -> OperandSize {
 fn mem_size(cx: &CodegenCx<'_>, ty: Type) -> MemSize {
     let (size, _) = cx.type_size_align(ty);
     match size {
+        1 => MemSize::B,
+        2 => MemSize::H,
+        4 => MemSize::W,
+        _ => MemSize::X,
+    }
+}
+
+/// Mach memory access size for a power-of-two byte count (1/2/4/8); >8 uses a 64-bit word.
+fn mem_size_for_bytes(bytes: u64) -> MemSize {
+    match bytes {
         1 => MemSize::B,
         2 => MemSize::H,
         4 => MemSize::W,
@@ -1208,8 +1269,19 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
             Value::Sym { sym, offset, ty: _ } => {
                 let symref = SymRef { name: self.cx.sym_name(sym), addend: offset };
-                self.emit(Inst::Adrp { rd: reg, sym: symref.clone() });
-                self.emit(Inst::AddLo { rd: reg, rn: reg, sym: symref });
+                if self.cx.got_syms.borrow().contains(&sym) {
+                    // Foreign static: load its address from the GOT, then add any field offset.
+                    let base = SymRef { name: self.cx.sym_name(sym), addend: 0 };
+                    self.emit(Inst::AdrpGot { rd: reg, sym: base.clone() });
+                    self.emit(Inst::LdrGotLo { rt: reg, rn: reg, sym: base });
+                    if offset != 0 {
+                        self.load_imm(X16, offset as u128, OperandSize::S64);
+                        self.emit(Inst::AddSubReg { op: AddSub::Add, size: OperandSize::S64, set_flags: false, rd: reg, rn: reg, rm: X16, amount: 0 });
+                    }
+                } else {
+                    self.emit(Inst::Adrp { rd: reg, sym: symref.clone() });
+                    self.emit(Inst::AddLo { rd: reg, rn: reg, sym: symref });
+                }
             }
         }
     }
@@ -2123,6 +2195,14 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let r = if self.is_int128(v.ty()) { self.emit_reverse128(v, DataProc1::Rbit) } else { self.emit_reverse(v, DataProc1::Rbit) };
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
+            // `ptr_mask(ptr, mask)` masks the address bits of a pointer: `(ptr.addr() & mask)` cast
+            // back to a pointer. A plain 64-bit AND of the pointer and mask registers.
+            sym::ptr_mask => {
+                let ptr = args[0].immediate();
+                let mask = args[1].immediate();
+                let r = self.and(ptr, mask);
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
             // `compare_bytes` has `memcmp` semantics: the sign of the first differing byte, as i32.
             sym::compare_bytes => {
                 self.materialize(args[0].immediate(), X0);
@@ -2351,6 +2431,16 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let r = self.emit_simd_binop(LogicOp::Eor, args[0].immediate(), args[1].immediate());
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
+            sym::simd_add | sym::simd_sub | sym::simd_mul | sym::simd_div => {
+                let kind = match name {
+                    sym::simd_add => SimdArith::Add,
+                    sym::simd_sub => SimdArith::Sub,
+                    sym::simd_mul => SimdArith::Mul,
+                    _ => SimdArith::Div,
+                };
+                let r = self.emit_simd_arith(args[0].immediate(), args[1].immediate(), kind);
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
             sym::simd_shl | sym::simd_shr => {
                 // The right shift is arithmetic for signed lanes, logical for unsigned.
                 let signed = args[0].layout.ty.simd_size_and_type(self.cx.tcx).1.is_signed();
@@ -2401,6 +2491,30 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             sym::is_val_statically_known => {
                 let ty = self.cx.immediate_backend_type(result_layout);
                 IntrinsicResult::Operand(OperandValue::Immediate(self.cx.const_int(ty, 0)))
+            }
+            // `select_unpredictable(cond, t, f)` -> `if cond { t } else { f }`, just a branchless
+            // select (the "unpredictable" hint is ignored). Scalars/pairs pick each register; an
+            // aggregate selects between the two source pointers and copies into the result place.
+            sym::select_unpredictable => {
+                let cond = args[0].immediate();
+                match (args[1].val, args[2].val) {
+                    (OperandValue::Immediate(t), OperandValue::Immediate(f)) => {
+                        IntrinsicResult::Operand(OperandValue::Immediate(self.select(cond, t, f)))
+                    }
+                    (OperandValue::Pair(t0, t1), OperandValue::Pair(f0, f1)) => {
+                        let a = self.select(cond, t0, f0);
+                        let b = self.select(cond, t1, f1);
+                        IntrinsicResult::Operand(OperandValue::Pair(a, b))
+                    }
+                    (OperandValue::Ref(t), OperandValue::Ref(f)) => {
+                        let dest = result_place.expect("select_unpredictable aggregate needs a place");
+                        let src = self.select(cond, t.llval, f.llval);
+                        let size = self.const_usize(result_layout.size.bytes());
+                        self.memcpy(dest.llval, dest.align, src, t.align.min(f.align), size, MemFlags::empty(), None);
+                        IntrinsicResult::WroteIntoPlace
+                    }
+                    _ => IntrinsicResult::Operand(args[1].val),
+                }
             }
             // Everything else falls back to the intrinsic's MIR body (if it has one).
             _ => IntrinsicResult::Fallback(instance),

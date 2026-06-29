@@ -362,6 +362,18 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
                 sym.name
             ),
         ),
+        Inst::AdrpGot { rd, ref sym } => {
+            line(out, &format!("adrp {}, {}@GOTPAGE", rd.name(OperandSize::S64), sym.name))
+        }
+        Inst::LdrGotLo { rt, rn, ref sym } => line(
+            out,
+            &format!(
+                "ldr {}, [{}, {}@GOTPAGEOFF]",
+                rt.name(OperandSize::S64),
+                rn.name(OperandSize::S64),
+                sym.name
+            ),
+        ),
         Inst::AddLo { rd, rn, ref sym } => line(
             out,
             &format!(

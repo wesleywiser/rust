@@ -158,6 +158,14 @@ impl MachFunction {
                     push_reloc(&mut relocs, cur, sym, RelocKind::TlvpPageOff12);
                     code.extend_from_slice(&inst.encode().to_le_bytes());
                 }
+                Inst::AdrpGot { sym, .. } => {
+                    push_reloc(&mut relocs, cur, sym, RelocKind::GotLoadPage21);
+                    code.extend_from_slice(&inst.encode().to_le_bytes());
+                }
+                Inst::LdrGotLo { sym, .. } => {
+                    push_reloc(&mut relocs, cur, sym, RelocKind::GotLoadPageOff12);
+                    code.extend_from_slice(&inst.encode().to_le_bytes());
+                }
                 _ => code.extend_from_slice(&inst.encode().to_le_bytes()),
             }
             cur += 4;
