@@ -163,9 +163,21 @@ pub fn emit_object(module: &MachModule) -> Vec<u8> {
     // Build the shared `__eh_frame` (one CIE, one FDE per EH function) first so compact entries can
     // reference FDE offsets. macOS uses pointer-sized (8-byte) pc/lsda fields resolved by SUBTRACTOR
     // + UNSIGNED pairs; the personality is a 4-byte GOT-relative pointer in the CIE.
-    // eh_frame is byte/reloc-identical to LLVM (CIE/FDE/section-flags verified) and uses only
-    // non-scattered relocs; personality is a defined absolute pointer. One link issue remains
-    // (ld 0x1FC0) so it stays gated.
+    //
+    // BLOCKER (eh_frame gated off): the table bytes, CIE/FDE layout, section flags (0x6800000b),
+    // and all SUB/UNSIGNED pointer pairs are byte-identical to LLVM and link fine. The one piece
+    // that does not is the CIE personality, which macOS ld requires as a GOT-indirect pointer
+    // (DW_EH_PE 0x9b, ARM64_RELOC_POINTER_TO_GOT) whose field holds the pcrel delta `-pers_field`.
+    // object 0.39.1 (the latest release) cannot emit this:
+    //   * write_relocation has no aarch64 GotRelative mapping, so POINTER_TO_GOT can only be set via
+    //     explicit RelocationFlags::MachO.
+    //   * macho_adjust_addend only applies pcrel_offset for i386/x86_64, so the GOT field stays 0 and
+    //     ld resolves it absolute -> "address 0x1FC0 not in any section".
+    //   * a non-zero addend is written as ARM64_RELOC_ADDEND with r_symbolnum=addend, which ld
+    //     rejects in eh_frame -> "r_symbolnum out of range". A preset field is read back as that
+    //     same implicit addend, so it also becomes ADDEND. Direct/abs personality is rejected too.
+    // Newer object: 0.39.1 IS latest; it does not fix this. Fixes: patch the personality field to
+    // -pers_field in the final bytes (addend 0, no ADDEND reloc), or upstream aarch64 POINTER_TO_GOT.
     let any_eh = false && encoded.iter().any(|f| !f.call_sites.is_empty());
     let mut eh_bytes: Vec<u8> = Vec::new();
     let mut fde_off: Vec<Option<u32>> = vec![None; encoded.len()];
@@ -173,11 +185,11 @@ pub fn emit_object(module: &MachModule) -> Vec<u8> {
     if any_eh {
         // CIE: aug "zPLR", code_align=1, data_align=-8, ret_reg=30. P=pcrel|sdata4(0x10) to a local
         // stub that tail-calls the personality; L/R=pcrel|sdata4(0x10). Init CFI: def_cfa r31,0.
-        let cie = b"\x00\x00\x00\x00\x01zPLR\x00\x01\x78\x1e\x0b\x00";
-        eh_bytes.extend_from_slice(&0x1cu32.to_le_bytes());
+        let cie = b"\x00\x00\x00\x00\x01zPLR\x00\x01\x78\x1e\x07\x9b";
+        eh_bytes.extend_from_slice(&0x18u32.to_le_bytes());
         eh_bytes.extend_from_slice(cie);
         pers_field = eh_bytes.len();
-        eh_bytes.extend_from_slice(&0u64.to_le_bytes()); // personality abs ptr -> stub (UNSIGND)
+        eh_bytes.extend_from_slice(&0u32.to_le_bytes()); // personality (GOT pcrel; field patched post-write)
         eh_bytes.extend_from_slice(&[0x10, 0x10, 0x0c, 0x1f, 0x00]);
     }
 
@@ -246,8 +258,8 @@ pub fn emit_object(module: &MachModule) -> Vec<u8> {
         let u32r = macho_flags(RelocKind::Unsigned32);
         let got = macho_flags(RelocKind::PointerToGot32);
         let pers = *symbols.entry("_rust_eh_personality".into()).or_insert_with(|| add_undefined(&mut obj, "_rust_eh_personality"));
-        let _ = (sub32, u32r, pers_slot, got);
-        obj.add_relocation(ehs, Relocation { offset: ehbase + pers_field as u64, symbol: pers, addend: 0, flags: unsigned }).unwrap();
+        let _ = (sub32, u32r, pers_slot);
+        obj.add_relocation(ehs, Relocation { offset: ehbase + pers_field as u64, symbol: pers, addend: 0, flags: got }).unwrap();
         for (i, f) in encoded.iter().enumerate() {
             let Some(fo) = fde_off[i] else { continue };
             let func_id = symbols[&f.name];
@@ -262,7 +274,14 @@ pub fn emit_object(module: &MachModule) -> Vec<u8> {
         }
     }
 
-    let bytes = obj.write().expect("failed to write Mach-O object");
+    let mut bytes = obj.write().expect("failed to write Mach-O object");
+    if any_eh {
+        let cie = b"\x18\x00\x00\x00\x00\x00\x00\x00\x01zPLR";
+        if let Some(p) = bytes.windows(cie.len()).position(|w| w == cie) {
+            let f = p + pers_field;
+            bytes[f..f + 4].copy_from_slice(&(-(pers_field as i32)).to_le_bytes());
+        }
+    }
     bytes
 }
 
@@ -363,7 +382,7 @@ fn macho_flags(kind: RelocKind) -> RelocationFlags {
         RelocKind::Subtractor64 => (object::macho::ARM64_RELOC_SUBTRACTOR, false, 3),
         RelocKind::Subtractor32 => (object::macho::ARM64_RELOC_SUBTRACTOR, false, 2),
         RelocKind::Unsigned32 => (object::macho::ARM64_RELOC_UNSIGNED, false, 2),
-        RelocKind::PointerToGot32 => (object::macho::ARM64_RELOC_POINTER_TO_GOT, false, 2),
+        RelocKind::PointerToGot32 => (object::macho::ARM64_RELOC_POINTER_TO_GOT, true, 2),
     };
     RelocationFlags::MachO { r_type, r_pcrel, r_length }
 }
