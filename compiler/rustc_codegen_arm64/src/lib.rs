@@ -10,12 +10,17 @@
 //! These are deliberately unimplemented; the backend fails loudly (via `todo!`) rather than
 //! miscompiling when it hits them, so they show up as clear ICEs instead of wrong runtime results.
 //!
-//! - **SIMD / vector types.** Vector values live in frame slots and the `simd_*` intrinsics are
-//!   emitted as per-lane loops over those slots (correct, matching portable-SIMD semantics, but not
-//!   fast). Supported: `splat`, comparisons, bitwise ops, `bitmask`, `reduce_all`/`any`, `shuffle`
-//!   (any lane size), `extract`, `insert`, integer `add`/`sub`/`mul`, `shl`/`shr`, lane casts, and
-//!   the floating-point ops `add`/`sub`/`mul`/`div`/`neg`, `fabs`/`fsqrt`/`ceil`/`floor`/`round`/
-//!   `trunc`, and `fma`. A handful of `llvm.aarch64.neon.*` ops that the generic `simd_*` family
+//! - **SIMD / vector types.** Vector values live in frame slots. Native-width vectors (exactly 8 or
+//!   16 bytes) use real NEON instructions for the common arithmetic and bitwise operations —
+//!   integer `add`/`sub`/`mul` (`add`/`sub`/`mul v.Ns`), the float `add`/`sub`/`mul`/`div`
+//!   (`fadd`/`fsub`/`fmul`/`fdiv`), and `and`/`or`/`xor` — by loading the operands into `v`
+//!   registers around a single `q`/`d` load/store. Everything else, and any wider-than-128-bit
+//!   vector (and the 64-bit-lane integer multiply, which NEON lacks), is emitted as a per-lane loop
+//!   over the slot (correct, matching portable-SIMD semantics, but not fast). Supported across these
+//!   two paths: `splat`, comparisons, bitwise ops, `bitmask`, `reduce_all`/`any`, `shuffle` (any
+//!   lane size), `extract`, `insert`, `select`, integer `add`/`sub`/`mul`/`div`/`rem`, `shl`/`shr`,
+//!   lane casts, and the floating-point ops `add`/`sub`/`mul`/`div`/`rem`/`neg`,
+//!   `fabs`/`fsqrt`/`ceil`/`floor`/`round`/`trunc`, and `fma`. A handful of `llvm.aarch64.neon.*` ops that the generic `simd_*` family
 //!   can't express are also lowered lane-by-lane: `umaxp` (pairwise max), `tbl1` (byte table
 //!   lookup), `uaddlp`/`saddlp` (pairwise-add-long), `addp` (pairwise add), and `umull`/`smull`
 //!   (widening multiply) — enough for the portable-SIMD substring/slice search reached by

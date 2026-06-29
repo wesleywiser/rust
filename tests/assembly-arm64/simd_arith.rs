@@ -11,8 +11,9 @@
 use std::intrinsics::simd::{simd_div, simd_rem};
 use std::simd::{f32x4, i32x4, simd_swizzle, u32x4};
 
+// Native-width integer add is a single NEON `add` over `v` registers.
 // CHECK-LABEL: _add4:
-// CHECK: add x{{[0-9]+}}
+// CHECK: add v{{[0-9]+}}.4s, v{{[0-9]+}}.4s, v{{[0-9]+}}.4s
 #[no_mangle]
 pub fn add4(a: u32x4, b: u32x4) -> u32x4 {
     a + b
@@ -52,9 +53,9 @@ pub unsafe extern "C" fn remu(a: u32x4, b: u32x4) -> u32x4 {
     simd_rem(a, b)
 }
 
-// Float SIMD divide uses the FP unit; float remainder calls `fmodf` per lane.
+// Float SIMD divide is a single NEON `fdiv` over `v` registers; float remainder calls `fmodf`.
 // CHECK-LABEL: _divf:
-// CHECK: fdiv s{{[0-9]+}}, s{{[0-9]+}}, s{{[0-9]+}}
+// CHECK: fdiv v{{[0-9]+}}.4s, v{{[0-9]+}}.4s, v{{[0-9]+}}.4s
 #[no_mangle]
 pub unsafe extern "C" fn divf(a: f32x4, b: f32x4) -> f32x4 {
     simd_div(a, b)

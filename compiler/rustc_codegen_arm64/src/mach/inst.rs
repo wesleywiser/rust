@@ -287,6 +287,12 @@ pub enum Inst {
     /// Three-register ARMv8 crypto instruction (`sha256h`/`sha256h2`/`sha256su1`, `sha1c`/`sha1p`/
     /// `sha1m`/`sha1su0`). `rd` is read-modify-write.
     CryptoThree { op: CryptoThreeOp, rd: Vreg, rn: Vreg, rm: Vreg },
+    /// Three-register NEON "3-same" vector instruction (`add`/`sub`/`mul`, `and`/`orr`/`eor`,
+    /// `fadd`/`fsub`/`fmul`/`fdiv`). `q` selects a 128-bit (`true`) vs 64-bit (`false`) vector; the
+    /// 2-bit `size` field (bits 23:22) carries the integer lane size (`00`/`01`/`10`/`11` =
+    /// 8/16/32/64-bit) or, for the float ops, the single `sz` bit (`0`=f32, `1`=f64). Bitwise ops
+    /// fix `size` in their base, so they pass `0`.
+    SimdThree { op: SimdOp, q: bool, size: u8, rd: Vreg, rn: Vreg, rm: Vreg },
 
     /// `ldar`/`ldarb`/`ldarh` — load-acquire (atomic acquire load).
     LoadAcq { size: MemSize, rt: Gpr, rn: Gpr },
@@ -376,6 +382,21 @@ pub enum CryptoThreeOp {
     Sha1p,
     Sha1m,
     Sha1su0,
+}
+
+/// NEON "3-same" three-register vector opcode (see [`Inst::SimdThree`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SimdOp {
+    Add,
+    Sub,
+    Mul,
+    And,
+    Orr,
+    Eor,
+    Fadd,
+    Fsub,
+    Fmul,
+    Fdiv,
 }
 
 /// One-operand floating-point opcode.
@@ -792,6 +813,26 @@ impl Inst {
                     CryptoThreeOp::Sha1su0 => 0x5E00_3000,
                 };
                 base | (rm.encoding() << 16) | (rn.encoding() << 5) | rd.encoding()
+            }
+            Inst::SimdThree { op, q, size, rd, rn, rm } => {
+                let base: u32 = match op {
+                    SimdOp::Add => 0x0E20_8400,
+                    SimdOp::Sub => 0x2E20_8400,
+                    SimdOp::Mul => 0x0E20_9C00,
+                    SimdOp::And => 0x0E20_1C00,
+                    SimdOp::Orr => 0x0EA0_1C00,
+                    SimdOp::Eor => 0x2E20_1C00,
+                    SimdOp::Fadd => 0x0E20_D400,
+                    SimdOp::Fsub => 0x0EA0_D400,
+                    SimdOp::Fmul => 0x2E20_DC00,
+                    SimdOp::Fdiv => 0x2E20_FC00,
+                };
+                debug_assert!(size < 4, "NEON size/sz field is 2 bits");
+                base | ((q as u32) << 30)
+                    | ((size as u32) << 22)
+                    | (rm.encoding() << 16)
+                    | (rn.encoding() << 5)
+                    | rd.encoding()
             }
 
             Inst::LoadAcq { size, rt, rn } => {
@@ -1295,6 +1336,30 @@ mod tests {
         assert_eq!(Inst::CryptoTwo { op: CryptoTwoOp::Sha1h, rd: V0, rn: V1 }.encode(), 0x5E280820);
         assert_eq!(Inst::CryptoThree { op: CryptoThreeOp::Sha1su0, rd: V0, rn: V1, rm: V2 }.encode(), 0x5E023020);
         assert_eq!(Inst::CryptoTwo { op: CryptoTwoOp::Sha1su1, rd: V0, rn: V1 }.encode(), 0x5E281820);
+    }
+
+    #[test]
+    fn simd_three_encodings() {
+        // Integer add across arrangements (8b/8h/4s/2d and the 64-bit `8b`).
+        assert_eq!(Inst::SimdThree { op: SimdOp::Add, q: true, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x4E228420);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Add, q: true, size: 1, rd: V0, rn: V1, rm: V2 }.encode(), 0x4E628420);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Add, q: true, size: 2, rd: V0, rn: V1, rm: V2 }.encode(), 0x4EA28420);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Add, q: true, size: 3, rd: V0, rn: V1, rm: V2 }.encode(), 0x4EE28420);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Add, q: false, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x0E228420);
+        // sub / mul.
+        assert_eq!(Inst::SimdThree { op: SimdOp::Sub, q: true, size: 2, rd: V0, rn: V1, rm: V2 }.encode(), 0x6EA28420);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Mul, q: true, size: 2, rd: V0, rn: V1, rm: V2 }.encode(), 0x4EA29C20);
+        // Bitwise (size field 0; `q` selects 8b/16b).
+        assert_eq!(Inst::SimdThree { op: SimdOp::And, q: true, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x4E221C20);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Orr, q: true, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x4EA21C20);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Eor, q: true, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x6E221C20);
+        // Float (size = 0 for f32, 1 for f64).
+        assert_eq!(Inst::SimdThree { op: SimdOp::Fadd, q: true, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x4E22D420);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Fadd, q: true, size: 1, rd: V0, rn: V1, rm: V2 }.encode(), 0x4E62D420);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Fsub, q: true, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x4EA2D420);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Fmul, q: true, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x6E22DC20);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Fdiv, q: true, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x6E22FC20);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Fdiv, q: true, size: 1, rd: V0, rn: V1, rm: V2 }.encode(), 0x6E62FC20);
     }
 
     #[test]

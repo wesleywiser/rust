@@ -37,7 +37,7 @@ use crate::mach::func::MachFunction;
 use crate::mach::frame::FrameLayout;
 use crate::mach::inst::{
     AddSub, AtomicRmwOp, CondSel, CryptoThreeOp, CryptoTwoOp, DataProc1, DataProc2, DmbOption, FpOp1,
-    FpOp2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex, SymRef,
+    FpOp2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex, SimdOp, SymRef,
 };
 use crate::mach::reg::{
     Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V1, V16, V17, V18, X0, X1, X2, X3, X4, X9,
@@ -485,10 +485,23 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.emit(Inst::Sxt { from, to: OperandSize::S64, rd: reg, rn: reg });
     }
 
-    /// `simd_and`/`simd_or`/`simd_xor`: lane-wise bitwise operation. Integer lanes only.
+    /// `simd_and`/`simd_or`/`simd_xor`: lane-wise bitwise operation. Native-width vectors use a
+    /// single NEON `and`/`orr`/`eor`; wider vectors fall through to the per-lane path. Integer lanes
+    /// only.
     fn emit_simd_binop(&mut self, op: LogicOp, a: Value, b: Value) -> Value {
         let vec_ty = a.ty();
         let (elem, count, es) = self.vector_info(vec_ty);
+        if let Some((q, _)) = self.simd_native(vec_ty) {
+            let sop = match op {
+                LogicOp::And => Some(SimdOp::And),
+                LogicOp::Orr => Some(SimdOp::Orr),
+                LogicOp::Eor => Some(SimdOp::Eor),
+                _ => None,
+            };
+            if let Some(sop) = sop {
+                return self.emit_simd_three(sop, q, 0, a, b, vec_ty);
+            }
+        }
         let aoff = self.vector_to_slot(a);
         let boff = self.vector_to_slot(b);
         let (Some(aoff), Some(boff)) = (aoff, boff) else {
@@ -513,15 +526,92 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         Value::Slot { off: roff, ty: vec_ty }
     }
 
-    /// Lane-wise SIMD arithmetic (`simd_add`/`simd_sub`/`simd_mul`/`simd_div`/`simd_rem`). Integer
-    /// lanes use the GPR add/sub/mul and the divide unit (`udiv`/`sdiv`, with `msub` for remainder);
-    /// floating-point lanes use the FP unit, except `rem`, which has no instruction and goes to the
-    /// C library `fmod`/`fmodf` per lane. `signed` selects `sdiv`/`srem` for integer `div`/`rem`
-    /// (and is ignored otherwise); signed sub-word lanes are sign-extended first since loads
-    /// zero-extend.
+    /// The NEON arrangement `(q, size)` for a vector that fits a single `v` register — exactly 8
+    /// (`q = false`) or 16 (`q = true`) bytes — or `None` for wider vectors (handled by the scalar
+    /// per-lane path). `size` is the integer lane-size code (`0`/`1`/`2`/`3` = 8/16/32/64-bit); the
+    /// float ops re-derive their single `sz` bit from the element size.
+    fn simd_native(&self, vec_ty: Type) -> Option<(bool, u8)> {
+        let (_elem, _count, es) = self.vector_info(vec_ty);
+        let (vbytes, _) = self.cx.type_size_align(vec_ty);
+        let q = match vbytes {
+            16 => true,
+            8 => false,
+            _ => return None,
+        };
+        let size = match es {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            _ => return None,
+        };
+        Some((q, size))
+    }
+
+    /// Load (`load`) or store a native-width vector (`q` ? 16 : 8 bytes) between frame offset `off`
+    /// and the `v` register `vreg`.
+    fn emit_vec_mem(&mut self, load: bool, q: bool, vreg: Vreg, off: u64) {
+        if q {
+            self.emit_q(load, vreg, off);
+        } else {
+            self.emit_mem_fp(load, FpSize::S64, vreg, SP, off);
+        }
+    }
+
+    /// Emit a NEON 3-same vector op (`rd = a <op> b`) on native-width vectors, moving the operands
+    /// through `v` registers. `size` is the encoding's size/`sz` field for `op`.
+    fn emit_simd_three(
+        &mut self,
+        op: SimdOp,
+        q: bool,
+        size: u8,
+        a: Value,
+        b: Value,
+        vec_ty: Type,
+    ) -> Value {
+        let aoff = self.vector_to_slot(a);
+        let boff = self.vector_to_slot(b);
+        let (Some(aoff), Some(boff)) = (aoff, boff) else {
+            return Value::Undef { ty: vec_ty };
+        };
+        self.emit_vec_mem(true, q, V16, aoff);
+        self.emit_vec_mem(true, q, V17, boff);
+        self.emit(Inst::SimdThree { op, q, size, rd: V16, rn: V16, rm: V17 });
+        let (vsize, valign) = self.cx.type_size_align(vec_ty);
+        let roff = self.alloc_slot(vsize, valign);
+        self.emit_vec_mem(false, q, V16, roff);
+        Value::Slot { off: roff, ty: vec_ty }
+    }
+
+    /// Lane-wise SIMD arithmetic (`simd_add`/`simd_sub`/`simd_mul`/`simd_div`/`simd_rem`).
+    /// Native-width (8/16-byte) vectors use a single NEON instruction (`add`/`sub`/`mul`,
+    /// `fadd`/`fsub`/`fmul`/`fdiv`) over `v` registers. The cases without a NEON instruction —
+    /// integer `div`/`rem`, 64-bit-lane integer `mul`, and float `rem` — plus any wider-than-128-bit
+    /// vector fall through to the per-lane path below: integer lanes use the GPR divide unit
+    /// (`udiv`/`sdiv` + `msub`), float `rem` calls `fmod`/`fmodf` per lane. `signed` selects
+    /// `sdiv`/`srem` (sign-extending sub-word lanes first, since loads zero-extend).
     fn emit_simd_arith(&mut self, a: Value, b: Value, kind: SimdArith, signed: bool) -> Value {
         let vec_ty = a.ty();
         let (elem, count, es) = self.vector_info(vec_ty);
+        let is_float = type_is_float(self.cx, elem);
+        // NEON fast path for native-width vectors with a corresponding vector instruction.
+        if let Some((q, isize)) = self.simd_native(vec_ty) {
+            let fsz = (es == 8) as u8; // float sz bit: 0 = f32, 1 = f64
+            let neon = match (kind, is_float) {
+                (SimdArith::Add, false) => Some((SimdOp::Add, isize)),
+                (SimdArith::Sub, false) => Some((SimdOp::Sub, isize)),
+                // NEON has no 64-bit-lane integer multiply.
+                (SimdArith::Mul, false) if es != 8 => Some((SimdOp::Mul, isize)),
+                (SimdArith::Add, true) => Some((SimdOp::Fadd, fsz)),
+                (SimdArith::Sub, true) => Some((SimdOp::Fsub, fsz)),
+                (SimdArith::Mul, true) => Some((SimdOp::Fmul, fsz)),
+                (SimdArith::Div, true) => Some((SimdOp::Fdiv, fsz)),
+                _ => None,
+            };
+            if let Some((op, size)) = neon {
+                return self.emit_simd_three(op, q, size, a, b, vec_ty);
+            }
+        }
         let aoff = self.vector_to_slot(a);
         let boff = self.vector_to_slot(b);
         let (Some(aoff), Some(boff)) = (aoff, boff) else {
@@ -529,7 +619,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         };
         let (size, align) = self.cx.type_size_align(vec_ty);
         let roff = self.alloc_slot(size, align);
-        if type_is_float(self.cx, elem) {
+        if is_float {
             let fs = fp_size(self.cx, elem);
             // `rem` is `fmod`/`fmodf` per lane (no FP remainder instruction).
             if kind == SimdArith::Rem {
