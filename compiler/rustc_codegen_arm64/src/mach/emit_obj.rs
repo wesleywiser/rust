@@ -21,11 +21,13 @@ pub fn emit_object(module: &MachModule) -> Vec<u8> {
     obj.set_mangling(object::write::Mangling::None);
 
     // Emit an `LC_BUILD_VERSION` load command so the linker doesn't warn about a missing platform.
-    // FIXME: derive the minimum OS / SDK version from the target instead of hard-coding 11.0.
+    // The minimum-OS version is the target's deployment target, captured from the session when the
+    // module was built. The SDK version is omitted (`0`) \u2014 it does not influence the object and is
+    // re-specified when linking the final binary, matching what rustc/LLVM do.
     let mut build_version = object::write::MachOBuildVersion::default();
     build_version.platform = object::macho::PLATFORM_MACOS;
-    build_version.minos = 0x000B_0000; // 11.0.0
-    build_version.sdk = 0x000B_0000; // 11.0.0
+    build_version.minos = module.macho_min_os;
+    build_version.sdk = 0;
     obj.set_macho_build_version(build_version);
 
     let text = obj.section_id(StandardSection::Text);

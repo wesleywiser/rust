@@ -157,13 +157,22 @@ pub struct CodegenCx<'tcx> {
     local_gen_sym_counter: Cell<usize>,
 }
 
+/// The target's macOS deployment version, packed as `major << 16 | minor << 8 | patch` for the
+/// Mach-O `LC_BUILD_VERSION` load command (the same encoding rustc/LLVM use).
+pub(crate) fn macho_min_os(tcx: TyCtxt<'_>) -> u32 {
+    let v = tcx.sess.apple_deployment_target();
+    ((v.major as u32) << 16) | ((v.minor as u32) << 8) | (v.patch as u32)
+}
+
 impl<'tcx> CodegenCx<'tcx> {
     pub fn new(tcx: TyCtxt<'tcx>, _cgu_name: Symbol) -> CodegenCx<'tcx> {
+        let mut module = MachModule::new();
+        module.macho_min_os = macho_min_os(tcx);
         CodegenCx {
             tcx,
             types: RefCell::new(Interner::default()),
             symbols: RefCell::new(Interner::default()),
-            module: RefCell::new(MachModule::new()),
+            module: RefCell::new(module),
             cur_fn: RefCell::new(None),
             cur_instance: Cell::new(None),
             instances: RefCell::new(FxHashMap::default()),

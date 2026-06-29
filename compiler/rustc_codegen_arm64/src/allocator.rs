@@ -24,6 +24,7 @@ use crate::mach::reg::LR;
 /// Build the allocator shim module for the given set of allocator methods.
 pub(crate) fn codegen(tcx: TyCtxt<'_>, methods: &[AllocatorMethod]) -> MachModule {
     let mut module = MachModule::new();
+    module.macho_min_os = crate::context::macho_min_os(tcx);
     for method in methods {
         let wrapper = mach_symbol(tcx, &global_fn_name(method.name));
         let target = mach_symbol(tcx, &default_fn_name(method.name));

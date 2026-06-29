@@ -34,15 +34,18 @@ pub struct DataItem {
 }
 
 /// All code and data produced for one codegen unit.
-#[derive(Default)]
 pub struct MachModule {
     pub functions: Vec<MachFunction>,
     pub data: Vec<DataItem>,
+    /// Packed macOS deployment version (`major << 16 | minor << 8 | patch`) for the object's
+    /// `LC_BUILD_VERSION` load command, captured from the session target. Defaults to 11.0, the
+    /// first Apple-Silicon macOS, when no session is available.
+    pub macho_min_os: u32,
 }
 
 impl MachModule {
     pub fn new() -> MachModule {
-        MachModule::default()
+        MachModule { functions: Vec::new(), data: Vec::new(), macho_min_os: 0x000B_0000 }
     }
 
     pub fn push_function(&mut self, func: MachFunction) {
@@ -51,5 +54,11 @@ impl MachModule {
 
     pub fn push_data(&mut self, data: DataItem) {
         self.data.push(data);
+    }
+}
+
+impl Default for MachModule {
+    fn default() -> Self {
+        MachModule::new()
     }
 }
