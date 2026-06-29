@@ -158,7 +158,13 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
                 let (prov, offset) = ptr.prov_and_relative_offset();
                 let alloc_id = prov.alloc_id();
                 let sym = match self.tcx.global_alloc(alloc_id) {
-                    GlobalAlloc::Function { instance, .. } => self.function_sym(self.get_fn(instance)),
+                    GlobalAlloc::Function { instance, .. } => {
+                        let sym = self.function_sym(self.get_fn(instance));
+                        if self.tcx.is_foreign_item(instance.def_id()) {
+                            self.got_syms.borrow_mut().insert(sym);
+                        }
+                        sym
+                    }
                     GlobalAlloc::Static(def_id) => self.get_static_sym(def_id),
                     GlobalAlloc::Memory(alloc) => self.alloc_symbol(alloc.inner()),
                     GlobalAlloc::VTable(ty, dyn_ty) => {

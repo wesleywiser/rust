@@ -10,6 +10,7 @@
 
 unsafe extern "C" {
     static environ: *const *const u8;
+    fn utimes(p: *const u8, t: *const u8) -> i32;
 }
 
 // CHECK-LABEL: _read_environ:
@@ -18,4 +19,14 @@ unsafe extern "C" {
 #[no_mangle]
 pub fn read_environ() -> *const *const u8 {
     unsafe { environ }
+}
+
+// Taking the *address* of a foreign function also needs the GOT (a direct call uses bl, but a fn
+// pointer cannot be a direct adrp+add — `_utimes` does not have address). xsv's filetime dep hit this.
+// CHECK-LABEL: _utimes_addr:
+// CHECK: adrp x{{[0-9]+}}, _utimes@GOTPAGE
+// CHECK: ldr x{{[0-9]+}}, [x{{[0-9]+}}, _utimes@GOTPAGEOFF]
+#[no_mangle]
+pub fn utimes_addr() -> usize {
+    utimes as usize
 }
