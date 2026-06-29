@@ -13,11 +13,24 @@
 //! - **SIMD / vector types.** Vector values live in frame slots and the `simd_*` intrinsics are
 //!   emitted as per-lane loops over those slots (correct, matching portable-SIMD semantics, but not
 //!   fast). Supported: `splat`, comparisons, bitwise ops, `bitmask`, `reduce_all`/`any`, `shuffle`
-//!   (any lane size), `extract`, integer `add`/`sub`/`mul`, `shl`/`shr`, lane casts, and the
-//!   floating-point ops `add`/`sub`/`mul`/`div`/`neg`, `fabs`/`fsqrt`/`ceil`/`floor`/`round`/`trunc`,
-//!   and `fma`. Enough for the portable-SIMD substring/slice search reached by `str::contains`/`find`,
-//!   the `hashbrown` SIMD group scan behind `HashMap`/`HashSet`, and rand/chacha20. A true NEON
-//!   register model (operating on `q`/`v` registers rather than memory) is not implemented.
+//!   (any lane size), `extract`, `insert`, integer `add`/`sub`/`mul`, `shl`/`shr`, lane casts, and
+//!   the floating-point ops `add`/`sub`/`mul`/`div`/`neg`, `fabs`/`fsqrt`/`ceil`/`floor`/`round`/
+//!   `trunc`, and `fma`. A handful of `llvm.aarch64.neon.*` ops that the generic `simd_*` family
+//!   can't express are also lowered lane-by-lane: `umaxp` (pairwise max), `tbl1` (byte table
+//!   lookup), `uaddlp`/`saddlp` (pairwise-add-long), `addp` (pairwise add), and `umull`/`smull`
+//!   (widening multiply) — enough for the portable-SIMD substring/slice search reached by
+//!   `str::contains`/`find`, the `hashbrown` SIMD group scan behind `HashMap`/`HashSet`,
+//!   rand/chacha20, and the NEON `adler32` checksum in `simd-adler32`. A true NEON register model
+//!   (operating on `q`/`v` registers rather than memory) is not implemented.
+//!
+//! - **Inline assembly and ARMv8 cryptography are not supported.** `asm!`/`global_asm!`
+//!   (`codegen_inline_asm`) would require a textual AArch64 assembler, which this object-emitting
+//!   backend does not have, so any crate using inline asm fails loudly (`zlib-rs`, `sha2`,
+//!   `constant_time_eq`, ...). Likewise the ARMv8 crypto-extension intrinsics
+//!   (`llvm.aarch64.crypto.{aese,aesmc,sha256h,sha1h,...}`, used by `aes`/`sha1`/`sha2`) are not
+//!   lowered. Crates with these in their dependency tree can usually be built with their software
+//!   fallbacks (e.g. `--cfg aes_force_soft`, the `sha2`/`sha1` `force-soft` features). The dedicated
+//!   AArch64 `crc32{c}{b,h,w,x}` instructions *are* supported (used by `crc32fast`).
 //!
 //! Implemented since the first cut, for reference:
 //!

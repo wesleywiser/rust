@@ -272,10 +272,30 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
                 DataProc2::Lslv => "lsl",
                 DataProc2::Lsrv => "lsr",
                 DataProc2::Asrv => "asr",
+                DataProc2::Crc32b => "crc32b",
+                DataProc2::Crc32h => "crc32h",
+                DataProc2::Crc32w => "crc32w",
+                DataProc2::Crc32x => "crc32x",
+                DataProc2::Crc32cb => "crc32cb",
+                DataProc2::Crc32ch => "crc32ch",
+                DataProc2::Crc32cw => "crc32cw",
+                DataProc2::Crc32cx => "crc32cx",
             };
+            // The CRC32 accumulator (`rd`/`rn`) is always a 32-bit register; only its data operand
+            // (`rm`) widens. For the other 2-source ops all three operands share `size`.
+            let is_crc = !matches!(
+                op,
+                DataProc2::Udiv | DataProc2::Sdiv | DataProc2::Lslv | DataProc2::Lsrv | DataProc2::Asrv
+            );
+            let acc_size = if is_crc { OperandSize::S32 } else { size };
             line(
                 out,
-                &format!("{mnem} {}, {}, {}", rd.name_zr(size), rn.name_zr(size), rm.name_zr(size)),
+                &format!(
+                    "{mnem} {}, {}, {}",
+                    rd.name_zr(acc_size),
+                    rn.name_zr(acc_size),
+                    rm.name_zr(size)
+                ),
             );
         }
 

@@ -58,6 +58,18 @@ pub enum DataProc2 {
     Lslv,
     Lsrv,
     Asrv,
+    /// `crc32{b,h,w,x}` — one CRC32 step (the zlib/PNG polynomial). The suffix is the data width;
+    /// the accumulator (`rd`/`rn`) is always 32-bit, so the operand `size` only selects the `rm`
+    /// data-operand width (32-bit for `b`/`h`/`w`, 64-bit for `x`).
+    Crc32b,
+    Crc32h,
+    Crc32w,
+    Crc32x,
+    /// `crc32c{b,h,w,x}` — the CRC32C (Castagnoli) polynomial variants.
+    Crc32cb,
+    Crc32ch,
+    Crc32cw,
+    Crc32cx,
 }
 
 /// One-source data-processing opcode.
@@ -465,6 +477,14 @@ impl Inst {
                     DataProc2::Lslv => 0b001000,
                     DataProc2::Lsrv => 0b001001,
                     DataProc2::Asrv => 0b001010,
+                    DataProc2::Crc32b => 0b010000,
+                    DataProc2::Crc32h => 0b010001,
+                    DataProc2::Crc32w => 0b010010,
+                    DataProc2::Crc32x => 0b010011,
+                    DataProc2::Crc32cb => 0b010100,
+                    DataProc2::Crc32ch => 0b010101,
+                    DataProc2::Crc32cw => 0b010110,
+                    DataProc2::Crc32cx => 0b010111,
                 };
                 (size.sf() << 31)
                     | (0b11010110 << 21)
@@ -878,6 +898,30 @@ mod tests {
             }
             .encode(),
             0x9AC20820
+        );
+        // crc32b w0, w1, w2  (32-bit data operand -> sf=0)
+        assert_eq!(
+            Inst::DataProc2 { op: DataProc2::Crc32b, size: OperandSize::S32, rd: X0, rn: X1, rm: X2 }
+                .encode(),
+            0x1AC24020
+        );
+        // crc32x w0, w1, x2  (64-bit data operand -> sf=1)
+        assert_eq!(
+            Inst::DataProc2 { op: DataProc2::Crc32x, size: OperandSize::S64, rd: X0, rn: X1, rm: X2 }
+                .encode(),
+            0x9AC24C20
+        );
+        // crc32cb w0, w1, w2  (Castagnoli)
+        assert_eq!(
+            Inst::DataProc2 { op: DataProc2::Crc32cb, size: OperandSize::S32, rd: X0, rn: X1, rm: X2 }
+                .encode(),
+            0x1AC25020
+        );
+        // crc32cx w0, w1, x2  (Castagnoli, 64-bit data)
+        assert_eq!(
+            Inst::DataProc2 { op: DataProc2::Crc32cx, size: OperandSize::S64, rd: X0, rn: X1, rm: X2 }
+                .encode(),
+            0x9AC25C20
         );
         // clz x0, x1
         assert_eq!(

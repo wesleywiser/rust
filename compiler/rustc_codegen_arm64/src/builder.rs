@@ -716,6 +716,108 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         Value::Slot { off: roff, ty: result_ty }
     }
 
+    /// The backend type of an intrinsic call's return value, derived from the monomorphized
+    /// instance signature. Used by the NEON intrinsics whose result vector type differs from their
+    /// argument types (the widening / pairwise-long ops).
+    fn intrinsic_result_ty(&self, instance: Instance<'tcx>) -> Type {
+        let tcx = self.cx.tcx;
+        let fn_ty = instance.ty(tcx, ty::TypingEnv::fully_monomorphized());
+        let sig = fn_ty.fn_sig(tcx);
+        let ret = tcx.instantiate_bound_regions_with_erased(sig.output());
+        self.cx.immediate_backend_type(self.cx.layout_of(ret))
+    }
+
+    /// `llvm.aarch64.neon.uaddlp`/`saddlp` (`vpaddlq_*`, `vpadalq_*`): pairwise add long. Sums each
+    /// adjacent pair of input lanes and widens the result to the next-larger lane type, so the
+    /// output has half as many lanes. Signed inputs are sign-extended before the add (loads
+    /// zero-extend). Integer lanes only.
+    fn emit_neon_addlp(&mut self, a: Value, signed: bool, ret_ty: Type) -> Value {
+        let (ielem, _icount, ies) = self.vector_info(a.ty());
+        let Some(aoff) = self.vector_to_slot(a) else {
+            return Value::Undef { ty: ret_ty };
+        };
+        let (oelem, ocount, oes) = self.vector_info(ret_ty);
+        let (size, align) = self.cx.type_size_align(ret_ty);
+        let roff = self.alloc_slot(size, align);
+        let imsize = mem_size(self.cx, ielem);
+        let omsize = mem_size(self.cx, oelem);
+        for j in 0..ocount {
+            self.emit_mem_gpr(true, false, imsize, X10, SP, aoff + (2 * j) * ies);
+            self.emit_mem_gpr(true, false, imsize, X11_HACK, SP, aoff + (2 * j + 1) * ies);
+            if signed {
+                self.sign_extend_reg(X10, ies);
+                self.sign_extend_reg(X11_HACK, ies);
+            }
+            self.emit(Inst::AddSubReg { op: AddSub::Add, size: OperandSize::S64, set_flags: false, rd: X10, rn: X10, rm: X11_HACK, amount: 0 });
+            self.emit_mem_gpr(false, false, omsize, X10, SP, roff + j * oes);
+        }
+        Value::Slot { off: roff, ty: ret_ty }
+    }
+
+    /// `llvm.aarch64.neon.addp` (`vpadd_*`): pairwise add. The result's lower half holds the
+    /// adjacent-pair sums of `a`, the upper half those of `b` (same lane width as the inputs).
+    /// Integer lanes only.
+    fn emit_neon_addp(&mut self, a: Value, b: Value, ret_ty: Type) -> Value {
+        let (elem, count, es) = self.vector_info(ret_ty);
+        let aoff = self.vector_to_slot(a);
+        let boff = self.vector_to_slot(b);
+        let (Some(aoff), Some(boff)) = (aoff, boff) else {
+            return Value::Undef { ty: ret_ty };
+        };
+        let (size, align) = self.cx.type_size_align(ret_ty);
+        let roff = self.alloc_slot(size, align);
+        let msize = mem_size(self.cx, elem);
+        let half = count / 2;
+        for (src_off, base) in [(aoff, 0u64), (boff, half)] {
+            for j in 0..half {
+                self.emit_mem_gpr(true, false, msize, X10, SP, src_off + (2 * j) * es);
+                self.emit_mem_gpr(true, false, msize, X11_HACK, SP, src_off + (2 * j + 1) * es);
+                self.emit(Inst::AddSubReg { op: AddSub::Add, size: OperandSize::S64, set_flags: false, rd: X10, rn: X10, rm: X11_HACK, amount: 0 });
+                self.emit_mem_gpr(false, false, msize, X10, SP, roff + (base + j) * es);
+            }
+        }
+        Value::Slot { off: roff, ty: ret_ty }
+    }
+
+    /// `llvm.aarch64.neon.umull`/`smull` (`vmull_*`): widening multiply. Each lane's product is
+    /// computed at double width, so the output lane type is the next size up (the lane count is
+    /// unchanged). Signed inputs are sign-extended first. Integer lanes only.
+    fn emit_neon_mull(&mut self, a: Value, b: Value, signed: bool, ret_ty: Type) -> Value {
+        let (ielem, icount, ies) = self.vector_info(a.ty());
+        let aoff = self.vector_to_slot(a);
+        let boff = self.vector_to_slot(b);
+        let (Some(aoff), Some(boff)) = (aoff, boff) else {
+            return Value::Undef { ty: ret_ty };
+        };
+        let (oelem, _ocount, oes) = self.vector_info(ret_ty);
+        let (size, align) = self.cx.type_size_align(ret_ty);
+        let roff = self.alloc_slot(size, align);
+        let imsize = mem_size(self.cx, ielem);
+        let omsize = mem_size(self.cx, oelem);
+        for i in 0..icount {
+            self.emit_mem_gpr(true, false, imsize, X10, SP, aoff + i * ies);
+            self.emit_mem_gpr(true, false, imsize, X11_HACK, SP, boff + i * ies);
+            if signed {
+                self.sign_extend_reg(X10, ies);
+                self.sign_extend_reg(X11_HACK, ies);
+            }
+            self.emit(Inst::Madd { size: OperandSize::S64, rd: X10, rn: X10, rm: X11_HACK, ra: ZR });
+            self.emit_mem_gpr(false, false, omsize, X10, SP, roff + i * oes);
+        }
+        Value::Slot { off: roff, ty: ret_ty }
+    }
+
+    /// One AArch64 CRC32 step (`crc32{c}{b,h,w,x}`): combine the 32-bit accumulator `acc` with the
+    /// data operand `data`, producing the next accumulator. `size` is the data-operand width
+    /// (`S64` only for the `x`/`cx` forms); the accumulator is always 32-bit.
+    fn emit_crc32(&mut self, op: DataProc2, size: OperandSize, acc: Value, data: Value) -> Value {
+        let ret_ty = acc.ty();
+        self.materialize(acc, X10);
+        self.materialize(data, X11_HACK);
+        self.emit(Inst::DataProc2 { op, size, rd: X10, rn: X10, rm: X11_HACK });
+        self.spill(X10, ret_ty)
+    }
+
 
     /// MSB test reduces to "lane is non-zero". Integer lanes only.
     fn emit_simd_bitmask(&mut self, x: Value, result_ty: Type) -> Value {
@@ -867,6 +969,33 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             self.emit_mem_gpr(true, false, mem_size(self.cx, elem), X10, SP, lane_off);
             self.spill(X10, result_ty)
         }
+    }
+
+    /// `simd_insert`: return a copy of vector `x` with lane `idx` overwritten by scalar `val`.
+    /// (`result_ty` is the same vector type as `x`.)
+    fn emit_simd_insert(&mut self, x: Value, idx: u64, val: Value, result_ty: Type) -> Value {
+        let (elem, count, es) = self.vector_info(x.ty());
+        let Some(xoff) = self.vector_to_slot(x) else {
+            return Value::Undef { ty: result_ty };
+        };
+        let (size, align) = self.cx.type_size_align(result_ty);
+        let roff = self.alloc_slot(size, align);
+        // Copy every lane across first (bit-preserving integer moves work for float lanes too).
+        let msize = mem_size(self.cx, elem);
+        for i in 0..count {
+            self.emit_mem_gpr(true, false, msize, X10, SP, xoff + i * es);
+            self.emit_mem_gpr(false, false, msize, X10, SP, roff + i * es);
+        }
+        // Overwrite the selected lane with the inserted scalar.
+        let lane_off = roff + idx * es;
+        if type_is_float(self.cx, elem) {
+            self.materialize_fp(val, V16);
+            self.emit_mem_fp(false, fp_size(self.cx, elem), V16, SP, lane_off);
+        } else {
+            self.materialize(val, X10);
+            self.emit_mem_gpr(false, false, msize, X10, SP, lane_off);
+        }
+        Value::Slot { off: roff, ty: result_ty }
     }
 }
 
@@ -2566,6 +2695,20 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let r = self.emit_simd_extract(args[0].immediate(), idx, result_ty);
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
+            sym::simd_insert => {
+                let idx = match args[1].immediate() {
+                    Value::Const { bits, .. } => bits as u64,
+                    _ => 0,
+                };
+                let result_ty = self.cx.immediate_backend_type(result_layout);
+                let r = self.emit_simd_insert(
+                    args[0].immediate(),
+                    idx,
+                    args[2].immediate(),
+                    result_ty,
+                );
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
             // `is_val_statically_known(_)` is an optimization hint with no MIR body. This backend
             // performs no such analysis, so it conservatively answers `false`; the only effect is
             // that callers take their runtime (non-constant) path, which is always correct.
@@ -2613,13 +2756,56 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             self.emit(Inst::Isb);
             return Value::Undef { ty: self.ptr_ty() };
         }
-        // Pairwise unsigned maximum (`vpmaxq_u8`, used by memchr's "any match?" fast path).
-        if sym.starts_with("llvm.aarch64.neon.umaxp") {
-            return self.emit_neon_umaxp(args[0].immediate(), args[1].immediate());
+        // NEON vector intrinsics that the generic `simd_*` family can't express. Each operates on
+        // whole vectors living in frame slots and is lowered lane-by-lane. The operation name is
+        // the segment after the `llvm.aarch64.neon.` prefix and before the LLVM type suffix.
+        if let Some(rest) = sym.strip_prefix("llvm.aarch64.neon.") {
+            match rest.split('.').next().unwrap_or(rest) {
+                // Pairwise unsigned maximum (`vpmaxq_u8`, memchr's "any match?" fast path).
+                "umaxp" => return self.emit_neon_umaxp(args[0].immediate(), args[1].immediate()),
+                // Byte table lookup (`vqtbl1q_u8`, aho-corasick's Teddy matcher).
+                "tbl1" => return self.emit_neon_tbl1(args[0].immediate(), args[1].immediate()),
+                // Pairwise add long, widening to the next lane size (`vpaddlq_*`/`vpadalq_*`).
+                "uaddlp" => {
+                    let ret = self.intrinsic_result_ty(instance);
+                    return self.emit_neon_addlp(args[0].immediate(), false, ret);
+                }
+                "saddlp" => {
+                    let ret = self.intrinsic_result_ty(instance);
+                    return self.emit_neon_addlp(args[0].immediate(), true, ret);
+                }
+                // Pairwise add, same lane width (`vpadd_*`).
+                "addp" => {
+                    let ret = self.intrinsic_result_ty(instance);
+                    return self.emit_neon_addp(args[0].immediate(), args[1].immediate(), ret);
+                }
+                // Widening multiply, doubling the lane size (`vmull_*`).
+                "umull" => {
+                    let ret = self.intrinsic_result_ty(instance);
+                    return self.emit_neon_mull(args[0].immediate(), args[1].immediate(), false, ret);
+                }
+                "smull" => {
+                    let ret = self.intrinsic_result_ty(instance);
+                    return self.emit_neon_mull(args[0].immediate(), args[1].immediate(), true, ret);
+                }
+                _ => {}
+            }
         }
-        // Byte table lookup (`vqtbl1q_u8`, used by aho-corasick's Teddy matcher).
-        if sym.starts_with("llvm.aarch64.neon.tbl1") {
-            return self.emit_neon_tbl1(args[0].immediate(), args[1].immediate());
+        // AArch64 CRC32 instructions (`llvm.aarch64.crc32{c}{b,h,w,x}`): one CRC step folding a data
+        // operand (arg 1) into the 32-bit accumulator (arg 0). Used by crc32fast and similar crates.
+        if let Some(step) = sym.strip_prefix("llvm.aarch64.crc32") {
+            let (op, size) = match step {
+                "b" => (DataProc2::Crc32b, OperandSize::S32),
+                "h" => (DataProc2::Crc32h, OperandSize::S32),
+                "w" => (DataProc2::Crc32w, OperandSize::S32),
+                "x" => (DataProc2::Crc32x, OperandSize::S64),
+                "cb" => (DataProc2::Crc32cb, OperandSize::S32),
+                "ch" => (DataProc2::Crc32ch, OperandSize::S32),
+                "cw" => (DataProc2::Crc32cw, OperandSize::S32),
+                "cx" => (DataProc2::Crc32cx, OperandSize::S64),
+                _ => todo!("rustc_codegen_arm64: codegen_llvm_intrinsic_call: {sym}"),
+            };
+            return self.emit_crc32(op, size, args[0].immediate(), args[1].immediate());
         }
         todo!("rustc_codegen_arm64: codegen_llvm_intrinsic_call: {sym}")
     }
