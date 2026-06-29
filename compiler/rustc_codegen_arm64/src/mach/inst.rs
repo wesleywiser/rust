@@ -278,6 +278,16 @@ pub enum Inst {
     /// `fcvt` — floating-point precision conversion (`f32`<->`f64`).
     FpCvt { from: FpSize, to: FpSize, rd: Vreg, rn: Vreg },
 
+    /// `ldr`/`str` of a full 128-bit vector (`q`) register with an unsigned, scaled 12-bit offset.
+    /// Used to move whole vectors between frame slots and `v` registers (e.g. for crypto).
+    LoadStoreQ { load: bool, rt: Vreg, rn: Gpr, offset: u64 },
+    /// Two-register ARMv8 crypto instruction (`aese`/`aesd`/`aesmc`/`aesimc`, `sha256su0`, `sha1h`,
+    /// `sha1su1`). `rd` is read-modify-write for the AES/`su0`/`su1` forms.
+    CryptoTwo { op: CryptoTwoOp, rd: Vreg, rn: Vreg },
+    /// Three-register ARMv8 crypto instruction (`sha256h`/`sha256h2`/`sha256su1`, `sha1c`/`sha1p`/
+    /// `sha1m`/`sha1su0`). `rd` is read-modify-write.
+    CryptoThree { op: CryptoThreeOp, rd: Vreg, rn: Vreg, rm: Vreg },
+
     /// `ldar`/`ldarb`/`ldarh` — load-acquire (atomic acquire load).
     LoadAcq { size: MemSize, rt: Gpr, rn: Gpr },
     /// `stlr`/`stlrb`/`stlrh` — store-release (atomic release store).
@@ -342,6 +352,30 @@ pub enum FpOp2 {
     Fsub,
     Fmul,
     Fdiv,
+}
+
+/// Two-register ARMv8 crypto-extension opcode (`rd`/`rn`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CryptoTwoOp {
+    Aese,
+    Aesd,
+    Aesmc,
+    Aesimc,
+    Sha256su0,
+    Sha1h,
+    Sha1su1,
+}
+
+/// Three-register ARMv8 crypto-extension opcode (`rd`/`rn`/`rm`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CryptoThreeOp {
+    Sha256h,
+    Sha256h2,
+    Sha256su1,
+    Sha1c,
+    Sha1p,
+    Sha1m,
+    Sha1su0,
 }
 
 /// One-operand floating-point opcode.
@@ -726,6 +760,38 @@ impl Inst {
                     (FpSize::S64, FpSize::S64) => 0x1E60_4000,
                 };
                 base | (rn.encoding() << 5) | rd.encoding()
+            }
+
+            Inst::LoadStoreQ { load, rt, rn, offset } => {
+                let base: u32 = if load { 0x3DC0_0000 } else { 0x3D80_0000 };
+                debug_assert!(offset % 16 == 0, "unaligned scaled 128-bit FP offset");
+                let scaled = offset / 16;
+                debug_assert!(scaled < (1 << 12), "q offset out of range for unsigned-imm form");
+                base | ((scaled as u32) << 10) | (rn.encoding() << 5) | rt.encoding()
+            }
+            Inst::CryptoTwo { op, rd, rn } => {
+                let base: u32 = match op {
+                    CryptoTwoOp::Aese => 0x4E28_4800,
+                    CryptoTwoOp::Aesd => 0x4E28_5800,
+                    CryptoTwoOp::Aesmc => 0x4E28_6800,
+                    CryptoTwoOp::Aesimc => 0x4E28_7800,
+                    CryptoTwoOp::Sha256su0 => 0x5E28_2800,
+                    CryptoTwoOp::Sha1h => 0x5E28_0800,
+                    CryptoTwoOp::Sha1su1 => 0x5E28_1800,
+                };
+                base | (rn.encoding() << 5) | rd.encoding()
+            }
+            Inst::CryptoThree { op, rd, rn, rm } => {
+                let base: u32 = match op {
+                    CryptoThreeOp::Sha256h => 0x5E00_4000,
+                    CryptoThreeOp::Sha256h2 => 0x5E00_5000,
+                    CryptoThreeOp::Sha256su1 => 0x5E00_6000,
+                    CryptoThreeOp::Sha1c => 0x5E00_0000,
+                    CryptoThreeOp::Sha1p => 0x5E00_1000,
+                    CryptoThreeOp::Sha1m => 0x5E00_2000,
+                    CryptoThreeOp::Sha1su0 => 0x5E00_3000,
+                };
+                base | (rm.encoding() << 16) | (rn.encoding() << 5) | rd.encoding()
             }
 
             Inst::LoadAcq { size, rt, rn } => {
@@ -1203,6 +1269,32 @@ mod tests {
             Inst::MulHigh { signed: true, rd: X9, rn: X10, rm: X11 }.encode(),
             0x9B4B7D49
         );
+    }
+
+    #[test]
+    fn crypto_encodings() {
+        // 128-bit (q) load/store; the byte offset is scaled by 16.
+        assert_eq!(Inst::LoadStoreQ { load: true, rt: V0, rn: SP, offset: 0 }.encode(), 0x3DC003E0);
+        assert_eq!(Inst::LoadStoreQ { load: true, rt: V1, rn: X9, offset: 16 }.encode(), 0x3DC00521);
+        assert_eq!(Inst::LoadStoreQ { load: false, rt: V0, rn: SP, offset: 0 }.encode(), 0x3D8003E0);
+        assert_eq!(Inst::LoadStoreQ { load: false, rt: V2, rn: X9, offset: 32 }.encode(), 0x3D800922);
+        // AES (`aese`/`aesd`/`aesmc`/`aesimc v0.16b, v1.16b`).
+        assert_eq!(Inst::CryptoTwo { op: CryptoTwoOp::Aese, rd: V0, rn: V1 }.encode(), 0x4E284820);
+        assert_eq!(Inst::CryptoTwo { op: CryptoTwoOp::Aesd, rd: V0, rn: V1 }.encode(), 0x4E285820);
+        assert_eq!(Inst::CryptoTwo { op: CryptoTwoOp::Aesmc, rd: V0, rn: V1 }.encode(), 0x4E286820);
+        assert_eq!(Inst::CryptoTwo { op: CryptoTwoOp::Aesimc, rd: V0, rn: V1 }.encode(), 0x4E287820);
+        // SHA-256.
+        assert_eq!(Inst::CryptoThree { op: CryptoThreeOp::Sha256h, rd: V0, rn: V1, rm: V2 }.encode(), 0x5E024020);
+        assert_eq!(Inst::CryptoThree { op: CryptoThreeOp::Sha256h2, rd: V0, rn: V1, rm: V2 }.encode(), 0x5E025020);
+        assert_eq!(Inst::CryptoTwo { op: CryptoTwoOp::Sha256su0, rd: V0, rn: V1 }.encode(), 0x5E282820);
+        assert_eq!(Inst::CryptoThree { op: CryptoThreeOp::Sha256su1, rd: V0, rn: V1, rm: V2 }.encode(), 0x5E026020);
+        // SHA-1 (`sha1c`/`sha1p`/`sha1m q0, s1, v2.4s`; `sha1h s0, s1`).
+        assert_eq!(Inst::CryptoThree { op: CryptoThreeOp::Sha1c, rd: V0, rn: V1, rm: V2 }.encode(), 0x5E020020);
+        assert_eq!(Inst::CryptoThree { op: CryptoThreeOp::Sha1p, rd: V0, rn: V1, rm: V2 }.encode(), 0x5E021020);
+        assert_eq!(Inst::CryptoThree { op: CryptoThreeOp::Sha1m, rd: V0, rn: V1, rm: V2 }.encode(), 0x5E022020);
+        assert_eq!(Inst::CryptoTwo { op: CryptoTwoOp::Sha1h, rd: V0, rn: V1 }.encode(), 0x5E280820);
+        assert_eq!(Inst::CryptoThree { op: CryptoThreeOp::Sha1su0, rd: V0, rn: V1, rm: V2 }.encode(), 0x5E023020);
+        assert_eq!(Inst::CryptoTwo { op: CryptoTwoOp::Sha1su1, rd: V0, rn: V1 }.encode(), 0x5E281820);
     }
 
     #[test]

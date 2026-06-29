@@ -118,6 +118,7 @@ pub const V7: Vreg = Vreg(7);
 // Scratch FP registers for the baseline lowering (caller-saved).
 pub const V16: Vreg = Vreg(16);
 pub const V17: Vreg = Vreg(17);
+pub const V18: Vreg = Vreg(18);
 
 /// Integer operand size: 32-bit (`w`) or 64-bit (`x`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

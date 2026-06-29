@@ -7,8 +7,8 @@
 use std::fmt::Write;
 
 use crate::mach::inst::{
-    AddSub, AtomicRmwOp, CondSel, DataProc1, DataProc2, DmbOption, FpOp1, FpOp2, Inst, Label, LogicOp, MemSize,
-    MovKind, PairIndex,
+    AddSub, AtomicRmwOp, CondSel, CryptoThreeOp, CryptoTwoOp, DataProc1, DataProc2, DmbOption, FpOp1,
+    FpOp2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex,
 };
 use crate::mach::module::{DataSection, MachModule};
 use crate::mach::reg::{FpSize, OperandSize, Vreg};
@@ -465,6 +465,40 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
         }
         Inst::FpCvt { from, to, rd, rn } => {
             line(out, &format!("fcvt {}, {}", vname(rd, to), vname(rn, from)));
+        }
+
+        Inst::LoadStoreQ { load, rt, rn, offset } => {
+            let mnem = if load { "ldr" } else { "str" };
+            line(
+                out,
+                &format!("{mnem} q{}, [{}, #{offset}]", rt.encoding(), rn.name(OperandSize::S64)),
+            );
+        }
+        Inst::CryptoTwo { op, rd, rn } => {
+            let (d, n) = (rd.encoding(), rn.encoding());
+            let text = match op {
+                CryptoTwoOp::Aese => format!("aese v{d}.16b, v{n}.16b"),
+                CryptoTwoOp::Aesd => format!("aesd v{d}.16b, v{n}.16b"),
+                CryptoTwoOp::Aesmc => format!("aesmc v{d}.16b, v{n}.16b"),
+                CryptoTwoOp::Aesimc => format!("aesimc v{d}.16b, v{n}.16b"),
+                CryptoTwoOp::Sha256su0 => format!("sha256su0 v{d}.4s, v{n}.4s"),
+                CryptoTwoOp::Sha1h => format!("sha1h s{d}, s{n}"),
+                CryptoTwoOp::Sha1su1 => format!("sha1su1 v{d}.4s, v{n}.4s"),
+            };
+            line(out, &text);
+        }
+        Inst::CryptoThree { op, rd, rn, rm } => {
+            let (d, n, m) = (rd.encoding(), rn.encoding(), rm.encoding());
+            let text = match op {
+                CryptoThreeOp::Sha256h => format!("sha256h q{d}, q{n}, v{m}.4s"),
+                CryptoThreeOp::Sha256h2 => format!("sha256h2 q{d}, q{n}, v{m}.4s"),
+                CryptoThreeOp::Sha256su1 => format!("sha256su1 v{d}.4s, v{n}.4s, v{m}.4s"),
+                CryptoThreeOp::Sha1c => format!("sha1c q{d}, s{n}, v{m}.4s"),
+                CryptoThreeOp::Sha1p => format!("sha1p q{d}, s{n}, v{m}.4s"),
+                CryptoThreeOp::Sha1m => format!("sha1m q{d}, s{n}, v{m}.4s"),
+                CryptoThreeOp::Sha1su0 => format!("sha1su0 v{d}.4s, v{n}.4s, v{m}.4s"),
+            };
+            line(out, &text);
         }
 
         Inst::LoadAcq { size, rt, rn } => {

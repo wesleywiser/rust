@@ -23,14 +23,18 @@
 //!   rand/chacha20, and the NEON `adler32` checksum in `simd-adler32`. A true NEON register model
 //!   (operating on `q`/`v` registers rather than memory) is not implemented.
 //!
-//! - **Inline assembly and ARMv8 cryptography are not supported.** `asm!`/`global_asm!`
-//!   (`codegen_inline_asm`) would require a textual AArch64 assembler, which this object-emitting
-//!   backend does not have, so any crate using inline asm fails loudly (`zlib-rs`, `sha2`,
-//!   `constant_time_eq`, ...). Likewise the ARMv8 crypto-extension intrinsics
-//!   (`llvm.aarch64.crypto.{aese,aesmc,sha256h,sha1h,...}`, used by `aes`/`sha1`/`sha2`) are not
-//!   lowered. Crates with these in their dependency tree can usually be built with their software
-//!   fallbacks (e.g. `--cfg aes_force_soft`, the `sha2`/`sha1` `force-soft` features). The dedicated
-//!   AArch64 `crc32{c}{b,h,w,x}` instructions *are* supported (used by `crc32fast`).
+//! - **Inline assembly is not supported.** `asm!`/`global_asm!` (`codegen_inline_asm`) would
+//!   require a textual AArch64 assembler, which this object-emitting backend does not have, so any
+//!   crate using inline asm fails loudly (`zlib-rs`, the `sha2`/`constant_time_eq` asm paths, ...).
+//!   Such crates can usually still be built via their software fallbacks. The dedicated AArch64
+//!   `crc32{c}{b,h,w,x}` instructions *are* supported even though `zlib-rs` reaches them through
+//!   `asm!` (other crates such as `crc32fast` use the intrinsics, which work).
+//!
+//! - **ARMv8 cryptography** *is* supported: the AES round/mix-columns intrinsics (`aese`/`aesd`/
+//!   `aesmc`/`aesimc`) and the SHA-1/SHA-256 round and message-schedule intrinsics
+//!   (`sha1c`/`sha1p`/`sha1m`/`sha1h`/`sha1su0`/`sha1su1`, `sha256h`/`sha256h2`/`sha256su0`/
+//!   `sha256su1`) are lowered to the real instructions, moving the 128-bit operands between frame
+//!   slots and `v` registers via `q` loads/stores. Differential-tested against the LLVM backend.
 //!
 //! Implemented since the first cut, for reference:
 //!

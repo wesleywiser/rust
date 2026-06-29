@@ -36,11 +36,11 @@ use crate::context::{BasicBlock, CodegenCx, Function, Type, TypeData, Value};
 use crate::mach::func::MachFunction;
 use crate::mach::frame::FrameLayout;
 use crate::mach::inst::{
-    AddSub, AtomicRmwOp, CondSel, DataProc1, DataProc2, DmbOption, FpOp1, FpOp2, Inst, Label,
-    LogicOp, MemSize, MovKind, PairIndex, SymRef,
+    AddSub, AtomicRmwOp, CondSel, CryptoThreeOp, CryptoTwoOp, DataProc1, DataProc2, DmbOption, FpOp1,
+    FpOp2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex, SymRef,
 };
 use crate::mach::reg::{
-    Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V1, V16, V17, X0, X1, X2, X3, X4, X9,
+    Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V1, V16, V17, V18, X0, X1, X2, X3, X4, X9,
     X10, X11, X12, X13, X16, ZR,
 };
 
@@ -891,6 +891,45 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.materialize(data, X11_HACK);
         self.emit(Inst::DataProc2 { op, size, rd: X10, rn: X10, rm: X11_HACK });
         self.spill(X10, ret_ty)
+    }
+
+    /// Emit a 128-bit (`q`) load/store of `vreg` at frame offset `off`, forming the address in the
+    /// dedicated scratch register `X16` when the offset is too large for the scaled immediate.
+    fn emit_q(&mut self, load: bool, vreg: Vreg, off: u64) {
+        if off % 16 == 0 && off / 16 < (1 << 12) {
+            self.emit(Inst::LoadStoreQ { load, rt: vreg, rn: SP, offset: off });
+        } else {
+            self.emit_frame_addr(X16, off);
+            self.emit(Inst::LoadStoreQ { load, rt: vreg, rn: X16, offset: 0 });
+        }
+    }
+
+    /// Load a 128-bit vector value (from its frame slot, materializing a constant vector first) into
+    /// the `q` register `vreg`.
+    fn load_q(&mut self, val: Value, vreg: Vreg) {
+        if let Some(off) = self.vector_to_slot(val) {
+            self.emit_q(true, vreg, off);
+        }
+    }
+
+    /// Store the `q` register `vreg` to a fresh 16-byte slot, typed `ty`.
+    fn store_q(&mut self, vreg: Vreg, ty: Type) -> Value {
+        let off = self.alloc_slot(16, 16);
+        self.emit_q(false, vreg, off);
+        Value::Slot { off, ty }
+    }
+
+    /// Load an `i32` scalar into the low word of the `s` register `vreg` (SHA-1's `hash_e` operand).
+    fn load_s32(&mut self, val: Value, vreg: Vreg) {
+        self.materialize(val, X10);
+        self.emit(Inst::FmovFromGpr { size: FpSize::S32, rd: vreg, rn: X10 });
+    }
+
+    /// Store the low word of the `s` register `vreg` to a fresh slot, typed `ty` (`sha1h`'s result).
+    fn store_s32(&mut self, vreg: Vreg, ty: Type) -> Value {
+        let off = self.alloc_slot(4, 4);
+        self.emit_mem_fp(false, FpSize::S32, vreg, SP, off);
+        Value::Slot { off, ty }
     }
 
 
@@ -2899,6 +2938,86 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 _ => todo!("rustc_codegen_arm64: codegen_llvm_intrinsic_call: {sym}"),
             };
             return self.emit_crc32(op, size, args[0].immediate(), args[1].immediate());
+        }
+        // ARMv8 cryptography extension (`llvm.aarch64.crypto.*`): AES rounds and the SHA-1/SHA-256
+        // round/schedule functions. The vector operands are loaded into `v` registers, the real
+        // crypto instruction runs, and the result is stored back to a fresh frame slot. The `rd`
+        // register is read-modify-write for the AES and the three-operand SHA forms.
+        if let Some(op) = sym.strip_prefix("llvm.aarch64.crypto.") {
+            let ret = self.intrinsic_result_ty(instance);
+            match op {
+                // AES: (data, key) -> Vd = data (read-modify-write), Vn = key.
+                "aese" | "aesd" => {
+                    let cop = if op == "aese" { CryptoTwoOp::Aese } else { CryptoTwoOp::Aesd };
+                    self.load_q(args[0].immediate(), V16);
+                    self.load_q(args[1].immediate(), V17);
+                    self.emit(Inst::CryptoTwo { op: cop, rd: V16, rn: V17 });
+                    return self.store_q(V16, ret);
+                }
+                // MixColumns: (data) -> Vn = data, Vd = fresh output.
+                "aesmc" | "aesimc" => {
+                    let cop = if op == "aesmc" { CryptoTwoOp::Aesmc } else { CryptoTwoOp::Aesimc };
+                    self.load_q(args[0].immediate(), V17);
+                    self.emit(Inst::CryptoTwo { op: cop, rd: V16, rn: V17 });
+                    return self.store_q(V16, ret);
+                }
+                // SHA-256 hash update: (Qd, Qn, Vm) all v4i32.
+                "sha256h" | "sha256h2" => {
+                    let cop =
+                        if op == "sha256h" { CryptoThreeOp::Sha256h } else { CryptoThreeOp::Sha256h2 };
+                    self.load_q(args[0].immediate(), V16);
+                    self.load_q(args[1].immediate(), V17);
+                    self.load_q(args[2].immediate(), V18);
+                    self.emit(Inst::CryptoThree { op: cop, rd: V16, rn: V17, rm: V18 });
+                    return self.store_q(V16, ret);
+                }
+                "sha256su0" => {
+                    self.load_q(args[0].immediate(), V16);
+                    self.load_q(args[1].immediate(), V17);
+                    self.emit(Inst::CryptoTwo { op: CryptoTwoOp::Sha256su0, rd: V16, rn: V17 });
+                    return self.store_q(V16, ret);
+                }
+                "sha256su1" => {
+                    self.load_q(args[0].immediate(), V16);
+                    self.load_q(args[1].immediate(), V17);
+                    self.load_q(args[2].immediate(), V18);
+                    self.emit(Inst::CryptoThree { op: CryptoThreeOp::Sha256su1, rd: V16, rn: V17, rm: V18 });
+                    return self.store_q(V16, ret);
+                }
+                // SHA-1: c/p/m take (abcd: v4i32, e: i32 scalar in an `s` reg, wk: v4i32).
+                "sha1c" | "sha1p" | "sha1m" => {
+                    let cop = match op {
+                        "sha1c" => CryptoThreeOp::Sha1c,
+                        "sha1p" => CryptoThreeOp::Sha1p,
+                        _ => CryptoThreeOp::Sha1m,
+                    };
+                    self.load_q(args[0].immediate(), V16);
+                    self.load_s32(args[1].immediate(), V17);
+                    self.load_q(args[2].immediate(), V18);
+                    self.emit(Inst::CryptoThree { op: cop, rd: V16, rn: V17, rm: V18 });
+                    return self.store_q(V16, ret);
+                }
+                // SHA-1 fixed rotate: (e: i32) -> i32.
+                "sha1h" => {
+                    self.load_s32(args[0].immediate(), V17);
+                    self.emit(Inst::CryptoTwo { op: CryptoTwoOp::Sha1h, rd: V16, rn: V17 });
+                    return self.store_s32(V16, ret);
+                }
+                "sha1su0" => {
+                    self.load_q(args[0].immediate(), V16);
+                    self.load_q(args[1].immediate(), V17);
+                    self.load_q(args[2].immediate(), V18);
+                    self.emit(Inst::CryptoThree { op: CryptoThreeOp::Sha1su0, rd: V16, rn: V17, rm: V18 });
+                    return self.store_q(V16, ret);
+                }
+                "sha1su1" => {
+                    self.load_q(args[0].immediate(), V16);
+                    self.load_q(args[1].immediate(), V17);
+                    self.emit(Inst::CryptoTwo { op: CryptoTwoOp::Sha1su1, rd: V16, rn: V17 });
+                    return self.store_q(V16, ret);
+                }
+                _ => {}
+            }
         }
         todo!("rustc_codegen_arm64: codegen_llvm_intrinsic_call: {sym}")
     }
