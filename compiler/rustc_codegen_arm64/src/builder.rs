@@ -1426,6 +1426,18 @@ struct ArgAssign {
     nsaa: u32,
 }
 
+impl ArgAssign {
+    /// Reserve space for a stack argument of natural `size`/`align` bytes, returning the byte offset
+    /// (within the outgoing-argument area) to place it at. Apple AArch64 packs stack arguments at
+    /// their natural alignment and size; it does *not* round each up to an 8-byte slot the way the
+    /// standard AAPCS64 does (so e.g. two `u32` stack args sit at offsets 0 and 4, not 0 and 8).
+    fn stack_slot(&mut self, size: u32, align: u32) -> u32 {
+        let off = (self.nsaa + align - 1) & !(align - 1);
+        self.nsaa = off + size;
+        off
+    }
+}
+
 /// The classified parameter locations of a function signature, plus the total bytes of stack
 /// arguments — which, for a *call* to such a function, is exactly its outgoing-argument-area size.
 struct ParamList {
@@ -1460,18 +1472,16 @@ fn push_scalar_param(cx: &CodegenCx<'_>, params: &mut Vec<(ParamLoc, Type)>, a: 
             a.nsrn += 1;
             loc
         } else {
-            let loc = ParamLoc::Stack(a.nsaa);
-            a.nsaa += 8;
-            loc
+            let (size, align) = cx.type_size_align(ty);
+            ParamLoc::Stack(a.stack_slot(size as u32, align as u32))
         }
     } else if a.ngrn < 8 {
         let loc = ParamLoc::Gpr(Gpr::from_encoding(a.ngrn));
         a.ngrn += 1;
         loc
     } else {
-        let loc = ParamLoc::Stack(a.nsaa);
-        a.nsaa += 8;
-        loc
+        let (size, align) = cx.type_size_align(ty);
+        ParamLoc::Stack(a.stack_slot(size as u32, align as u32))
     };
     params.push((loc, ty));
 }
@@ -1511,14 +1521,22 @@ fn cast_regs(cast: &CastTarget) -> Vec<CastReg> {
         }
     }
     let unit = cast.rest.unit;
-    let usz = (unit.size.bytes() as u32).max(1);
+    let unit_fp = is_fp(unit.kind);
+    // An integer cast piece occupies a single 8-byte GPR, so a wider integer unit — e.g. the `i128`
+    // rustc uses for a 16-byte aggregate, or for a `repr(align(16))` struct whose data is smaller —
+    // must be split across multiple GPRs. (FP units are already <= 8 bytes: `s`/`d` registers.)
+    let usz = if unit_fp {
+        (unit.size.bytes() as u32).max(1)
+    } else {
+        (unit.size.bytes() as u32).clamp(1, 8)
+    };
     let total = cast.rest.total.bytes() as u32;
     if total > 0 {
         let n = total.div_ceil(usz);
         for i in 0..n {
             let rel = i * usz;
             let data = (total - rel).min(usz);
-            regs.push(CastReg { fp: is_fp(unit.kind), width: usz, data, offset: offset + rel });
+            regs.push(CastReg { fp: unit_fp, width: usz, data, offset: offset + rel });
         }
     }
     // FP cast pieces map to a single SIMD&FP register (s/d); 128-bit vector HFA lanes are not
@@ -1565,13 +1583,16 @@ fn push_cast_param<'tcx>(
         if n_fp > 0 {
             a.nsrn = 8;
         }
-        let align = (cast.align(cx).bytes() as u32).max(8);
-        let base = (a.nsaa + align - 1) & !(align - 1);
+        // A stack-passed cast occupies its register pieces back-to-back (each piece is a
+        // register-sized chunk), aligned to the aggregate's natural alignment. The footprint is the
+        // pieces' total width, *not* the data size rounded to 8 — a sub-register cast (e.g. an
+        // `i32`-unit 4-byte union) takes a 4-byte slot, while LLVM agrees.
+        let footprint = regs.iter().map(|r| r.offset + r.width).max().unwrap_or(0);
+        let align = cast.align(cx).bytes() as u32;
+        let base = a.stack_slot(footprint, align);
         for r in &regs {
             params.push((ParamLoc::Stack(base + r.offset), piece_ty(r)));
         }
-        let size = cast.size(cx).bytes() as u32;
-        a.nsaa = base + ((size + 7) & !7);
     }
 }
 fn build_param_list<'tcx>(cx: &CodegenCx<'tcx>, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> ParamList {
@@ -4912,9 +4933,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 self.materialize_fp(arg, Vreg::from_encoding(a.nsrn));
                 a.nsrn += 1;
             } else {
+                let (size, align) = self.cx.type_size_align(arg.ty());
+                let off = a.stack_slot(size as u32, align as u32);
                 self.materialize_fp(arg, V16);
-                self.emit_mem_fp(false, fp_size(self.cx, arg.ty()), V16, SP, a.nsaa as u64);
-                a.nsaa += 8;
+                self.emit_mem_fp(false, fp_size(self.cx, arg.ty()), V16, SP, off as u64);
             }
         } else if self.is_int128(arg.ty()) {
             if a.ngrn <= 6 {
@@ -4934,9 +4956,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             self.materialize(arg, Gpr::from_encoding(a.ngrn));
             a.ngrn += 1;
         } else {
+            let (size, align) = self.cx.type_size_align(arg.ty());
+            let off = a.stack_slot(size as u32, align as u32);
             self.materialize(arg, X9);
-            self.emit_mem_gpr(false, false, mem_size(self.cx, arg.ty()), X9, SP, a.nsaa as u64);
-            a.nsaa += 8;
+            self.emit_mem_gpr(false, false, mem_size(self.cx, arg.ty()), X9, SP, off as u64);
         }
     }
 
@@ -4947,9 +4970,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn marshal_cast_arg(&mut self, arg: Value, cast: &CastTarget, a: &mut ArgAssign) {
         let regs = cast_regs(cast);
         let src = match arg {
-            Value::Slot { off, .. } if regs.len() > 1 => off,
-            // A single-register cast is just a scalar; a multi-register cast value is always a slot,
-            // but fall back to scalar marshalling defensively if it is not.
+            // An aggregate cast value lives in memory; marshal each register piece from its slot.
+            // This includes a single-register cast: it still travels as a register-sized chunk (an
+            // 8-byte stack slot when spilled), unlike a `Direct` scalar which the caller packs at its
+            // natural size — so it must use the cast path here, not `marshal_scalar_arg`.
+            Value::Slot { off, .. } => off,
+            // A non-memory cast value (rare) is treated as a plain scalar.
             _ => return self.marshal_scalar_arg(arg, a),
         };
         let n_int = regs.iter().filter(|r| !r.fp).count() as u8;
@@ -4972,8 +4998,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             if n_fp > 0 {
                 a.nsrn = 8;
             }
-            let align = (cast.align(self.cx).bytes() as u32).max(8);
-            let base = (a.nsaa + align - 1) & !(align - 1);
+            // Mirror `push_cast_param`'s stack layout: pieces back-to-back over the cast's footprint
+            // (their total width), at the aggregate's natural alignment.
+            let footprint = regs.iter().map(|r| r.offset + r.width).max().unwrap_or(0);
+            let align = cast.align(self.cx).bytes() as u32;
+            let base = a.stack_slot(footprint, align);
             for r in &regs {
                 self.copy_slot_to_base_off(
                     src + r.offset as u64,
@@ -4982,8 +5011,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     r.data as u64,
                 );
             }
-            let size = cast.size(self.cx).bytes() as u32;
-            a.nsaa = base + ((size + 7) & !7);
         }
     }
 
