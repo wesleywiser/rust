@@ -10,11 +10,14 @@ use object::write::{
 };
 use object::{Architecture, BinaryFormat, Endianness, RelocationFlags, SectionFlags, SectionKind, SymbolKind, SymbolScope};
 
+use crate::dwarf::{DebugContext, DebugRelocTarget, FnDebug};
 use crate::mach::func::{Reloc, RelocKind};
 use crate::mach::module::{DataSection, MachModule};
 
-/// Emit `module` as a little-endian arm64 Mach-O object, returning the file bytes.
-pub fn emit_object(module: &MachModule) -> Vec<u8> {
+/// Emit `module` as a little-endian arm64 Mach-O object, returning the file bytes. When `debug` is
+/// present, its DWARF sections are appended to the `__DWARF` segment with relocations against the
+/// emitted function and DWARF-section symbols.
+pub fn emit_object(module: &MachModule, debug: Option<DebugContext>) -> Vec<u8> {
     let mut obj = Object::new(BinaryFormat::MachO, Architecture::Aarch64, Endianness::Little);
     // Symbol names are stored already in final form (with the Mach-O leading underscore), so do no
     // additional mangling.
@@ -42,8 +45,11 @@ pub fn emit_object(module: &MachModule) -> Vec<u8> {
     // Pass 1: define all functions and data items (and their symbols). Functions are encoded up
     // front so the layout (and relocations) are available here.
     let encoded: Vec<_> = module.functions.iter().map(|f| f.encode()).collect();
+    // Byte offset of each function within `__text`, aligned with `encoded` (for DWARF addresses).
+    let mut fn_text_offsets: Vec<u64> = Vec::with_capacity(encoded.len());
     for f in &encoded {
         let offset = obj.append_section_data(text, &f.code, 4);
+        fn_text_offsets.push(offset);
         let id = obj.add_symbol(Symbol {
             name: f.name.as_bytes().to_vec(),
             value: offset,
@@ -276,6 +282,11 @@ pub fn emit_object(module: &MachModule) -> Vec<u8> {
         }
     }
 
+    // Emit DWARF debug info (line table + subprogram DIEs) into the `__DWARF` segment.
+    if let Some(debug) = debug {
+        emit_debug_info(&mut obj, debug, &encoded, &fn_text_offsets, text);
+    }
+
     let mut bytes = obj.write().expect("failed to write Mach-O object");
     if any_eh {
         let cie = b"\x18\x00\x00\x00\x00\x00\x00\x00\x01zPLR";
@@ -387,4 +398,79 @@ fn macho_flags(kind: RelocKind) -> RelocationFlags {
         RelocKind::PointerToGot32 => (object::macho::ARM64_RELOC_POINTER_TO_GOT, true, 2),
     };
     RelocationFlags::MachO { r_type, r_pcrel, r_length }
+}
+
+/// Append the DWARF sections produced by `debug` to the `__DWARF` segment, translating gimli's
+/// collected relocations into Mach-O `ARM64_RELOC_UNSIGNED` relocations against the `__text` and
+/// DWARF-section symbols.
+fn emit_debug_info(
+    obj: &mut Object<'_>,
+    mut debug: DebugContext,
+    encoded: &[crate::mach::func::EncodedFunction],
+    fn_text_offsets: &[u64],
+    text: SectionId,
+) {
+    let fn_debugs: Vec<FnDebug<'_>> = encoded
+        .iter()
+        .zip(fn_text_offsets)
+        .map(|(f, &off)| FnDebug {
+            name: &f.name,
+            text_offset: off,
+            size: f.code.len() as u64,
+            line_rows: &f.line_rows,
+        })
+        .collect();
+    let sections = debug.emit(&fn_debugs);
+
+    let text_sym = obj.section_symbol(text);
+
+    // Create every DWARF section first (so cross-section references resolve), recording each gimli
+    // section id -> (object section id, its section symbol).
+    let mut section_map: HashMap<gimli::SectionId, (SectionId, SymbolId)> = HashMap::new();
+    for sect in &sections {
+        let name = sect.id.name().replace('.', "__"); // ".debug_info" -> "__debug_info"
+        let kind = match sect.id {
+            gimli::SectionId::DebugStr | gimli::SectionId::DebugLineStr => SectionKind::DebugString,
+            _ => SectionKind::Debug,
+        };
+        let sid = obj.add_section(b"__DWARF".to_vec(), name.into_bytes(), kind);
+        obj.section_mut(sid).set_data(sect.bytes.clone(), 1);
+        let ssym = obj.section_symbol(sid);
+        section_map.insert(sect.id, (sid, ssym));
+    }
+
+    // Apply relocations. `ARM64_RELOC_UNSIGNED` stores the addend inline in the field, so a
+    // section-symbol target plus an offset addend is the correct encoding for both the code
+    // references (low_pc / line-program addresses, against `__text`) and the inter-section
+    // references (e.g. `__debug_info` -> `__debug_str`).
+    for sect in &sections {
+        let sid = section_map[&sect.id].0;
+        for r in &sect.relocs {
+            let (symbol, addend) = match r.target {
+                DebugRelocTarget::Function(idx) => {
+                    (text_sym, fn_text_offsets[idx] as i64 + r.addend)
+                }
+                DebugRelocTarget::Section(gid) => (section_map[&gid].1, r.addend),
+            };
+            obj.add_relocation(
+                sid,
+                Relocation {
+                    offset: r.offset as u64,
+                    symbol,
+                    addend,
+                    flags: macho_dwarf_flags(r.size),
+                },
+            )
+            .expect("failed to add DWARF relocation");
+        }
+    }
+}
+
+/// Mach-O `ARM64_RELOC_UNSIGNED` flags for an absolute DWARF reference of `size` bytes.
+fn macho_dwarf_flags(size: u8) -> RelocationFlags {
+    RelocationFlags::MachO {
+        r_type: object::macho::ARM64_RELOC_UNSIGNED,
+        r_pcrel: false,
+        r_length: size.trailing_zeros() as u8, // 8 -> 3, 4 -> 2, 2 -> 1, 1 -> 0
+    }
 }

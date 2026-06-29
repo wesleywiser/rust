@@ -122,6 +122,11 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
         Inst::Label(l) => {
             let _ = writeln!(out, "{}:", label_name(fidx, l));
         }
+        Inst::DebugLoc(loc) => {
+            // Emitted as a comment in textual output; the binary path turns this into a
+            // `.debug_line` row. (`--emit asm` is for inspection only.)
+            let _ = writeln!(out, "\t// .loc file{} {} {}", loc.file, loc.line, loc.col);
+        }
         Inst::Nop => line(out, "nop"),
         Inst::Brk { imm16 } => line(out, &format!("brk #{imm16}")),
 

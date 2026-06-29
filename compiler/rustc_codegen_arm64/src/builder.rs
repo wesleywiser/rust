@@ -1267,8 +1267,8 @@ impl<'a, 'tcx> BackendTypes for Builder<'a, 'tcx> {
     type Type = Type;
     type FunctionSignature = Type;
 
-    type DIScope = ();
-    type DILocation = ();
+    type DIScope = gimli::write::UnitEntryId;
+    type DILocation = crate::mach::inst::DebugLoc;
     type DIVariable = ();
 }
 
@@ -2750,7 +2750,7 @@ impl<'a, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn dbg_var_addr(
         &mut self,
         _dbg_var: (),
-        _dbg_loc: (),
+        _dbg_loc: crate::mach::inst::DebugLoc,
         _variable_alloca: Value,
         _direct_offset: Size,
         _indirect_offsets: &[Size],
@@ -2760,14 +2760,19 @@ impl<'a, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn dbg_var_value(
         &mut self,
         _dbg_var: (),
-        _dbg_loc: (),
+        _dbg_loc: crate::mach::inst::DebugLoc,
         _value: Value,
         _direct_offset: Size,
         _indirect_offsets: &[Size],
         _fragment: &Option<std::ops::Range<Size>>,
     ) {
     }
-    fn set_dbg_loc(&mut self, _dbg_loc: ()) {}
+    fn set_dbg_loc(&mut self, dbg_loc: crate::mach::inst::DebugLoc) {
+        // Record a source-location marker in the instruction stream; layout turns it into a
+        // `.debug_line` row. No-op when debug info is disabled (the marker is simply never emitted
+        // because `set_dbg_loc` is only called by the SSA driver with debug info enabled).
+        self.emit(crate::mach::inst::Inst::DebugLoc(dbg_loc));
+    }
     fn clear_dbg_loc(&mut self) {}
     fn insert_reference_to_gdb_debug_scripts_section_global(&mut self) {}
     fn set_var_name(&mut self, _value: Value, _name: &str) {}

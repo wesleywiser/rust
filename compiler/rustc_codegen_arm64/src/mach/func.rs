@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::mach::inst::{Inst, SymRef, patch_imm19, patch_imm26};
+use crate::mach::inst::{DebugLoc, Inst, SymRef, patch_imm19, patch_imm26};
 
 /// The kind of relocation a symbol-referencing instruction needs. Mirrors the AArch64 Mach-O
 /// relocation types; the object emitter maps these to `ARM64_RELOC_*`.
@@ -87,6 +87,9 @@ pub struct EncodedFunction {
     pub relocs: Vec<Reloc>,
     /// Resolved EH call sites (byte offsets). Non-empty iff the function needs a landing-pad table.
     pub call_sites: Vec<CallSite>,
+    /// Debug line markers resolved to byte offsets: `(code_offset, location)`, in program order.
+    /// Empty unless the function was built with debug info enabled.
+    pub line_rows: Vec<(u64, DebugLoc)>,
 }
 
 impl MachFunction {
@@ -113,6 +116,7 @@ impl MachFunction {
                 Inst::Label(l) => {
                     label_offsets.insert(*l, offset);
                 }
+                Inst::DebugLoc(_) => {}
                 _ => offset += 4,
             }
         }
@@ -120,10 +124,15 @@ impl MachFunction {
         // Pass 2: encode + patch + relocate.
         let mut code = Vec::with_capacity(offset as usize);
         let mut relocs = Vec::new();
+        let mut line_rows = Vec::new();
         let mut cur: u64 = 0;
         for inst in &self.insts {
             match inst {
                 Inst::Label(_) => continue,
+                Inst::DebugLoc(loc) => {
+                    line_rows.push((cur, *loc));
+                    continue;
+                }
                 Inst::B { target } => {
                     let word = patch_imm26(
                         inst.encode(),
@@ -182,7 +191,7 @@ impl MachFunction {
             })
             .collect();
 
-        EncodedFunction { name: self.name.clone(), is_global: self.is_global, code, relocs, call_sites }
+        EncodedFunction { name: self.name.clone(), is_global: self.is_global, code, relocs, call_sites, line_rows }
     }
 }
 

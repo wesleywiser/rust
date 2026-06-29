@@ -8,6 +8,7 @@ crate-type = ["dylib"]
 
 [dependencies]
 # tidy-alphabetical-start
+gimli = { version = "0.31.1", default-features = false, features = ["write"] }
 object = { version = "0.39.1", default-features = false, features = ["std", "read_core", "write", "macho"] }
 smallvec = "1.8.1"
 tracing = "0.1"

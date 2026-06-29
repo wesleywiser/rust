@@ -155,6 +155,10 @@ pub struct CodegenCx<'tcx> {
     eh_personality: Cell<Option<Function>>,
 
     local_gen_sym_counter: Cell<usize>,
+
+    /// DWARF debug-info builder for this codegen unit. `Some` iff debug info is enabled. Taken out
+    /// (via [`CodegenCx::take_debug_context`]) at the end of codegen to travel with the module.
+    pub debug: Option<RefCell<crate::dwarf::DebugContext>>,
 }
 
 /// The target's macOS deployment version, packed as `major << 16 | minor << 8 | patch` for the
@@ -184,6 +188,7 @@ impl<'tcx> CodegenCx<'tcx> {
             static_consts: RefCell::new(FxHashMap::default()),
             eh_personality: Cell::new(None),
             local_gen_sym_counter: Cell::new(0),
+            debug: crate::dwarf::DebugContext::new(tcx).map(RefCell::new),
         }
     }
 
@@ -272,8 +277,8 @@ impl<'tcx> BackendTypes for CodegenCx<'tcx> {
     type Type = Type;
     type FunctionSignature = Type;
 
-    type DIScope = ();
-    type DILocation = ();
+    type DIScope = gimli::write::UnitEntryId;
+    type DILocation = crate::mach::inst::DebugLoc;
     type DIVariable = ();
 }
 

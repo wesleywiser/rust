@@ -127,6 +127,7 @@ mod consts;
 mod context;
 mod debuginfo;
 mod declare;
+mod dwarf;
 mod mach;
 mod type_;
 
@@ -154,6 +155,9 @@ use crate::mach::module::MachModule;
 #[derive(Default)]
 pub struct Arm64Module {
     pub mach: MachModule,
+    /// DWARF debug info for this codegen unit, finalized into the object during `codegen`. `None`
+    /// when debug info is disabled.
+    pub debug: Option<crate::dwarf::DebugContext>,
 }
 
 /// The codegen backend. It implements `CodegenBackend` (the entry point rustc calls) as well as
@@ -228,7 +232,7 @@ impl ExtraBackendMethods for Arm64CodegenBackend {
         _module_name: &str,
         methods: &[AllocatorMethod],
     ) -> Self::Module {
-        Arm64Module { mach: crate::allocator::codegen(tcx, methods) }
+        Arm64Module { mach: crate::allocator::codegen(tcx, methods), debug: None }
     }
 
     fn compile_codegen_unit(
@@ -274,7 +278,8 @@ impl ExtraBackendMethods for Arm64CodegenBackend {
         }
 
         let mach = std::mem::take(&mut *cx.module.borrow_mut());
-        let module = ModuleCodegen::new_regular(cgu_name.as_str().to_owned(), Arm64Module { mach });
+        let debug = cx.debug.take().map(std::cell::RefCell::into_inner);
+        let module = ModuleCodegen::new_regular(cgu_name.as_str().to_owned(), Arm64Module { mach, debug });
         (module, 0)
     }
 }
@@ -341,15 +346,16 @@ impl WriteBackendMethods for Arm64CodegenBackend {
         cgcx: &CodegenContext,
         _prof: &SelfProfilerRef,
         _shared_emitter: &SharedEmitter,
-        module: ModuleCodegen<Self::Module>,
+        mut module: ModuleCodegen<Self::Module>,
         config: &ModuleConfig,
     ) -> CompiledModule {
         let name = module.name.clone();
         let kind = module.kind;
+        let debug = module.module_llvm.debug.take();
         let mach = &module.module_llvm.mach;
 
         let object = cgcx.output_filenames.temp_path_for_cgu(OutputType::Object, &name);
-        std::fs::write(&object, crate::mach::emit_obj::emit_object(mach))
+        std::fs::write(&object, crate::mach::emit_obj::emit_object(mach, debug))
             .expect("failed to write object file");
 
         let assembly = if config.emit_asm {

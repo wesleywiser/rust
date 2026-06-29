@@ -10,6 +10,17 @@ use crate::mach::reg::{Cond, FpSize, Gpr, OperandSize, Vreg};
 /// Index of a local label within a function.
 pub type Label = u32;
 
+/// A resolved source location for debug info, attached to the instruction stream via the
+/// [`Inst::DebugLoc`] pseudo-op. The fields are already resolved against the source map (so the
+/// object-emitting back-half needs no `TyCtxt`): `file` is an index into the debug context's file
+/// table, `line`/`col` are 1-based (0 meaning "unknown").
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DebugLoc {
+    pub file: u32,
+    pub line: u32,
+    pub col: u32,
+}
+
 /// A reference to a named symbol plus an addend, used by calls and address-formation sequences.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SymRef {
@@ -147,6 +158,10 @@ pub enum PairIndex {
 pub enum Inst {
     /// A local label definition; emits no bytes.
     Label(Label),
+
+    /// A source-location marker for debug info; emits no bytes. Layout records its byte offset so
+    /// the line-number program can map code addresses back to `(file, line, col)`.
+    DebugLoc(DebugLoc),
 
     /// `nop`
     Nop,
@@ -456,6 +471,10 @@ impl Inst {
     pub fn encode(&self) -> u32 {
         match *self {
             Inst::Label(_) => panic!("Inst::Label has no encoding; resolve labels during layout"),
+
+            Inst::DebugLoc(_) => {
+                panic!("Inst::DebugLoc has no encoding; it is stripped during layout")
+            }
 
             Inst::Nop => 0xD503201F,
             Inst::Brk { imm16 } => 0xD4200000 | ((imm16 as u32) << 5),
