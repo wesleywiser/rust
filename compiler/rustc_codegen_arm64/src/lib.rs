@@ -64,12 +64,17 @@
 //!   differential-tested against the LLVM backend.
 //!
 //! - **`f16` and `f128`.** `f16` uses the native half-precision instructions (Apple Silicon's
-//!   FEAT_FP16): a third `FpSize` (`h`) drives `fadd`/`fsub`/`fmul`/`fdiv`/`fcmp`/`fcvt` and is
-//!   passed/returned in an `h` register. `f128` (IEEE binary128, no AArch64 hardware) is a 16-byte
-//!   value held in a `q` register; every operation \u2014 arithmetic, comparison, and the conversions
-//!   to/from the other floats and the integers \u2014 is a `compiler_builtins` libcall (`__addtf3`,
-//!   `__lttf2`, `__trunctfdf2`, `__floatditf`, ...), and it is passed/returned in a `q` register.
-//!   Both are differential-tested against the LLVM backend.
+//!   FEAT_FP16): a third `FpSize` (`h`) drives `fadd`/`fsub`/`fmul`/`fdiv`/`fcmp`/`fcvt`/`fabs` and
+//!   is passed/returned in an `h` register. `f16` transcendental math (`sin`/`cos`/`exp`/`log`/
+//!   `pow`/`powi`/`fmod`) has no libm form, so it is promoted to `f32`, computed with the `f32`
+//!   routine, and rounded back to `f16` (matching how LLVM legalizes it). `f128` (IEEE binary128, no
+//!   AArch64 hardware) is a 16-byte value held in a `q` register; arithmetic, comparison, `fabs`,
+//!   and the conversions to/from the other floats and the integers are `compiler_builtins` libcalls
+//!   (`__addtf3`, `__lttf2`, `__trunctfdf2`, `__floatditf`, ...) or a sign-bit clear, passed/returned
+//!   in a `q` register. `f128` transcendental math, `fma`, and `sqrt` are *not* supported: macOS has
+//!   no `f128` libm, and even the LLVM backend miscompiles them here (it calls the `long double`
+//!   = `f64` routines `fmal`/`sqrtl`), so `has_reliable_f128_math` is `false` and the backend fails
+//!   loudly rather than emitting garbage. Everything else is differential-tested against LLVM.
 //!
 //! - **Thread-local storage** uses the macOS thread-local-variable (TLV) model: a thread-local
 //!   static is emitted as a `$tlv$init` initializer in `__thread_data` plus a three-word descriptor
@@ -182,7 +187,9 @@ impl CodegenBackend for Arm64CodegenBackend {
             has_reliable_f16: true,
             has_reliable_f16_math: true,
             has_reliable_f128: true,
-            has_reliable_f128_math: true,
+            // macOS provides no `f128` libm (`logf128`/`sinf128`/...), so transcendental `f128`
+            // math is unsupported — matching what the LLVM backend advertises for this target.
+            has_reliable_f128_math: false,
         }
     }
 

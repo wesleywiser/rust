@@ -6,7 +6,8 @@
 //! FEAT_FP16. `f128` (IEEE binary128, no AArch64 hardware) routes every operation through
 //! `compiler_builtins` libcalls over 16-byte values held in `q` registers.
 #![crate_type = "lib"]
-#![feature(f16, f128)]
+#![feature(f16, f128, core_intrinsics)]
+use std::intrinsics::{fmaf16, sinf16, sqrtf16};
 
 // CHECK-LABEL: _h_add:
 // CHECK: fadd h{{[0-9]+}}, h{{[0-9]+}}, h{{[0-9]+}}
@@ -64,4 +65,30 @@ pub extern "C" fn q_to_f64(a: f128) -> f64 {
 #[no_mangle]
 pub extern "C" fn f64_to_q(a: f64) -> f128 {
     a as f128
+}
+
+// `f16` `sqrt`/`fma`/`fabs` use the native FEAT_FP16 half-precision instructions.
+// CHECK-LABEL: _h_sqrt:
+// CHECK: fsqrt h{{[0-9]+}}, h{{[0-9]+}}
+#[no_mangle]
+pub extern "C" fn h_sqrt(x: f16) -> f16 {
+    sqrtf16(x)
+}
+
+// CHECK-LABEL: _h_fma:
+// CHECK: fmadd h{{[0-9]+}}, h{{[0-9]+}}, h{{[0-9]+}}, h{{[0-9]+}}
+#[no_mangle]
+pub extern "C" fn h_fma(a: f16, b: f16, c: f16) -> f16 {
+    fmaf16(a, b, c)
+}
+
+// `f16` transcendental math has no libm form, so it is promoted to `f32` (`fcvt s, h`), computed
+// with the `f32` routine (`sinf`), and rounded back to `f16` (`fcvt h, s`).
+// CHECK-LABEL: _h_sin:
+// CHECK: fcvt s{{[0-9]+}}, h{{[0-9]+}}
+// CHECK: bl _sinf
+// CHECK: fcvt h{{[0-9]+}}, s{{[0-9]+}}
+#[no_mangle]
+pub extern "C" fn h_sin(x: f16) -> f16 {
+    sinf16(x)
 }
