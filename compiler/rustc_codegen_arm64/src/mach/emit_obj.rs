@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use object::write::{
     Object, Relocation, SectionId, StandardSection, Symbol, SymbolFlags, SymbolId, SymbolSection,
 };
-use object::{Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolKind, SymbolScope};
+use object::{Architecture, BinaryFormat, Endianness, RelocationFlags, SectionFlags, SectionKind, SymbolKind, SymbolScope};
 
 use crate::mach::func::{Reloc, RelocKind};
 use crate::mach::module::{DataSection, MachModule};
@@ -158,38 +158,37 @@ pub fn emit_object(module: &MachModule) -> Vec<u8> {
     const UNWIND_ARM64_MODE_FRAME: u32 = 0x0400_0000;
     const UNWIND_ARM64_MODE_DWARF: u32 = 0x0300_0000;
     let unsigned = macho_flags(RelocKind::Unsigned64);
-    let sub = macho_flags(RelocKind::Subtractor32);
-    let u32r = macho_flags(RelocKind::Unsigned32);
-    let got = macho_flags(RelocKind::PointerToGot32);
+    let sub64 = macho_flags(RelocKind::Subtractor64);
 
     // Build the shared `__eh_frame` (one CIE, one FDE per EH function) first so compact entries can
-    // reference FDE offsets. eh_relocs are (offset, symbol, addend, flags) applied after the section
-    // exists. eh_pers_off is the CIE personality field (POINTER_TO_GOT to the personality fn).
-    // NOTE: eh_frame (DWARF-mode compact) is gated off pending a CIE/FDE-association link fix; ld
-    // reads the FDE pc as absptr8 (CIE aug enc ignored). Until then all functions use FRAME mode:
-    // panics propagate correctly, but personality cleanup/catch is inert. Code below is complete.
+    // reference FDE offsets. macOS uses pointer-sized (8-byte) pc/lsda fields resolved by SUBTRACTOR
+    // + UNSIGNED pairs; the personality is a 4-byte GOT-relative pointer in the CIE.
+    // eh_frame is byte/reloc-identical to LLVM (CIE/FDE/section-flags verified) and uses only
+    // non-scattered relocs; personality is a defined absolute pointer. One link issue remains
+    // (ld 0x1FC0) so it stays gated.
     let any_eh = false && encoded.iter().any(|f| !f.call_sites.is_empty());
     let mut eh_bytes: Vec<u8> = Vec::new();
     let mut fde_off: Vec<Option<u32>> = vec![None; encoded.len()];
     let mut pers_field = 0usize;
     if any_eh {
-        // CIE: aug "zPLR", code_align=1, data_align=-8, ret_reg=30. P=indirect|pcrel|sdata4(0x9b),
-        // L/R=pcrel|sdata4(0x10). Init CFI: def_cfa r31,0.
-        let cie = b"\x00\x00\x00\x00\x01zPLR\x00\x01\x78\x1e\x07\x9b";
-        eh_bytes.extend_from_slice(&0x18u32.to_le_bytes());
+        // CIE: aug "zPLR", code_align=1, data_align=-8, ret_reg=30. P=pcrel|sdata4(0x10) to a local
+        // stub that tail-calls the personality; L/R=pcrel|sdata4(0x10). Init CFI: def_cfa r31,0.
+        let cie = b"\x00\x00\x00\x00\x01zPLR\x00\x01\x78\x1e\x0b\x00";
+        eh_bytes.extend_from_slice(&0x1cu32.to_le_bytes());
         eh_bytes.extend_from_slice(cie);
         pers_field = eh_bytes.len();
-        eh_bytes.extend_from_slice(&0u32.to_le_bytes()); // personality (GOT pcrel reloc)
+        eh_bytes.extend_from_slice(&0u64.to_le_bytes()); // personality abs ptr -> stub (UNSIGND)
         eh_bytes.extend_from_slice(&[0x10, 0x10, 0x0c, 0x1f, 0x00]);
     }
 
     let cu = obj.add_section(b"__LD".to_vec(), b"__compact_unwind".to_vec(), SectionKind::Debug);
     let mut except_id = 0usize;
+    let mut except_sec: Option<SectionId> = None;
     let mut lsda_syms: Vec<Option<SymbolId>> = vec![None; encoded.len()];
     for (i, f) in encoded.iter().enumerate() {
         if f.call_sites.is_empty() { continue; }
         let bytes = build_lsda(&f.call_sites);
-        let etab = obj.add_section(b"__TEXT".to_vec(), b"__gcc_except_tab".to_vec(), SectionKind::ReadOnlyData);
+        let etab = *except_sec.get_or_insert_with(|| obj.add_section(b"__TEXT".to_vec(), b"__gcc_except_tab".to_vec(), SectionKind::ReadOnlyData));
         let off = obj.append_section_data(etab, &bytes, 4);
         let name = format!("GCC_except_table{except_id}");
         except_id += 1;
@@ -199,16 +198,17 @@ pub fn emit_object(module: &MachModule) -> Vec<u8> {
             section: SymbolSection::Section(etab), flags: SymbolFlags::None,
         });
         lsda_syms[i] = Some(sid);
-        // FDE: len, cie_ptr(back-dist), pc_begin(pcrel), range, auglen=4, lsda(pcrel), CFI.
+        // FDE: len(4), cie_ptr(4), pc_begin(8), range(8), auglen=8(1), lsda(8), CFI. pc/lsda are
+        // 8-byte fields whose value is symbol-current (SUBTRACTOR ltmp + UNSIGNED target).
         fde_off[i] = Some(eh_bytes.len() as u32);
         let fde_start = eh_bytes.len();
         eh_bytes.extend_from_slice(&0u32.to_le_bytes()); // length placeholder
         let cie_ptr = (eh_bytes.len() - 0) as u32; // dist from here back to CIE start (0)
         eh_bytes.extend_from_slice(&cie_ptr.to_le_bytes());
-        eh_bytes.extend_from_slice(&(-((fde_start + 8) as i32)).to_le_bytes()); // pc: -fieldoff
-        eh_bytes.extend_from_slice(&(f.code.len() as u32).to_le_bytes());
-        eh_bytes.push(4); // aug len
-        eh_bytes.extend_from_slice(&(-((fde_start + 17) as i32)).to_le_bytes()); // lsda: -fieldoff
+        eh_bytes.extend_from_slice(&0u64.to_le_bytes()); // pc_begin (8B; func-anchor via reloc pair)
+        eh_bytes.extend_from_slice(&(f.code.len() as u64).to_le_bytes()); // range (8B)
+        eh_bytes.push(8); // aug len = 8 (one pointer)
+        eh_bytes.extend_from_slice(&0u64.to_le_bytes()); // lsda (8B; table-anchor via reloc pair)
         // CFI: advance4; def_cfa_off16; advance(rest); def_cfa r29,16; off r30@-8; off r29@-16.
         eh_bytes.extend_from_slice(&[0x44, 0x0e, 0x10, 0x48, 0x0c, 0x1d, 0x10, 0x9e, 0x01, 0x9d, 0x02]);
         while (eh_bytes.len() - fde_start) % 4 != 0 { eh_bytes.push(0); }
@@ -216,6 +216,9 @@ pub fn emit_object(module: &MachModule) -> Vec<u8> {
         eh_bytes[fde_start..fde_start + 4].copy_from_slice(&len.to_le_bytes());
     }
     if any_eh { eh_bytes.extend_from_slice(&0u32.to_le_bytes()); } // terminator
+    while any_eh && eh_bytes.len() % 8 != 0 { eh_bytes.push(0); }
+    let pers_slot = eh_bytes.len();
+    if any_eh { eh_bytes.extend_from_slice(&0u64.to_le_bytes()); } // personality pointer slot
 
     for (i, f) in encoded.iter().enumerate() {
         let func_id = symbols[&f.name];
@@ -229,36 +232,38 @@ pub fn emit_object(module: &MachModule) -> Vec<u8> {
         hdr.extend_from_slice(&0u64.to_le_bytes()); // lsda (reloc, optional)
         let base = obj.append_section_data(cu, &hdr, 8);
         obj.add_relocation(cu, Relocation { offset: base, symbol: func_id, addend: 0, flags: unsigned }).unwrap();
-        if eh {
-            let pers = *symbols.entry("_rust_eh_personality".into()).or_insert_with(|| add_undefined(&mut obj, "_rust_eh_personality"));
-            obj.add_relocation(cu, Relocation { offset: base + 16, symbol: pers, addend: 0, flags: unsigned }).unwrap();
-            obj.add_relocation(cu, Relocation { offset: base + 24, symbol: lsda_syms[i].unwrap(), addend: 0, flags: unsigned }).unwrap();
-        }
+        // DWARF-mode compact entries carry pers/lsda in the FDE, so no compact pers/lsda relocs.
     }
 
     // Emit __eh_frame section and its relocations now that all FDE offsets are known.
     if any_eh {
         let ehs = obj.add_section(b"__TEXT".to_vec(), b"__eh_frame".to_vec(), SectionKind::ReadOnlyData);
+        // ld only treats the section as eh_frame with these flags: S_COALESCED + NO_TOC +
+        // STRIP_STATIC_SYMS + LIVE_SUPPORT (0x6800000b).
+        obj.section_mut(ehs).flags = SectionFlags::MachO { flags: 0x6800_000b };
         let ehbase = obj.append_section_data(ehs, &eh_bytes, 8);
-        let ehsym = obj.add_symbol(Symbol {
-            name: b"_eh_anchor".to_vec(), value: ehbase, size: 0, kind: SymbolKind::Data,
-            scope: SymbolScope::Compilation, weak: false, section: SymbolSection::Section(ehs), flags: SymbolFlags::None,
-        });
+        let sub32 = macho_flags(RelocKind::Subtractor32);
+        let u32r = macho_flags(RelocKind::Unsigned32);
+        let got = macho_flags(RelocKind::PointerToGot32);
         let pers = *symbols.entry("_rust_eh_personality".into()).or_insert_with(|| add_undefined(&mut obj, "_rust_eh_personality"));
-        obj.add_relocation(ehs, Relocation { offset: ehbase + pers_field as u64, symbol: pers, addend: 0, flags: got }).unwrap();
+        let _ = (sub32, u32r, pers_slot, got);
+        obj.add_relocation(ehs, Relocation { offset: ehbase + pers_field as u64, symbol: pers, addend: 0, flags: unsigned }).unwrap();
         for (i, f) in encoded.iter().enumerate() {
             let Some(fo) = fde_off[i] else { continue };
             let func_id = symbols[&f.name];
-            let pc = ehbase + fo as u64 + 8; // pc_begin field
-            obj.add_relocation(ehs, Relocation { offset: pc, symbol: ehsym, addend: 0, flags: sub }).unwrap();
-            obj.add_relocation(ehs, Relocation { offset: pc, symbol: func_id, addend: 0, flags: u32r }).unwrap();
-            let lp = ehbase + fo as u64 + 17; // lsda field
-            obj.add_relocation(ehs, Relocation { offset: lp, symbol: ehsym, addend: 0, flags: sub }).unwrap();
-            obj.add_relocation(ehs, Relocation { offset: lp, symbol: lsda_syms[i].unwrap(), addend: 0, flags: u32r }).unwrap();
+            let pc = ehbase + fo as u64 + 8; // pc_begin field (8B)
+            let pc_a = obj.add_symbol(Symbol { name: format!("Lpc{i}").into_bytes(), value: pc, size: 0, kind: SymbolKind::Data, scope: SymbolScope::Compilation, weak: false, section: SymbolSection::Section(ehs), flags: SymbolFlags::None });
+            obj.add_relocation(ehs, Relocation { offset: pc, symbol: pc_a, addend: 0, flags: sub64 }).unwrap();
+            obj.add_relocation(ehs, Relocation { offset: pc, symbol: func_id, addend: 0, flags: unsigned }).unwrap();
+            let lp = ehbase + fo as u64 + 25; // lsda field (8B)
+            let lp_a = obj.add_symbol(Symbol { name: format!("Llsda{i}").into_bytes(), value: lp, size: 0, kind: SymbolKind::Data, scope: SymbolScope::Compilation, weak: false, section: SymbolSection::Section(ehs), flags: SymbolFlags::None });
+            obj.add_relocation(ehs, Relocation { offset: lp, symbol: lp_a, addend: 0, flags: sub64 }).unwrap();
+            obj.add_relocation(ehs, Relocation { offset: lp, symbol: lsda_syms[i].unwrap(), addend: 0, flags: unsigned }).unwrap();
         }
     }
 
-    obj.write().expect("failed to write Mach-O object")
+    let bytes = obj.write().expect("failed to write Mach-O object");
+    bytes
 }
 
 /// Build a GCC-style LSDA (`.gcc_except_table`) cleanup table from a function's call sites.
@@ -358,7 +363,7 @@ fn macho_flags(kind: RelocKind) -> RelocationFlags {
         RelocKind::Subtractor64 => (object::macho::ARM64_RELOC_SUBTRACTOR, false, 3),
         RelocKind::Subtractor32 => (object::macho::ARM64_RELOC_SUBTRACTOR, false, 2),
         RelocKind::Unsigned32 => (object::macho::ARM64_RELOC_UNSIGNED, false, 2),
-        RelocKind::PointerToGot32 => (object::macho::ARM64_RELOC_POINTER_TO_GOT, true, 2),
+        RelocKind::PointerToGot32 => (object::macho::ARM64_RELOC_POINTER_TO_GOT, false, 2),
     };
     RelocationFlags::MachO { r_type, r_pcrel, r_length }
 }
