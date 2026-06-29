@@ -37,7 +37,7 @@ use crate::mach::func::MachFunction;
 use crate::mach::frame::FrameLayout;
 use crate::mach::inst::{
     AddSub, AtomicRmwOp, CondSel, CryptoThreeOp, CryptoTwoOp, DataProc1, DataProc2, DmbOption, FpOp1,
-    FpOp2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex, SimdOp, SymRef,
+    FpOp2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex, SimdOp, SimdUnOp, SymRef,
 };
 use crate::mach::reg::{
     Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V1, V16, V17, V18, X0, X1, X2, X3, X4, X9,
@@ -427,6 +427,19 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// lanes first (the loads zero-extend). Integer lanes only.
     fn emit_simd_cmp(&mut self, cond: Cond, signed: bool, a: Value, b: Value, mask_ty: Type) -> Value {
         let (elem, count, es) = self.vector_info(a.ty());
+        let is_float = type_is_float(self.cx, elem);
+        // NEON fast path: native-width vectors map to a single `cm*`/`fcm*` instruction (with an
+        // operand swap for the `<`/`<=` forms and a trailing `not` for `ne`). The mask lanes are the
+        // same width as the input lanes, so the same `q`/size applies to the result store.
+        if let Some((q, isize)) = self.simd_native(a.ty()) {
+            if let Some((op, swap, negate)) = simd_cmp_neon(cond, is_float) {
+                let size = if is_float { (es == 8) as u8 } else { isize };
+                let (x, y) = if swap { (b, a) } else { (a, b) };
+                let r = self.emit_simd_three(op, q, size, x, y, mask_ty);
+                let r = if negate { self.emit_simd_two(SimdUnOp::Not, q, 0, r, mask_ty) } else { r };
+                return r;
+            }
+        }
         let aoff = self.vector_to_slot(a);
         let boff = self.vector_to_slot(b);
         let (Some(aoff), Some(boff)) = (aoff, boff) else {
@@ -596,6 +609,20 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         Value::Slot { off: roff, ty: vec_ty }
     }
 
+    /// Emit a NEON 2-register-misc op (`rd = <op> a`) on a native-width vector, moving the operand
+    /// through a `v` register. `size` is the encoding's size/`sz` field for `op`.
+    fn emit_simd_two(&mut self, op: SimdUnOp, q: bool, size: u8, a: Value, vec_ty: Type) -> Value {
+        let Some(aoff) = self.vector_to_slot(a) else {
+            return Value::Undef { ty: vec_ty };
+        };
+        self.emit_vec_mem(true, q, V16, aoff);
+        self.emit(Inst::SimdTwo { op, q, size, rd: V16, rn: V16 });
+        let (vsize, valign) = self.cx.type_size_align(vec_ty);
+        let roff = self.alloc_slot(vsize, valign);
+        self.emit_vec_mem(false, q, V16, roff);
+        Value::Slot { off: roff, ty: vec_ty }
+    }
+
     /// Lane-wise SIMD arithmetic (`simd_add`/`simd_sub`/`simd_mul`/`simd_div`/`simd_rem`).
     /// Native-width (8/16-byte) vectors use a single NEON instruction (`add`/`sub`/`mul`,
     /// `fadd`/`fsub`/`fmul`/`fdiv`) over `v` registers. The cases without a NEON instruction —
@@ -737,6 +764,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn emit_simd_fp_unary(&mut self, a: Value, op: crate::mach::inst::FpOp1) -> Value {
         let vec_ty = a.ty();
         let (elem, count, es) = self.vector_info(vec_ty);
+        // NEON fast path: native-width float vectors map to a single two-register-misc instruction.
+        if let Some((q, _)) = self.simd_native(vec_ty) {
+            if let Some(unop) = fp_op1_to_simd(op) {
+                let sz = (es == 8) as u8; // float sz bit: 0 = f32, 1 = f64
+                return self.emit_simd_two(unop, q, sz, a, vec_ty);
+            }
+        }
         let Some(aoff) = self.vector_to_slot(a) else { return Value::Undef { ty: vec_ty } };
         let (size, align) = self.cx.type_size_align(vec_ty);
         let roff = self.alloc_slot(size, align);
@@ -1310,6 +1344,54 @@ fn mem_size(cx: &CodegenCx<'_>, ty: Type) -> MemSize {
 /// Whether a backend type is a floating-point scalar (passed/returned in the SIMD&FP registers).
 fn type_is_float(cx: &CodegenCx<'_>, ty: Type) -> bool {
     matches!(cx.type_data(ty), TypeData::Float(_))
+}
+
+/// Map a lane-comparison condition to a NEON compare: the instruction, whether to swap the operands
+/// (the `<`/`<=` forms are expressed as a reversed `>`/`>=`), and whether to invert the result (`ne`
+/// is `cmeq` + `not`). Float lanes use the unsigned condition forms (floats are not "signed" here).
+/// Returns `None` for conditions without a direct NEON form, leaving the scalar fallback to handle
+/// them.
+fn simd_cmp_neon(cond: Cond, is_float: bool) -> Option<(SimdOp, bool, bool)> {
+    Some(if is_float {
+        match cond {
+            Cond::Eq => (SimdOp::Fcmeq, false, false),
+            Cond::Ne => (SimdOp::Fcmeq, false, true),
+            Cond::Hi => (SimdOp::Fcmgt, false, false), // a > b
+            Cond::Hs => (SimdOp::Fcmge, false, false), // a >= b
+            Cond::Lo => (SimdOp::Fcmgt, true, false),  // a < b  == b > a
+            Cond::Ls => (SimdOp::Fcmge, true, false),  // a <= b == b >= a
+            _ => return None,
+        }
+    } else {
+        match cond {
+            Cond::Eq => (SimdOp::Cmeq, false, false),
+            Cond::Ne => (SimdOp::Cmeq, false, true),
+            Cond::Gt => (SimdOp::Cmgt, false, false),
+            Cond::Ge => (SimdOp::Cmge, false, false),
+            Cond::Lt => (SimdOp::Cmgt, true, false), // a < b  == b > a
+            Cond::Le => (SimdOp::Cmge, true, false), // a <= b == b >= a
+            Cond::Hi => (SimdOp::Cmhi, false, false),
+            Cond::Hs => (SimdOp::Cmhs, false, false),
+            Cond::Lo => (SimdOp::Cmhi, true, false), // a <u b == b >u a
+            Cond::Ls => (SimdOp::Cmhs, true, false), // a <=u b == b >=u a
+            _ => return None,
+        }
+    })
+}
+
+/// Map a scalar floating-point unary op to its NEON two-register-misc equivalent, for the lane-wise
+/// SIMD intrinsics. Every rounding/abs/neg/sqrt op has a vector form.
+fn fp_op1_to_simd(op: FpOp1) -> Option<SimdUnOp> {
+    Some(match op {
+        FpOp1::Fabs => SimdUnOp::Fabs,
+        FpOp1::Fneg => SimdUnOp::Fneg,
+        FpOp1::Fsqrt => SimdUnOp::Fsqrt,
+        FpOp1::Frintn => SimdUnOp::Frintn,
+        FpOp1::Frintp => SimdUnOp::Frintp,
+        FpOp1::Frintm => SimdUnOp::Frintm,
+        FpOp1::Frintz => SimdUnOp::Frintz,
+        FpOp1::Frinta => SimdUnOp::Frinta,
+    })
 }
 
 /// Floating-point operand size for a float backend type (`f16` -> half, `f32` -> single, otherwise
@@ -2999,6 +3081,9 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let (elem, count, es) = self.vector_info(a.ty());
                 let r = if type_is_float(self.cx, elem) {
                     self.emit_simd_fp_unary(a, crate::mach::inst::FpOp1::Fneg)
+                } else if let Some((q, isize)) = self.simd_native(a.ty()) {
+                    // Native-width integer vectors negate in a single `neg` instruction.
+                    self.emit_simd_two(SimdUnOp::Neg, q, isize, a, a.ty())
                 } else if let Some(aoff) = self.vector_to_slot(a) {
                     let (size, align) = self.cx.type_size_align(a.ty());
                     let roff = self.alloc_slot(size, align);

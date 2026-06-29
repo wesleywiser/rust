@@ -293,6 +293,9 @@ pub enum Inst {
     /// 8/16/32/64-bit) or, for the float ops, the single `sz` bit (`0`=f32, `1`=f64). Bitwise ops
     /// fix `size` in their base, so they pass `0`.
     SimdThree { op: SimdOp, q: bool, size: u8, rd: Vreg, rn: Vreg, rm: Vreg },
+    /// Two-register NEON "2-misc" vector instruction (`neg`/`not`, `fneg`/`fabs`/`fsqrt`, the
+    /// `frint*` rounding modes). `q`/`size` are interpreted as for [`Inst::SimdThree`].
+    SimdTwo { op: SimdUnOp, q: bool, size: u8, rd: Vreg, rn: Vreg },
 
     /// `ldar`/`ldarb`/`ldarh` — load-acquire (atomic acquire load).
     LoadAcq { size: MemSize, rt: Gpr, rn: Gpr },
@@ -397,6 +400,34 @@ pub enum SimdOp {
     Fsub,
     Fmul,
     Fdiv,
+    /// Lane-wise compares producing an all-ones/all-zero mask (`cmeq`/`cmgt`/`cmge` signed,
+    /// `cmhi`/`cmhs` unsigned; `fcmeq`/`fcmgt`/`fcmge` float).
+    Cmeq,
+    Cmgt,
+    Cmge,
+    Cmhi,
+    Cmhs,
+    Fcmeq,
+    Fcmgt,
+    Fcmge,
+}
+
+/// NEON "2-misc" two-register vector opcode (see [`Inst::SimdTwo`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SimdUnOp {
+    /// Integer negate (`neg`) and bitwise not (`not`/`mvn`).
+    Neg,
+    Not,
+    /// Floating-point negate / absolute / square-root.
+    Fneg,
+    Fabs,
+    Fsqrt,
+    /// Floating-point round-to-integral (the `frint*` rounding modes).
+    Frintn,
+    Frintp,
+    Frintm,
+    Frintz,
+    Frinta,
 }
 
 /// One-operand floating-point opcode.
@@ -836,11 +867,38 @@ impl Inst {
                     SimdOp::Fsub => 0x0EA0_D400,
                     SimdOp::Fmul => 0x2E20_DC00,
                     SimdOp::Fdiv => 0x2E20_FC00,
+                    SimdOp::Cmeq => 0x2E20_8C00,
+                    SimdOp::Cmgt => 0x0E20_3400,
+                    SimdOp::Cmge => 0x0E20_3C00,
+                    SimdOp::Cmhi => 0x2E20_3400,
+                    SimdOp::Cmhs => 0x2E20_3C00,
+                    SimdOp::Fcmeq => 0x0E20_E400,
+                    SimdOp::Fcmgt => 0x2EA0_E400,
+                    SimdOp::Fcmge => 0x2E20_E400,
                 };
                 debug_assert!(size < 4, "NEON size/sz field is 2 bits");
                 base | ((q as u32) << 30)
                     | ((size as u32) << 22)
                     | (rm.encoding() << 16)
+                    | (rn.encoding() << 5)
+                    | rd.encoding()
+            }
+            Inst::SimdTwo { op, q, size, rd, rn } => {
+                let base: u32 = match op {
+                    SimdUnOp::Neg => 0x2E20_B800,
+                    SimdUnOp::Not => 0x2E20_5800,
+                    SimdUnOp::Fneg => 0x2EA0_F800,
+                    SimdUnOp::Fabs => 0x0EA0_F800,
+                    SimdUnOp::Fsqrt => 0x2EA1_F800,
+                    SimdUnOp::Frintn => 0x0E21_8800,
+                    SimdUnOp::Frintp => 0x0EA1_8800,
+                    SimdUnOp::Frintm => 0x0E21_9800,
+                    SimdUnOp::Frintz => 0x0EA1_9800,
+                    SimdUnOp::Frinta => 0x2E21_8800,
+                };
+                debug_assert!(size < 4, "NEON size/sz field is 2 bits");
+                base | ((q as u32) << 30)
+                    | ((size as u32) << 22)
                     | (rn.encoding() << 5)
                     | rd.encoding()
             }
@@ -1393,6 +1451,27 @@ mod tests {
         assert_eq!(Inst::FpDataProc1 { op: FpOp1::Fneg, size: FpSize::S16, rd: V0, rn: V1 }.encode(), 0x1EE14020);
         assert_eq!(Inst::FpDataProc1 { op: FpOp1::Fsqrt, size: FpSize::S16, rd: V0, rn: V1 }.encode(), 0x1EE1C020);
         assert_eq!(Inst::FpDataProc1 { op: FpOp1::Frintm, size: FpSize::S16, rd: V0, rn: V1 }.encode(), 0x1EE54020);
+    }
+
+    #[test]
+    fn simd_misc_encodings() {
+        // Lane-wise compares (`.4s`).
+        assert_eq!(Inst::SimdThree { op: SimdOp::Cmeq, q: true, size: 2, rd: V0, rn: V1, rm: V2 }.encode(), 0x6EA28C20);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Cmgt, q: true, size: 2, rd: V0, rn: V1, rm: V2 }.encode(), 0x4EA23420);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Cmge, q: true, size: 2, rd: V0, rn: V1, rm: V2 }.encode(), 0x4EA23C20);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Cmhi, q: true, size: 2, rd: V0, rn: V1, rm: V2 }.encode(), 0x6EA23420);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Cmhs, q: true, size: 2, rd: V0, rn: V1, rm: V2 }.encode(), 0x6EA23C20);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Fcmeq, q: true, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x4E22E420);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Fcmgt, q: true, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x6EA2E420);
+        assert_eq!(Inst::SimdThree { op: SimdOp::Fcmge, q: true, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x6E22E420);
+        // Two-register misc.
+        assert_eq!(Inst::SimdTwo { op: SimdUnOp::Neg, q: true, size: 2, rd: V0, rn: V1 }.encode(), 0x6EA0B820);
+        assert_eq!(Inst::SimdTwo { op: SimdUnOp::Not, q: true, size: 0, rd: V0, rn: V1 }.encode(), 0x6E205820);
+        assert_eq!(Inst::SimdTwo { op: SimdUnOp::Fneg, q: true, size: 0, rd: V0, rn: V1 }.encode(), 0x6EA0F820);
+        assert_eq!(Inst::SimdTwo { op: SimdUnOp::Fabs, q: true, size: 0, rd: V0, rn: V1 }.encode(), 0x4EA0F820);
+        assert_eq!(Inst::SimdTwo { op: SimdUnOp::Fsqrt, q: true, size: 0, rd: V0, rn: V1 }.encode(), 0x6EA1F820);
+        assert_eq!(Inst::SimdTwo { op: SimdUnOp::Frintn, q: true, size: 0, rd: V0, rn: V1 }.encode(), 0x4E218820);
+        assert_eq!(Inst::SimdTwo { op: SimdUnOp::Frintm, q: true, size: 0, rd: V0, rn: V1 }.encode(), 0x4E219820);
     }
 
     #[test]

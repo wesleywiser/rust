@@ -8,7 +8,7 @@ use std::fmt::Write;
 
 use crate::mach::inst::{
     AddSub, AtomicRmwOp, CondSel, CryptoThreeOp, CryptoTwoOp, DataProc1, DataProc2, DmbOption, FpOp1,
-    FpOp2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex, SimdOp,
+    FpOp2, Inst, Label, LogicOp, MemSize, MovKind, PairIndex, SimdOp, SimdUnOp,
 };
 use crate::mach::module::{DataSection, MachModule};
 use crate::mach::reg::{FpSize, OperandSize, Vreg};
@@ -512,6 +512,14 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
                 SimdOp::Fsub => "fsub",
                 SimdOp::Fmul => "fmul",
                 SimdOp::Fdiv => "fdiv",
+                SimdOp::Cmeq => "cmeq",
+                SimdOp::Cmgt => "cmgt",
+                SimdOp::Cmge => "cmge",
+                SimdOp::Cmhi => "cmhi",
+                SimdOp::Cmhs => "cmhs",
+                SimdOp::Fcmeq => "fcmeq",
+                SimdOp::Fcmgt => "fcmgt",
+                SimdOp::Fcmge => "fcmge",
             };
             let arr = simd_arrangement(op, q, size);
             line(
@@ -523,6 +531,22 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
                     rm.encoding()
                 ),
             );
+        }
+        Inst::SimdTwo { op, q, size, rd, rn } => {
+            let (mnem, float, bitwise) = match op {
+                SimdUnOp::Neg => ("neg", false, false),
+                SimdUnOp::Not => ("not", false, true),
+                SimdUnOp::Fneg => ("fneg", true, false),
+                SimdUnOp::Fabs => ("fabs", true, false),
+                SimdUnOp::Fsqrt => ("fsqrt", true, false),
+                SimdUnOp::Frintn => ("frintn", true, false),
+                SimdUnOp::Frintp => ("frintp", true, false),
+                SimdUnOp::Frintm => ("frintm", true, false),
+                SimdUnOp::Frintz => ("frintz", true, false),
+                SimdUnOp::Frinta => ("frinta", true, false),
+            };
+            let arr = arrangement(q, size, float, bitwise);
+            line(out, &format!("{mnem} v{}.{arr}, v{}.{arr}", rd.encoding(), rn.encoding()));
         }
 
         Inst::LoadAcq { size, rt, rn } => {
@@ -665,21 +689,35 @@ fn vname(v: Vreg, size: FpSize) -> String {
 /// The NEON arrangement suffix (`16b`/`8h`/`4s`/`2d`/...) for a 3-same vector op, derived from the
 /// `q` bit and the 2-bit `size`/`sz` field (interpreted per the op family).
 fn simd_arrangement(op: SimdOp, q: bool, size: u8) -> String {
+    let bitwise = matches!(op, SimdOp::And | SimdOp::Orr | SimdOp::Eor);
+    let float = matches!(
+        op,
+        SimdOp::Fadd
+            | SimdOp::Fsub
+            | SimdOp::Fmul
+            | SimdOp::Fdiv
+            | SimdOp::Fcmeq
+            | SimdOp::Fcmgt
+            | SimdOp::Fcmge
+    );
+    arrangement(q, size, float, bitwise)
+}
+
+/// The NEON arrangement suffix for a vector op of the given family: `bitwise` ops are byte lanes,
+/// `float` ops use `s`/`d` from the `sz` bit, integer ops use `b`/`h`/`s`/`d` from the size field.
+fn arrangement(q: bool, size: u8, float: bool, bitwise: bool) -> String {
     let total = if q { 16 } else { 8 };
-    let (lanes, letter) = match op {
-        // Bitwise ops operate on bytes regardless of the (zero) size field.
-        SimdOp::And | SimdOp::Orr | SimdOp::Eor => (total, 'b'),
-        // Float: size 0 = f32 (`s`), size 1 = f64 (`d`).
-        SimdOp::Fadd | SimdOp::Fsub | SimdOp::Fmul | SimdOp::Fdiv => {
-            if size == 0 { (total / 4, 's') } else { (total / 8, 'd') }
-        }
-        // Integer: size 0/1/2/3 = 8/16/32/64-bit lanes (`b`/`h`/`s`/`d`).
-        _ => match size {
+    let (lanes, letter) = if bitwise {
+        (total, 'b')
+    } else if float {
+        if size == 0 { (total / 4, 's') } else { (total / 8, 'd') }
+    } else {
+        match size {
             0 => (total, 'b'),
             1 => (total / 2, 'h'),
             2 => (total / 4, 's'),
             _ => (total / 8, 'd'),
-        },
+        }
     };
     format!("{lanes}{letter}")
 }
