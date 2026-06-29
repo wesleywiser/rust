@@ -440,8 +440,8 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
         }
         Inst::FmovFromGpr { size, rd, rn } => {
             let gpr_size = match size {
-                FpSize::S32 => OperandSize::S32,
                 FpSize::S64 => OperandSize::S64,
+                FpSize::S16 | FpSize::S32 => OperandSize::S32,
             };
             line(out, &format!("fmov {}, {}", vname(rd, size), rn.name_zr(gpr_size)));
         }

@@ -189,6 +189,7 @@ fn push_mem_gpr(
 /// handling as [`push_mem_gpr`].
 fn push_mem_fp(out: &mut Vec<Inst>, load: bool, size: FpSize, rt: Vreg, base: Gpr, offset: u64) {
     let bytes = match size {
+        FpSize::S16 => 2,
         FpSize::S32 => 4,
         FpSize::S64 => 8,
     };
@@ -198,6 +199,18 @@ fn push_mem_fp(out: &mut Vec<Inst>, load: bool, size: FpSize, rt: Vreg, base: Gp
         push_load_imm64(out, X16, offset);
         out.push(Inst::AddSubExtReg { op: AddSub::Add, size: OperandSize::S64, rd: X16, rn: base, rm: X16 });
         out.push(Inst::LoadStoreFpUImm { load, size, rt, rn: X16, offset: 0 });
+    }
+}
+
+/// Push a 128-bit (`q`) FP load/store of `rt` at `[base, #offset]` (a whole `f128`), with the same
+/// large-offset handling as [`push_mem_fp`].
+fn push_mem_q(out: &mut Vec<Inst>, load: bool, rt: Vreg, base: Gpr, offset: u64) {
+    if imm_offset_fits(offset, 16) {
+        out.push(Inst::LoadStoreQ { load, rt, rn: base, offset });
+    } else {
+        push_load_imm64(out, X16, offset);
+        out.push(Inst::AddSubExtReg { op: AddSub::Add, size: OperandSize::S64, rd: X16, rn: base, rm: X16 });
+        out.push(Inst::LoadStoreQ { load, rt, rn: X16, offset: 0 });
     }
 }
 
@@ -1299,9 +1312,11 @@ fn type_is_float(cx: &CodegenCx<'_>, ty: Type) -> bool {
     matches!(cx.type_data(ty), TypeData::Float(_))
 }
 
-/// Floating-point operand size for a float backend type (`f32` -> single, otherwise double).
+/// Floating-point operand size for a float backend type (`f16` -> half, `f32` -> single, otherwise
+/// double). `f128` has no hardware FP register form and is handled by libcalls before this is hit.
 fn fp_size(cx: &CodegenCx<'_>, ty: Type) -> FpSize {
     match cx.type_data(ty) {
+        TypeData::Float(16) => FpSize::S16,
         TypeData::Float(32) => FpSize::S32,
         _ => FpSize::S64,
     }
@@ -1595,7 +1610,12 @@ fn setup_params(cx: &CodegenCx<'_>, fb: &mut FunctionBuild, block: BasicBlock) {
             }
             ParamLoc::Fp(reg) => {
                 let out = &mut fb.blocks[block.0 as usize];
-                push_mem_fp(out, false, fp_size(cx, ty), reg, SP, off);
+                if matches!(cx.type_data(ty), TypeData::Float(128)) {
+                    // `f128` arrives in a full 128-bit `q` register.
+                    push_mem_q(out, false, reg, SP, off);
+                } else {
+                    push_mem_fp(out, false, fp_size(cx, ty), reg, SP, off);
+                }
             }
             ParamLoc::Stack(arg_off) => {
                 let incoming = fb.frame.incoming_arg(arg_off as u64);
@@ -1607,9 +1627,14 @@ fn setup_params(cx: &CodegenCx<'_>, fb: &mut FunctionBuild, block: BasicBlock) {
                     push_mem_gpr(out, true, false, MemSize::X, X9, FP, incoming + 8);
                     push_mem_gpr(out, false, false, MemSize::X, X9, SP, off + 8);
                 } else if type_is_float(cx, ty) {
-                    let size = fp_size(cx, ty);
-                    push_mem_fp(out, true, size, V16, FP, incoming);
-                    push_mem_fp(out, false, size, V16, SP, off);
+                    if matches!(cx.type_data(ty), TypeData::Float(128)) {
+                        push_mem_q(out, true, V16, FP, incoming);
+                        push_mem_q(out, false, V16, SP, off);
+                    } else {
+                        let size = fp_size(cx, ty);
+                        push_mem_fp(out, true, size, V16, FP, incoming);
+                        push_mem_fp(out, false, size, V16, SP, off);
+                    }
                 } else {
                     let size = mem_size(cx, ty);
                     push_mem_gpr(out, true, false, size, X9, FP, incoming);
@@ -1745,6 +1770,116 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.emit_mem_gpr(false, false, MemSize::X, lo, SP, off);
         self.emit_mem_gpr(false, false, MemSize::X, hi, SP, off + 8);
         Value::Slot { off, ty }
+    }
+
+    /// Whether a backend type is `f128`, the IEEE binary128 quad-precision float. It has no AArch64
+    /// hardware register form; every operation is a `compiler_builtins` libcall over a 16-byte
+    /// value held in a `q` register.
+    fn is_f128(&self, ty: Type) -> bool {
+        matches!(self.cx.type_data(ty), TypeData::Float(128))
+    }
+
+    /// Load a 16-byte `f128` value into the `q` register `qreg`.
+    fn materialize_q(&mut self, val: Value, qreg: Vreg) {
+        match val {
+            Value::Slot { off, .. } => self.emit_q(true, qreg, off),
+            Value::Const { bits, .. } => {
+                // Stage the 16-byte bit pattern in a temp slot, then load it into the q register.
+                let off = self.alloc_slot(16, 16);
+                self.load_imm(X9, bits, OperandSize::S64);
+                self.emit_mem_gpr(false, false, MemSize::X, X9, SP, off);
+                self.load_imm(X9, bits >> 64, OperandSize::S64);
+                self.emit_mem_gpr(false, false, MemSize::X, X9, SP, off + 8);
+                self.emit_q(true, qreg, off);
+            }
+            Value::Sym { sym, offset, .. } => {
+                let symref = SymRef { name: self.cx.sym_name(sym), addend: offset };
+                self.emit(Inst::Adrp { rd: X9, sym: symref.clone() });
+                self.emit(Inst::AddLo { rd: X9, rn: X9, sym: symref });
+                self.emit(Inst::LoadStoreQ { load: true, rt: qreg, rn: X9, offset: 0 });
+            }
+            Value::Undef { .. } => {
+                let off = self.alloc_slot(16, 16);
+                self.emit_mem_gpr(false, false, MemSize::X, ZR, SP, off);
+                self.emit_mem_gpr(false, false, MemSize::X, ZR, SP, off + 8);
+                self.emit_q(true, qreg, off);
+            }
+        }
+    }
+
+    /// Store the `q` register `qreg` (a 16-byte `f128`) into a fresh frame slot.
+    fn spill_q_val(&mut self, qreg: Vreg, ty: Type) -> Value {
+        let off = self.alloc_slot(16, 16);
+        self.emit_q(false, qreg, off);
+        Value::Slot { off, ty }
+    }
+
+    /// An `f128` binary arithmetic op via a `compiler_builtins` libcall (`__addtf3`/`__subtf3`/
+    /// `__multf3`/`__divtf3`): operands in `q0`/`q1`, result in `q0`.
+    fn f128_binop(&mut self, sym: &str, lhs: Value, rhs: Value) -> Value {
+        let ty = lhs.ty();
+        self.materialize_q(lhs, V0);
+        self.materialize_q(rhs, V1);
+        self.emit(Inst::Bl { sym: SymRef::new(sym) });
+        self.spill_q_val(V0, ty)
+    }
+
+    /// An `f128` comparison via a `compiler_builtins` libcall (`__eqtf2`/`__lttf2`/...): the call
+    /// returns an `i32` in `w0` whose sign/zero relationship to `0` (using `cond`) gives the result.
+    fn f128_cmp(&mut self, sym: &str, cond: Cond, lhs: Value, rhs: Value) -> Value {
+        self.materialize_q(lhs, V0);
+        self.materialize_q(rhs, V1);
+        self.emit(Inst::Bl { sym: SymRef::new(sym) });
+        self.emit(Inst::AddSubImm {
+            op: AddSub::Sub,
+            size: OperandSize::S32,
+            set_flags: true,
+            rd: ZR,
+            rn: X0,
+            imm12: 0,
+            shift12: false,
+        });
+        self.emit(Inst::CondSel {
+            op: CondSel::Csinc,
+            size: OperandSize::S32,
+            rd: X9,
+            rn: ZR,
+            rm: ZR,
+            cond: cond.invert(),
+        });
+        self.spill(X9, self.cx.intern_type(TypeData::Int(1)))
+    }
+
+    /// Convert an integer to `f128` via a libcall (`__float[un]ditf` for <=64-bit sources, promoted
+    /// to 64 bits first, or `__float[un]titf` for `i128`). Result in `q0`.
+    fn int_to_f128(&mut self, signed: bool, val: Value, dest_ty: Type) -> Value {
+        if self.is_int128(val.ty()) {
+            let sym = if signed { "___floattitf" } else { "___floatuntitf" };
+            self.materialize128(val, X0, X1);
+            self.emit(Inst::Bl { sym: SymRef::new(sym) });
+            return self.spill_q_val(V0, dest_ty);
+        }
+        let i64ty = self.cx.intern_type(TypeData::Int(64));
+        let wide = if signed { self.sext(val, i64ty) } else { self.zext(val, i64ty) };
+        let sym = if signed { "___floatditf" } else { "___floatunditf" };
+        self.materialize(wide, X0);
+        self.emit(Inst::Bl { sym: SymRef::new(sym) });
+        self.spill_q_val(V0, dest_ty)
+    }
+
+    /// Convert `f128` to an integer via a libcall (`__fix[uns]tfti` for `i128`, else `__fix[uns]tfdi`
+    /// to `i64` then clamped to the destination width). These saturate and map NaN to zero.
+    fn f128_to_int(&mut self, signed: bool, val: Value, dest_ty: Type) -> Value {
+        if self.is_int128(dest_ty) {
+            let sym = if signed { "___fixtfti" } else { "___fixunstfti" };
+            self.materialize_q(val, V0);
+            self.emit(Inst::Bl { sym: SymRef::new(sym) });
+            return self.spill128(X0, X1, dest_ty);
+        }
+        let sym = if signed { "___fixtfdi" } else { "___fixunstfdi" };
+        self.materialize_q(val, V0);
+        self.emit(Inst::Bl { sym: SymRef::new(sym) });
+        self.clamp_fp_to_int(X0, dest_ty, signed)
     }
 
     /// Emit a carry-chained 128-bit add or subtract: `(lo, hi) op= (b_lo, b_hi)`. With `set_flags`,
@@ -1921,6 +2056,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             (FpSize::S64, false) => "___floatuntidf",
             (FpSize::S32, true) => "___floattisf",
             (FpSize::S32, false) => "___floatuntisf",
+            (FpSize::S16, true) => "___floattihf",
+            (FpSize::S16, false) => "___floatuntihf",
         };
         self.materialize128(val, X0, X1);
         self.emit(Inst::Bl { sym: SymRef::new(sym) });
@@ -1936,6 +2073,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             (FpSize::S64, false) => "___fixunsdfti",
             (FpSize::S32, true) => "___fixsfti",
             (FpSize::S32, false) => "___fixunssfti",
+            (FpSize::S16, true) => "___fixhfti",
+            (FpSize::S16, false) => "___fixunshfti",
         };
         self.materialize_fp(val, V0);
         self.emit(Inst::Bl { sym: SymRef::new(sym) });
@@ -2198,8 +2337,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             Value::Const { bits, .. } => {
                 // Load the raw IEEE-754 bit pattern into a scratch GPR, then move it across.
                 let gpr_size = match size {
-                    FpSize::S32 => OperandSize::S32,
                     FpSize::S64 => OperandSize::S64,
+                    FpSize::S16 | FpSize::S32 => OperandSize::S32,
                 };
                 self.load_imm(X9, bits, gpr_size);
                 self.emit(Inst::FmovFromGpr { size, rd: vreg, rn: X9 });
@@ -2226,6 +2365,15 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// `v16`, and spill.
     fn fp_alu(&mut self, op: FpOp2, lhs: Value, rhs: Value) -> Value {
         let ty = lhs.ty();
+        if self.is_f128(ty) {
+            let sym = match op {
+                FpOp2::Fadd => "___addtf3",
+                FpOp2::Fsub => "___subtf3",
+                FpOp2::Fmul => "___multf3",
+                FpOp2::Fdiv => "___divtf3",
+            };
+            return self.f128_binop(sym, lhs, rhs);
+        }
         let size = fp_size(self.cx, ty);
         self.materialize_fp(lhs, V16);
         self.materialize_fp(rhs, V17);
@@ -2260,6 +2408,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         match fp_size(self.cx, ty) {
             FpSize::S64 => format!("_{base}"),
             FpSize::S32 => format!("_{base}f"),
+            // `f16` has no standard libm form; transcendental math on `f16` is not supported.
+            FpSize::S16 => todo!("rustc_codegen_arm64: f16 libm math ({base})"),
         }
     }
 
@@ -2289,6 +2439,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let sym = match fp_size(self.cx, ty) {
             FpSize::S64 => "___powidf2",
             FpSize::S32 => "___powisf2",
+            FpSize::S16 => todo!("rustc_codegen_arm64: f16 powi"),
         };
         self.materialize_fp(base_val, V0);
         self.materialize(exp, X0);
@@ -3265,6 +3416,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     ngrn += 1;
                 }
             }
+        } else if self.is_f128(v.ty()) {
+            self.materialize_q(v, V0);
         } else if type_is_float(self.cx, v.ty()) {
             self.materialize_fp(v, V0);
         } else if self.is_int128(v.ty()) {
@@ -3721,6 +3874,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 self.copy_ptr_to_slot(off, X9, size);
                 return Value::Slot { off, ty };
             }
+            TypeData::Float(128) => {
+                // `f128` is a 16-byte value held in a `q` register; copy its full image into a slot.
+                let (size, align) = self.cx.type_size_align(ty);
+                let off = self.alloc_slot(size, align);
+                self.materialize(ptr, X9);
+                self.copy_ptr_to_slot(off, X9, size);
+                return Value::Slot { off, ty };
+            }
             TypeData::Aggregate { .. } => {
                 // A `>2`-register cast aggregate (e.g. a 3- or 4-element HFA) does not fit in a
                 // single register; copy its full byte image into a fresh slot so the caller's
@@ -3886,6 +4047,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             self.emit(Inst::LoadStoreUImm { load: false, signed: false, size: MemSize::X, rt: X11, rn: X9, offset: 8 });
             return Value::Undef { ty: self.ptr_ty() };
         }
+        if self.is_f128(val.ty()) {
+            // `f128` is a 16-byte value; store it through a `q` register.
+            self.materialize(ptr, X9);
+            self.materialize_q(val, V0);
+            self.emit(Inst::LoadStoreQ { load: false, rt: V0, rn: X9, offset: 0 });
+            return Value::Undef { ty: self.ptr_ty() };
+        }
         self.materialize(ptr, X9);
         self.materialize(val, X10);
         self.emit(Inst::LoadStoreUImm {
@@ -3997,6 +4165,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.fptosi(val, dest_ty)
     }
     fn fptoui(&mut self, val: Value, dest_ty: Type) -> Value {
+        if self.is_f128(val.ty()) {
+            return self.f128_to_int(false, val, dest_ty);
+        }
         if self.is_int128(dest_ty) {
             return self.fp_to_int128(false, val, dest_ty);
         }
@@ -4007,6 +4178,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.clamp_fp_to_int(X9, dest_ty, false)
     }
     fn fptosi(&mut self, val: Value, dest_ty: Type) -> Value {
+        if self.is_f128(val.ty()) {
+            return self.f128_to_int(true, val, dest_ty);
+        }
         if self.is_int128(dest_ty) {
             return self.fp_to_int128(true, val, dest_ty);
         }
@@ -4017,6 +4191,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.clamp_fp_to_int(X9, dest_ty, true)
     }
     fn uitofp(&mut self, val: Value, dest_ty: Type) -> Value {
+        if self.is_f128(dest_ty) {
+            return self.int_to_f128(false, val, dest_ty);
+        }
         if self.is_int128(val.ty()) {
             return self.int128_to_fp(false, val, dest_ty);
         }
@@ -4029,6 +4206,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.spill_fp(V16, dest_ty)
     }
     fn sitofp(&mut self, val: Value, dest_ty: Type) -> Value {
+        if self.is_f128(dest_ty) {
+            return self.int_to_f128(true, val, dest_ty);
+        }
         if self.is_int128(val.ty()) {
             return self.int128_to_fp(true, val, dest_ty);
         }
@@ -4041,6 +4221,18 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.spill_fp(V16, dest_ty)
     }
     fn fptrunc(&mut self, val: Value, dest_ty: Type) -> Value {
+        // `f128` -> narrower float: a `compiler_builtins` libcall (source in `q0`, result in the
+        // narrower FP register).
+        if self.is_f128(val.ty()) {
+            let sym = match fp_size(self.cx, dest_ty) {
+                FpSize::S16 => "___trunctfhf2",
+                FpSize::S32 => "___trunctfsf2",
+                FpSize::S64 => "___trunctfdf2",
+            };
+            self.materialize_q(val, V0);
+            self.emit(Inst::Bl { sym: SymRef::new(sym) });
+            return self.spill_fp(V0, dest_ty);
+        }
         let from = fp_size(self.cx, val.ty());
         let to = fp_size(self.cx, dest_ty);
         self.materialize_fp(val, V16);
@@ -4048,6 +4240,18 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.spill_fp(V16, dest_ty)
     }
     fn fpext(&mut self, val: Value, dest_ty: Type) -> Value {
+        // narrower float -> `f128`: a `compiler_builtins` libcall (source in the narrower FP
+        // register, result in `q0`).
+        if self.is_f128(dest_ty) {
+            let sym = match fp_size(self.cx, val.ty()) {
+                FpSize::S16 => "___extendhftf2",
+                FpSize::S32 => "___extendsftf2",
+                FpSize::S64 => "___extenddftf2",
+            };
+            self.materialize_fp(val, V0);
+            self.emit(Inst::Bl { sym: SymRef::new(sym) });
+            return self.spill_q_val(V0, dest_ty);
+        }
         let from = fp_size(self.cx, val.ty());
         let to = fp_size(self.cx, dest_ty);
         self.materialize_fp(val, V16);
@@ -4100,6 +4304,21 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             RealPredicate::RealPredicateFalse => return self.cx.const_bool(false),
             RealPredicate::RealPredicateTrue => return self.cx.const_bool(true),
             _ => {}
+        }
+        // `f128` has no hardware compare: each predicate is a `compiler_builtins` libcall returning
+        // an `i32` whose sign relationship to `0` gives the boolean. Rust only emits the six
+        // ordered/unordered forms below.
+        if self.is_f128(lhs.ty()) {
+            let (sym, cond) = match op {
+                RealPredicate::RealOEQ => ("___eqtf2", Cond::Eq),
+                RealPredicate::RealUNE => ("___netf2", Cond::Ne),
+                RealPredicate::RealOLT => ("___lttf2", Cond::Lt),
+                RealPredicate::RealOLE => ("___letf2", Cond::Le),
+                RealPredicate::RealOGT => ("___gttf2", Cond::Gt),
+                RealPredicate::RealOGE => ("___getf2", Cond::Ge),
+                _ => todo!("rustc_codegen_arm64: f128 float predicate {op:?}"),
+            };
+            return self.f128_cmp(sym, cond, lhs, rhs);
         }
         let size = fp_size(self.cx, lhs.ty());
         self.materialize_fp(lhs, V16);
@@ -4572,7 +4791,18 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// 128-bit integers take a consecutive `x` pair (or a 16-byte stack slot), everything else uses
     /// the next `x` register.
     fn marshal_scalar_arg(&mut self, arg: Value, a: &mut ArgAssign) {
-        if type_is_float(self.cx, arg.ty()) {
+        if self.is_f128(arg.ty()) {
+            // `f128` is passed in a full 128-bit `q` register (or 16-byte-aligned on the stack).
+            if a.nsrn < 8 {
+                self.materialize_q(arg, Vreg::from_encoding(a.nsrn));
+                a.nsrn += 1;
+            } else {
+                a.nsaa = (a.nsaa + 15) & !15;
+                self.materialize_q(arg, V16);
+                self.emit_q(false, V16, a.nsaa as u64);
+                a.nsaa += 16;
+            }
+        } else if type_is_float(self.cx, arg.ty()) {
             if a.nsrn < 8 {
                 self.materialize_fp(arg, Vreg::from_encoding(a.nsrn));
                 a.nsrn += 1;
@@ -4862,6 +5092,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         }
                         Value::Slot { off: base, ty }
                     }
+                    _ if self.is_f128(ty) => self.spill_q_val(V0, ty),
                     _ if type_is_float(self.cx, ty) => self.spill_fp(V0, ty),
                     _ if self.is_int128(ty) => self.spill128(X0, X1, ty),
                     _ => self.spill(X0, ty),

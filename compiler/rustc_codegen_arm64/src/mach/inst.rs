@@ -725,6 +725,7 @@ impl Inst {
                 let base: u32 = match size {
                     FpSize::S64 => 0x9E67_0000,
                     FpSize::S32 => 0x1E27_0000,
+                    FpSize::S16 => 0x1EE7_0000,
                 };
                 base | (rn.encoding() << 5) | rd.encoding()
             }
@@ -734,8 +735,11 @@ impl Inst {
                     (true, FpSize::S64) => 0xFD40_0000,
                     (false, FpSize::S32) => 0xBD00_0000,
                     (true, FpSize::S32) => 0xBD40_0000,
+                    (false, FpSize::S16) => 0x7D00_0000,
+                    (true, FpSize::S16) => 0x7D40_0000,
                 };
                 let scale = match size {
+                    FpSize::S16 => 2,
                     FpSize::S32 => 4,
                     FpSize::S64 => 8,
                 };
@@ -748,6 +752,7 @@ impl Inst {
                 let base: u32 = match size {
                     FpSize::S64 => 0x1E60_2000,
                     FpSize::S32 => 0x1E20_2000,
+                    FpSize::S16 => 0x1EE0_2000,
                 };
                 base | (rm.encoding() << 16) | (rn.encoding() << 5)
             }
@@ -776,9 +781,14 @@ impl Inst {
                 let base: u32 = match (from, to) {
                     (FpSize::S64, FpSize::S32) => 0x1E62_4000,
                     (FpSize::S32, FpSize::S64) => 0x1E22_C000,
-                    // Same-size "cast" is an identity copy: emit `fmov` (S/D), not a real convert.
+                    (FpSize::S16, FpSize::S32) => 0x1EE2_4000,
+                    (FpSize::S32, FpSize::S16) => 0x1E23_C000,
+                    (FpSize::S16, FpSize::S64) => 0x1EE2_C000,
+                    (FpSize::S64, FpSize::S16) => 0x1E63_C000,
+                    // Same-size "cast" is an identity copy: emit `fmov`, not a real convert.
                     (FpSize::S32, FpSize::S32) => 0x1E20_4000,
                     (FpSize::S64, FpSize::S64) => 0x1E60_4000,
+                    (FpSize::S16, FpSize::S16) => 0x1EE0_4000,
                 };
                 base | (rn.encoding() << 5) | rd.encoding()
             }
@@ -1360,6 +1370,29 @@ mod tests {
         assert_eq!(Inst::SimdThree { op: SimdOp::Fmul, q: true, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x6E22DC20);
         assert_eq!(Inst::SimdThree { op: SimdOp::Fdiv, q: true, size: 0, rd: V0, rn: V1, rm: V2 }.encode(), 0x6E22FC20);
         assert_eq!(Inst::SimdThree { op: SimdOp::Fdiv, q: true, size: 1, rd: V0, rn: V1, rm: V2 }.encode(), 0x6E62FC20);
+    }
+
+    #[test]
+    fn half_encodings() {
+        // Half-precision (f16) scalar FP ops use ftype = 0b11.
+        assert_eq!(Inst::FpDataProc2 { op: FpOp2::Fadd, size: FpSize::S16, rd: V0, rn: V1, rm: V2 }.encode(), 0x1EE22820);
+        assert_eq!(Inst::FpDataProc2 { op: FpOp2::Fsub, size: FpSize::S16, rd: V0, rn: V1, rm: V2 }.encode(), 0x1EE23820);
+        assert_eq!(Inst::FpDataProc2 { op: FpOp2::Fmul, size: FpSize::S16, rd: V0, rn: V1, rm: V2 }.encode(), 0x1EE20820);
+        assert_eq!(Inst::FpDataProc2 { op: FpOp2::Fdiv, size: FpSize::S16, rd: V0, rn: V1, rm: V2 }.encode(), 0x1EE21820);
+        assert_eq!(Inst::FpCmp { size: FpSize::S16, rn: V0, rm: V1 }.encode(), 0x1EE12000);
+        assert_eq!(Inst::FmovFromGpr { size: FpSize::S16, rd: V0, rn: X9 }.encode(), 0x1EE70120);
+        assert_eq!(Inst::LoadStoreFpUImm { load: true, size: FpSize::S16, rt: V0, rn: SP, offset: 2 }.encode(), 0x7D4007E0);
+        assert_eq!(Inst::LoadStoreFpUImm { load: false, size: FpSize::S16, rt: V0, rn: SP, offset: 4 }.encode(), 0x7D000BE0);
+        // fcvt to/from half.
+        assert_eq!(Inst::FpCvt { from: FpSize::S16, to: FpSize::S32, rd: V0, rn: V1 }.encode(), 0x1EE24020);
+        assert_eq!(Inst::FpCvt { from: FpSize::S32, to: FpSize::S16, rd: V0, rn: V1 }.encode(), 0x1E23C020);
+        assert_eq!(Inst::FpCvt { from: FpSize::S16, to: FpSize::S64, rd: V0, rn: V1 }.encode(), 0x1EE2C020);
+        assert_eq!(Inst::FpCvt { from: FpSize::S64, to: FpSize::S16, rd: V0, rn: V1 }.encode(), 0x1E63C020);
+        // Half unary.
+        assert_eq!(Inst::FpDataProc1 { op: FpOp1::Fabs, size: FpSize::S16, rd: V0, rn: V1 }.encode(), 0x1EE0C020);
+        assert_eq!(Inst::FpDataProc1 { op: FpOp1::Fneg, size: FpSize::S16, rd: V0, rn: V1 }.encode(), 0x1EE14020);
+        assert_eq!(Inst::FpDataProc1 { op: FpOp1::Fsqrt, size: FpSize::S16, rd: V0, rn: V1 }.encode(), 0x1EE1C020);
+        assert_eq!(Inst::FpDataProc1 { op: FpOp1::Frintm, size: FpSize::S16, rd: V0, rn: V1 }.encode(), 0x1EE54020);
     }
 
     #[test]

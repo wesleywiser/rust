@@ -41,6 +41,12 @@
 //!   `sha256su1`) are lowered to the real instructions, moving the 128-bit operands between frame
 //!   slots and `v` registers via `q` loads/stores. Differential-tested against the LLVM backend.
 //!
+//! - **Debug info is not generated.** All the `DebugInfoCodegenMethods` (variable/scope/location
+//!   creation, vtable debuginfo, the gdb scripts section) are no-ops over unit `DIScope`/
+//!   `DILocation`/`DIVariable` types, so `-g` builds produce working binaries with no DWARF —
+//!   debuggers and profilers see only symbol names, not line tables, types, or local variables.
+//!   Emitting DWARF (a `__debug_*` section set plus per-function line programs) is future work.
+//!
 //! Implemented since the first cut, for reference:
 //!
 //! - **128-bit integers (`i128`/`u128`).** Modelled as a low/high pair of 64-bit words in a 16-byte
@@ -53,6 +59,20 @@
 //!   overflow-checked multiply uses `__muloti4` (signed) or the `a != 0 && (a*b)/a != b` idiom
 //!   (unsigned). `ctlz`/`cttz`/`ctpop`/`bswap`/`bitreverse` operate per word. The whole surface is
 //!   differential-tested against the LLVM backend.
+//!
+//! - **`f16` and `f128`.** `f16` uses the native half-precision instructions (Apple Silicon's
+//!   FEAT_FP16): a third `FpSize` (`h`) drives `fadd`/`fsub`/`fmul`/`fdiv`/`fcmp`/`fcvt` and is
+//!   passed/returned in an `h` register. `f128` (IEEE binary128, no AArch64 hardware) is a 16-byte
+//!   value held in a `q` register; every operation \u2014 arithmetic, comparison, and the conversions
+//!   to/from the other floats and the integers \u2014 is a `compiler_builtins` libcall (`__addtf3`,
+//!   `__lttf2`, `__trunctfdf2`, `__floatditf`, ...), and it is passed/returned in a `q` register.
+//!   Both are differential-tested against the LLVM backend.
+//!
+//! - **Thread-local storage** uses the macOS thread-local-variable (TLV) model: a thread-local
+//!   static is emitted as a `$tlv$init` initializer in `__thread_data` plus a three-word descriptor
+//!   in `__thread_vars`, and a read loads the descriptor address (`TLVP_LOAD_PAGE21`/`PAGEOFF12`
+//!   relocations) and calls the thunk in its first word to get the per-thread address. This is what
+//!   unblocks `HashMap`/`HashSet`, whose `RandomState` seed is a thread-local.
 //!
 //! - **Thread-local storage** uses the macOS thread-local-variable (TLV) model: a thread-local
 //!   static is emitted as a `$tlv$init` initializer in `__thread_data` plus a three-word descriptor

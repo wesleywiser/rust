@@ -153,26 +153,30 @@ impl OperandSize {
     }
 }
 
-/// Floating-point operand size: single (`s`) or double (`d`).
+/// Floating-point operand size: half (`h`), single (`s`), or double (`d`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FpSize {
+    S16,
     S32,
     S64,
 }
 
 impl FpSize {
-    /// The 2-bit `ftype` field used by scalar FP instructions (`00` = single, `01` = double).
+    /// The 2-bit `ftype` field used by scalar FP instructions (`00` = single, `01` = double,
+    /// `11` = half).
     #[inline]
     pub const fn ftype(self) -> u32 {
         match self {
             FpSize::S32 => 0b00,
             FpSize::S64 => 0b01,
+            FpSize::S16 => 0b11,
         }
     }
 
     #[inline]
     pub const fn prefix(self) -> &'static str {
         match self {
+            FpSize::S16 => "h",
             FpSize::S32 => "s",
             FpSize::S64 => "d",
         }
