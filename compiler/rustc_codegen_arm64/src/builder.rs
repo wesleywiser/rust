@@ -54,6 +54,10 @@ pub struct FunctionBuild {
     pub frame: FrameLayout,
     /// Spilled location of each physical incoming parameter, indexed by physical param index.
     pub param_slots: Vec<Value>,
+    /// EH call sites recorded by `invoke` (label ids); resolved to offsets at encode time.
+    pub call_sites: Vec<crate::mach::func::MachCallSite>,
+    /// Next synthetic label id for bracketing call sites (kept clear of block-id labels).
+    pub next_cs_label: u32,
 }
 
 impl FunctionBuild {
@@ -72,6 +76,8 @@ impl FunctionBuild {
             blocks: Vec::new(),
             frame: FrameLayout::new(outgoing_bytes),
             param_slots: Vec::new(),
+            call_sites: Vec::new(),
+            next_cs_label: 0xF000_0000,
         }
     }
 
@@ -88,6 +94,7 @@ impl FunctionBuild {
     pub fn finish(self) -> MachFunction {
         let frame = self.frame.frame_size();
         let mut f = MachFunction::new(self.name, self.is_global);
+        f.call_sites = self.call_sites;
 
         // Prologue: save FP/LR, set up the frame pointer, reserve the local frame.
         f.push(Inst::LoadStorePair {
@@ -269,6 +276,24 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let mut cur = self.cx.cur_fn.borrow_mut();
         let fb = cur.as_mut().expect("no function is currently being built");
         fb.frame.alloc_local(size, align)
+    }
+
+    /// Allocate a fresh synthetic label id for bracketing an EH call site (kept clear of block-id
+    /// labels, which start at 0).
+    fn fresh_cs_label(&self) -> u32 {
+        let mut cur = self.cx.cur_fn.borrow_mut();
+        let fb = cur.as_mut().expect("no function is currently being built");
+        let l = fb.next_cs_label;
+        fb.next_cs_label += 1;
+        l
+    }
+
+    /// Record an EH call site: a call in `[begin, end)` that unwinds transfers to landing-pad
+    /// block `lp` (`action` 0 = cleanup, 1 = catch-all).
+    fn record_call_site(&self, begin: u32, end: u32, lp: u32, action: u8) {
+        let mut cur = self.cx.cur_fn.borrow_mut();
+        let fb = cur.as_mut().expect("no function is currently being built");
+        fb.call_sites.push(crate::mach::func::MachCallSite { begin, end, landing_pad: lp, action });
     }
 
     /// Copy `size` bytes from `[src]` into the frame slot at `dst_off`, using descending
@@ -2158,12 +2183,16 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             // tables), so the catch path is never reached. Run the try function and report that no
             // panic was caught (return 0) — exactly the panic=abort lowering.
             sym::catch_unwind => {
+                // Pure FRAME-mode unwind tables can't run a personality, so the catch path is never
+                // reached: run try(data) and report no catch (return 0), matching panic=abort.
                 let try_func = args[0].immediate();
                 let data = args[1].immediate();
+                let i32t = self.cx.intern_type(TypeData::Int(32));
                 self.emit_call_core(None, None, try_func, &[data]);
-                let ret_ty = self.cx.immediate_backend_type(result_layout);
-                let zero = self.cx.const_int(ret_ty, 0);
-                IntrinsicResult::Operand(OperandValue::Immediate(zero))
+                let res = self.alloc_slot(4, 4);
+                self.load_imm(X9, 0, OperandSize::S32);
+                self.emit_mem_gpr(false, false, MemSize::W, X9, SP, res);
+                IntrinsicResult::Operand(OperandValue::Immediate(Value::Slot { off: res, ty: i32t }))
             }
             // Saturating add/sub, clamped to the integer type's range.
             sym::saturating_add | sym::saturating_sub => {
@@ -2520,7 +2549,6 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn switch_to_block(&mut self, llbb: BasicBlock) {
         self.block = llbb;
     }
-
     fn ret_void(&mut self) {
         self.emit(Inst::Ret { rn: LR });
     }
@@ -2608,17 +2636,22 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         llfn: Value,
         args: &[Value],
         then: BasicBlock,
-        _catch: BasicBlock,
+        catch: BasicBlock,
         _funclet: Option<&()>,
         _instance: Option<Instance<'tcx>>,
     ) -> Value {
-        // Baseline model: emit the call and fall through to the normal successor. The unwind edge
-        // (`_catch`) is not wired up; an unwind through this call aborts (panic=abort semantics).
+        // Bracket the call in a labeled range and record a cleanup landing pad: if the call
+        // unwinds, the personality transfers control to the `catch` block (action 0 = cleanup).
+        let begin = self.fresh_cs_label();
+        let end = self.fresh_cs_label();
         let ret_fallback = match self.cx.type_data(llty) {
             TypeData::Func { ret, .. } => Some(ret),
             _ => None,
         };
+        self.emit(Inst::Label(begin));
         let ret = self.emit_call_core(fn_abi, ret_fallback, llfn, args);
+        self.emit(Inst::Label(end));
+        self.record_call_site(begin, end, catch.0, 0);
         self.br(then);
         ret
     }
@@ -3493,16 +3526,19 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn set_personality_fn(&mut self, _personality: Function) {}
     fn cleanup_landing_pad(&mut self, _pers_fn: Function) -> (Value, Value) {
-        // Baseline unwinding model: cleanup landing pads abort rather than run real cleanup. The
-        // landing-pad operands (exception pointer + selector) are never inspected before the
-        // `resume`/terminate aborts, so undefined placeholders suffice.
+        // A landing pad is entered by the unwinder with the exception object pointer in x0 and the
+        // selector in x1. Spill both so the cleanup code (and the eventual `resume`) can use them.
         let ptr = self.ptr_ty();
         let i32_ty = self.cx.intern_type(TypeData::Int(32));
-        (Value::Undef { ty: ptr }, Value::Undef { ty: i32_ty })
+        let exn = self.spill(X0, ptr);
+        let sel = self.spill(X1, i32_ty);
+        (exn, sel)
     }
     fn filter_landing_pad(&mut self, _pers_fn: Function) {}
-    fn resume(&mut self, _exn0: Value, _exn1: Value) {
-        // An unwind reaching `resume` aborts in the baseline (panic=abort semantics).
+    fn resume(&mut self, exn0: Value, _exn1: Value) {
+        // Continue unwinding to the next frame: `_Unwind_Resume(exn)` (never returns).
+        self.materialize(exn0, X0);
+        self.emit(Inst::Bl { sym: SymRef::new("__Unwind_Resume") });
         self.emit(Inst::Brk { imm16: 1 });
     }
     fn cleanup_pad(&mut self, _parent: Option<Value>, _args: &[Value]) {}

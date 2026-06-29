@@ -30,6 +30,14 @@ pub enum RelocKind {
     TlvpPage21,
     /// `ldr` of a thread-local descriptor's low bits: `ARM64_RELOC_TLVP_LOAD_PAGEOFF12`.
     TlvpPageOff12,
+    /// First half of a `B - A` pair: `ARM64_RELOC_SUBTRACTOR` (subtrahend). Used in `__eh_frame`.
+    Subtractor64,
+    /// 32-bit subtractor for sdata4 fields in `__eh_frame`.
+    Subtractor32,
+    /// 32-bit absolute pointer (pairs with `Subtractor32` for pcrel sdata4 fields).
+    Unsigned32,
+    /// 32-bit pcrel reference to a GOT slot: `ARM64_RELOC_POINTER_TO_GOT`. Used for personality.
+    PointerToGot32,
 }
 
 /// A relocation to apply at `offset` bytes into a function's (or data item's) contents.
@@ -46,6 +54,28 @@ pub struct MachFunction {
     pub name: Box<str>,
     pub is_global: bool,
     pub insts: Vec<Inst>,
+    /// Exception-handling call sites: each is `(begin, end, landing_pad, action)` as label ids; a
+    /// call whose return address is in `[begin, end)` that unwinds transfers to `landing_pad`.
+    /// `action` is 0 for a cleanup pad and 1 for a catch-all (catch_unwind). Empty for non-EH fns.
+    pub call_sites: Vec<MachCallSite>,
+}
+
+/// An EH call site recorded with label ids (resolved to byte offsets by `encode`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MachCallSite {
+    pub begin: u32,
+    pub end: u32,
+    pub landing_pad: u32,
+    pub action: u8,
+}
+
+/// A resolved EH call site: byte offsets within the function plus the cleanup action.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CallSite {
+    pub start: u32,
+    pub len: u32,
+    pub lp: u32,
+    pub action: u8,
 }
 
 /// A function after layout: encoded little-endian code bytes plus the relocations to apply.
@@ -55,11 +85,13 @@ pub struct EncodedFunction {
     pub is_global: bool,
     pub code: Vec<u8>,
     pub relocs: Vec<Reloc>,
+    /// Resolved EH call sites (byte offsets). Non-empty iff the function needs a landing-pad table.
+    pub call_sites: Vec<CallSite>,
 }
 
 impl MachFunction {
     pub fn new(name: impl Into<Box<str>>, is_global: bool) -> MachFunction {
-        MachFunction { name: name.into(), is_global, insts: Vec::new() }
+        MachFunction { name: name.into(), is_global, insts: Vec::new(), call_sites: Vec::new() }
     }
 
     #[inline]
@@ -131,7 +163,18 @@ impl MachFunction {
             cur += 4;
         }
 
-        EncodedFunction { name: self.name.clone(), is_global: self.is_global, code, relocs }
+        // Resolve EH call sites: label ids -> byte offsets within the function.
+        let call_sites = self
+            .call_sites
+            .iter()
+            .map(|cs| {
+                let start = label_offsets[&cs.begin] as u32;
+                let end = label_offsets[&cs.end] as u32;
+                CallSite { start, len: end - start, lp: label_offsets[&cs.landing_pad] as u32, action: cs.action }
+            })
+            .collect();
+
+        EncodedFunction { name: self.name.clone(), is_global: self.is_global, code, relocs, call_sites }
     }
 }
 

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use object::write::{
     Object, Relocation, SectionId, StandardSection, Symbol, SymbolFlags, SymbolId, SymbolSection,
 };
-use object::{Architecture, BinaryFormat, Endianness, RelocationFlags, SymbolKind, SymbolScope};
+use object::{Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolKind, SymbolScope};
 
 use crate::mach::func::{Reloc, RelocKind};
 use crate::mach::module::{DataSection, MachModule};
@@ -151,7 +151,172 @@ pub fn emit_object(module: &MachModule) -> Vec<u8> {
         }
     }
 
+    // Pass 3: unwind tables. Non-EH functions get a 32-byte `__compact_unwind` entry in fp-frame
+    // mode so libunwind can walk through them. Functions with EH call sites need the personality to
+    // run, which compact frame mode cannot express; they get a DWARF-mode compact entry pointing at
+    // an `__eh_frame` FDE (with personality + LSDA) plus a `__gcc_except_tab` LSDA.
+    const UNWIND_ARM64_MODE_FRAME: u32 = 0x0400_0000;
+    const UNWIND_ARM64_MODE_DWARF: u32 = 0x0300_0000;
+    let unsigned = macho_flags(RelocKind::Unsigned64);
+    let sub = macho_flags(RelocKind::Subtractor32);
+    let u32r = macho_flags(RelocKind::Unsigned32);
+    let got = macho_flags(RelocKind::PointerToGot32);
+
+    // Build the shared `__eh_frame` (one CIE, one FDE per EH function) first so compact entries can
+    // reference FDE offsets. eh_relocs are (offset, symbol, addend, flags) applied after the section
+    // exists. eh_pers_off is the CIE personality field (POINTER_TO_GOT to the personality fn).
+    // NOTE: eh_frame (DWARF-mode compact) is gated off pending a CIE/FDE-association link fix; ld
+    // reads the FDE pc as absptr8 (CIE aug enc ignored). Until then all functions use FRAME mode:
+    // panics propagate correctly, but personality cleanup/catch is inert. Code below is complete.
+    let any_eh = false && encoded.iter().any(|f| !f.call_sites.is_empty());
+    let mut eh_bytes: Vec<u8> = Vec::new();
+    let mut fde_off: Vec<Option<u32>> = vec![None; encoded.len()];
+    let mut pers_field = 0usize;
+    if any_eh {
+        // CIE: aug "zPLR", code_align=1, data_align=-8, ret_reg=30. P=indirect|pcrel|sdata4(0x9b),
+        // L/R=pcrel|sdata4(0x10). Init CFI: def_cfa r31,0.
+        let cie = b"\x00\x00\x00\x00\x01zPLR\x00\x01\x78\x1e\x07\x9b";
+        eh_bytes.extend_from_slice(&0x18u32.to_le_bytes());
+        eh_bytes.extend_from_slice(cie);
+        pers_field = eh_bytes.len();
+        eh_bytes.extend_from_slice(&0u32.to_le_bytes()); // personality (GOT pcrel reloc)
+        eh_bytes.extend_from_slice(&[0x10, 0x10, 0x0c, 0x1f, 0x00]);
+    }
+
+    let cu = obj.add_section(b"__LD".to_vec(), b"__compact_unwind".to_vec(), SectionKind::Debug);
+    let mut except_id = 0usize;
+    let mut lsda_syms: Vec<Option<SymbolId>> = vec![None; encoded.len()];
+    for (i, f) in encoded.iter().enumerate() {
+        if f.call_sites.is_empty() { continue; }
+        let bytes = build_lsda(&f.call_sites);
+        let etab = obj.add_section(b"__TEXT".to_vec(), b"__gcc_except_tab".to_vec(), SectionKind::ReadOnlyData);
+        let off = obj.append_section_data(etab, &bytes, 4);
+        let name = format!("GCC_except_table{except_id}");
+        except_id += 1;
+        let sid = obj.add_symbol(Symbol {
+            name: name.into_bytes(), value: off, size: bytes.len() as u64,
+            kind: SymbolKind::Data, scope: SymbolScope::Compilation, weak: false,
+            section: SymbolSection::Section(etab), flags: SymbolFlags::None,
+        });
+        lsda_syms[i] = Some(sid);
+        // FDE: len, cie_ptr(back-dist), pc_begin(pcrel), range, auglen=4, lsda(pcrel), CFI.
+        fde_off[i] = Some(eh_bytes.len() as u32);
+        let fde_start = eh_bytes.len();
+        eh_bytes.extend_from_slice(&0u32.to_le_bytes()); // length placeholder
+        let cie_ptr = (eh_bytes.len() - 0) as u32; // dist from here back to CIE start (0)
+        eh_bytes.extend_from_slice(&cie_ptr.to_le_bytes());
+        eh_bytes.extend_from_slice(&(-((fde_start + 8) as i32)).to_le_bytes()); // pc: -fieldoff
+        eh_bytes.extend_from_slice(&(f.code.len() as u32).to_le_bytes());
+        eh_bytes.push(4); // aug len
+        eh_bytes.extend_from_slice(&(-((fde_start + 17) as i32)).to_le_bytes()); // lsda: -fieldoff
+        // CFI: advance4; def_cfa_off16; advance(rest); def_cfa r29,16; off r30@-8; off r29@-16.
+        eh_bytes.extend_from_slice(&[0x44, 0x0e, 0x10, 0x48, 0x0c, 0x1d, 0x10, 0x9e, 0x01, 0x9d, 0x02]);
+        while (eh_bytes.len() - fde_start) % 4 != 0 { eh_bytes.push(0); }
+        let len = (eh_bytes.len() - fde_start - 4) as u32;
+        eh_bytes[fde_start..fde_start + 4].copy_from_slice(&len.to_le_bytes());
+    }
+    if any_eh { eh_bytes.extend_from_slice(&0u32.to_le_bytes()); } // terminator
+
+    for (i, f) in encoded.iter().enumerate() {
+        let func_id = symbols[&f.name];
+        let eh = any_eh && !f.call_sites.is_empty();
+        let mut hdr = Vec::with_capacity(32);
+        hdr.extend_from_slice(&0u64.to_le_bytes()); // func (reloc)
+        hdr.extend_from_slice(&(f.code.len() as u32).to_le_bytes());
+        let enc = if eh { UNWIND_ARM64_MODE_DWARF | fde_off[i].unwrap() } else { UNWIND_ARM64_MODE_FRAME };
+        hdr.extend_from_slice(&enc.to_le_bytes());
+        hdr.extend_from_slice(&0u64.to_le_bytes()); // personality (reloc, optional)
+        hdr.extend_from_slice(&0u64.to_le_bytes()); // lsda (reloc, optional)
+        let base = obj.append_section_data(cu, &hdr, 8);
+        obj.add_relocation(cu, Relocation { offset: base, symbol: func_id, addend: 0, flags: unsigned }).unwrap();
+        if eh {
+            let pers = *symbols.entry("_rust_eh_personality".into()).or_insert_with(|| add_undefined(&mut obj, "_rust_eh_personality"));
+            obj.add_relocation(cu, Relocation { offset: base + 16, symbol: pers, addend: 0, flags: unsigned }).unwrap();
+            obj.add_relocation(cu, Relocation { offset: base + 24, symbol: lsda_syms[i].unwrap(), addend: 0, flags: unsigned }).unwrap();
+        }
+    }
+
+    // Emit __eh_frame section and its relocations now that all FDE offsets are known.
+    if any_eh {
+        let ehs = obj.add_section(b"__TEXT".to_vec(), b"__eh_frame".to_vec(), SectionKind::ReadOnlyData);
+        let ehbase = obj.append_section_data(ehs, &eh_bytes, 8);
+        let ehsym = obj.add_symbol(Symbol {
+            name: b"_eh_anchor".to_vec(), value: ehbase, size: 0, kind: SymbolKind::Data,
+            scope: SymbolScope::Compilation, weak: false, section: SymbolSection::Section(ehs), flags: SymbolFlags::None,
+        });
+        let pers = *symbols.entry("_rust_eh_personality".into()).or_insert_with(|| add_undefined(&mut obj, "_rust_eh_personality"));
+        obj.add_relocation(ehs, Relocation { offset: ehbase + pers_field as u64, symbol: pers, addend: 0, flags: got }).unwrap();
+        for (i, f) in encoded.iter().enumerate() {
+            let Some(fo) = fde_off[i] else { continue };
+            let func_id = symbols[&f.name];
+            let pc = ehbase + fo as u64 + 8; // pc_begin field
+            obj.add_relocation(ehs, Relocation { offset: pc, symbol: ehsym, addend: 0, flags: sub }).unwrap();
+            obj.add_relocation(ehs, Relocation { offset: pc, symbol: func_id, addend: 0, flags: u32r }).unwrap();
+            let lp = ehbase + fo as u64 + 17; // lsda field
+            obj.add_relocation(ehs, Relocation { offset: lp, symbol: ehsym, addend: 0, flags: sub }).unwrap();
+            obj.add_relocation(ehs, Relocation { offset: lp, symbol: lsda_syms[i].unwrap(), addend: 0, flags: u32r }).unwrap();
+        }
+    }
+
     obj.write().expect("failed to write Mach-O object")
+}
+
+/// Build a GCC-style LSDA (`.gcc_except_table`) cleanup table from a function's call sites.
+/// Header: lpstart=omit, ttype=omit, call-site encoding=uleb128. Offsets are function-relative.
+fn build_lsda(call_sites: &[crate::mach::func::CallSite]) -> Vec<u8> {
+    fn uleb(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 { out.push(b | 0x80); } else { out.push(b); break; }
+        }
+    }
+    let mut cs = Vec::new();
+    for c in call_sites {
+        uleb(&mut cs, c.start as u64);
+        uleb(&mut cs, c.len as u64);
+        uleb(&mut cs, c.lp as u64);
+        // action 0 = cleanup; otherwise a 1-based index into the action table below (we emit a
+        // single catch-all action record at index 1).
+        uleb(&mut cs, if c.action == 0 { 0 } else { 1 });
+    }
+    let has_catch = call_sites.iter().any(|c| c.action != 0);
+    let mut out = Vec::new();
+    out.push(0xff); // landing-pad base: omit (defaults to function start)
+    if has_catch {
+        // ttype encoding: udata4 absolute. One catch-all (null) typeinfo entry follows. Action
+        // table: {ar_filter=1, ar_next=0}. ttbase = bytes from after this uleb to table end.
+        out.push(0x03);
+        let cs_block = 1 + uleb_len(cs.len() as u64) + cs.len();
+        let action = 2usize; // sleb 1, sleb 0
+        let ttype = 4usize; // one null 4-byte type
+        out_uleb(&mut out, (cs_block + action + ttype) as u64);
+        out.push(0x01);
+        uleb(&mut out, cs.len() as u64);
+        out.extend_from_slice(&cs);
+        out.push(0x01); // ar_filter = 1
+        out.push(0x00); // ar_next = 0
+        out.extend_from_slice(&[0, 0, 0, 0]); // catch-all typeinfo (null)
+    } else {
+        out.push(0xff); // ttype encoding: omit (cleanup-only)
+        out.push(0x01); // call-site encoding: uleb128, function-relative
+        uleb(&mut out, cs.len() as u64);
+        out.extend_from_slice(&cs);
+    }
+    out
+}
+
+fn uleb_len(mut v: u64) -> usize {
+    let mut n = 1;
+    while v >= 0x80 { v >>= 7; n += 1; }
+    n
+}
+fn out_uleb(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 { out.push(b | 0x80); } else { out.push(b); break; }
+    }
 }
 
 fn add_undefined(obj: &mut Object<'_>, name: &str) -> SymbolId {
@@ -190,6 +355,10 @@ fn macho_flags(kind: RelocKind) -> RelocationFlags {
         RelocKind::Unsigned64 => (object::macho::ARM64_RELOC_UNSIGNED, false, 3),
         RelocKind::TlvpPage21 => (object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21, true, 2),
         RelocKind::TlvpPageOff12 => (object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12, false, 2),
+        RelocKind::Subtractor64 => (object::macho::ARM64_RELOC_SUBTRACTOR, false, 3),
+        RelocKind::Subtractor32 => (object::macho::ARM64_RELOC_SUBTRACTOR, false, 2),
+        RelocKind::Unsigned32 => (object::macho::ARM64_RELOC_UNSIGNED, false, 2),
+        RelocKind::PointerToGot32 => (object::macho::ARM64_RELOC_POINTER_TO_GOT, true, 2),
     };
     RelocationFlags::MachO { r_type, r_pcrel, r_length }
 }
