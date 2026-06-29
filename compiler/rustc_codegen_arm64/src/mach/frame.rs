@@ -32,9 +32,6 @@ pub(crate) fn align_up(value: u64, align: u64) -> u64 {
 /// calls); local spill slots are then allocated against it during instruction selection.
 #[derive(Debug)]
 pub struct FrameLayout {
-    /// Size of the outgoing-argument area at the bottom of the frame (`sp + 0 .. sp + outgoing`),
-    /// rounded up to the 16-byte stack alignment.
-    outgoing_size: u64,
     /// `sp`-relative offset at which the next local slot will be placed; starts just above the
     /// outgoing area and grows as slots are allocated.
     next_local: u64,
@@ -44,8 +41,7 @@ impl FrameLayout {
     /// Reserve `outgoing_bytes` (rounded up to the 16-byte stack alignment) for outgoing call
     /// arguments at the bottom of the frame.
     pub fn new(outgoing_bytes: u64) -> FrameLayout {
-        let outgoing_size = align_up(outgoing_bytes, 16);
-        FrameLayout { outgoing_size, next_local: outgoing_size }
+        FrameLayout { next_local: align_up(outgoing_bytes, 16) }
     }
 
     /// Allocate a local spill slot of `size`/`align` bytes, returning its `sp`-relative offset.
@@ -56,26 +52,12 @@ impl FrameLayout {
         off
     }
 
-    /// The `sp`-relative offset of the outgoing-argument slot at byte position `arg_offset`.
-    ///
-    /// Outgoing arguments occupy `sp + 0 .. sp + outgoing_size`; callers must keep `arg_offset`
-    /// within that range (guaranteed by the outgoing-area pre-pass).
-    pub fn outgoing_arg(&self, arg_offset: u64) -> u64 {
-        debug_assert!(arg_offset < self.outgoing_size || self.outgoing_size == 0);
-        arg_offset
-    }
-
     /// The `fp`-relative offset of an incoming stack argument at byte position `arg_offset`.
     ///
     /// Our caller places stack arguments immediately above our saved `fp`/`lr`, i.e. at
     /// `fp + 16 + arg_offset`.
     pub fn incoming_arg(&self, arg_offset: u64) -> u64 {
         16 + arg_offset
-    }
-
-    /// The bytes reserved for the outgoing-argument area.
-    pub fn outgoing_size(&self) -> u64 {
-        self.outgoing_size
     }
 
     /// The total frame size (outgoing area + local slots), rounded up to the 16-byte stack
@@ -92,17 +74,17 @@ mod tests {
     #[test]
     fn empty_frame() {
         let frame = FrameLayout::new(0);
-        assert_eq!(frame.outgoing_size(), 0);
         assert_eq!(frame.frame_size(), 0);
     }
 
     #[test]
     fn outgoing_is_16_aligned() {
-        assert_eq!(FrameLayout::new(0).outgoing_size(), 0);
-        assert_eq!(FrameLayout::new(8).outgoing_size(), 16);
-        assert_eq!(FrameLayout::new(16).outgoing_size(), 16);
-        assert_eq!(FrameLayout::new(24).outgoing_size(), 32);
-        assert_eq!(FrameLayout::new(120).outgoing_size(), 128);
+        // With no locals allocated, the frame is exactly the (16-byte-rounded) outgoing area.
+        assert_eq!(FrameLayout::new(0).frame_size(), 0);
+        assert_eq!(FrameLayout::new(8).frame_size(), 16);
+        assert_eq!(FrameLayout::new(16).frame_size(), 16);
+        assert_eq!(FrameLayout::new(24).frame_size(), 32);
+        assert_eq!(FrameLayout::new(120).frame_size(), 128);
     }
 
     #[test]
@@ -138,12 +120,5 @@ mod tests {
         let frame = FrameLayout::new(0);
         assert_eq!(frame.incoming_arg(0), 16);
         assert_eq!(frame.incoming_arg(8), 24);
-    }
-
-    #[test]
-    fn outgoing_args_start_at_zero() {
-        let frame = FrameLayout::new(32);
-        assert_eq!(frame.outgoing_arg(0), 0);
-        assert_eq!(frame.outgoing_arg(8), 8);
     }
 }

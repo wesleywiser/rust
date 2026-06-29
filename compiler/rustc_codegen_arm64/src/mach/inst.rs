@@ -393,6 +393,8 @@ impl Inst {
                     AddSub::Add => 0,
                     AddSub::Sub => 1,
                 };
+                // The shift amount (LSL) occupies a 6-bit field and must be < the register width.
+                debug_assert!(amount < if matches!(size, OperandSize::S64) { 64 } else { 32 });
                 (size.sf() << 31)
                     | (op_bit << 30)
                     | ((set_flags as u32) << 29)

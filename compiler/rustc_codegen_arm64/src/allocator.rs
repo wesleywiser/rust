@@ -16,7 +16,6 @@ use rustc_middle::ty::TyCtxt;
 use rustc_symbol_mangling::mangle_internal_symbol;
 
 use crate::builder::FunctionBuild;
-use crate::context::Function;
 use crate::mach::func::MachFunction;
 use crate::mach::inst::{Inst, SymRef};
 use crate::mach::module::MachModule;
@@ -41,10 +40,9 @@ fn mach_symbol(tcx: TyCtxt<'_>, name: &str) -> String {
     format!("_{}", mangle_internal_symbol(tcx, name))
 }
 
-/// A forwarder `wrapper(args..) -> target(args..)` that returns the target's result. The function
-/// id is irrelevant for a standalone shim function (it is unused by `FunctionBuild::finish`).
+/// A forwarder `wrapper(args..) -> target(args..)` that returns the target's result.
 fn forwarder(name: String, target: &str) -> MachFunction {
-    let mut fb = FunctionBuild::new(Function(0), name.into(), true, 0);
+    let mut fb = FunctionBuild::new(name.into(), true, 0);
     let block = fb.new_block();
     fb.blocks[block.0 as usize].push(Inst::Bl { sym: SymRef::new(target) });
     fb.blocks[block.0 as usize].push(Inst::Ret { rn: LR });
@@ -53,7 +51,7 @@ fn forwarder(name: String, target: &str) -> MachFunction {
 
 /// An `extern "C"` function that immediately returns.
 fn empty(name: String) -> MachFunction {
-    let mut fb = FunctionBuild::new(Function(0), name.into(), true, 0);
+    let mut fb = FunctionBuild::new(name.into(), true, 0);
     let block = fb.new_block();
     fb.blocks[block.0 as usize].push(Inst::Ret { rn: LR });
     fb.finish()

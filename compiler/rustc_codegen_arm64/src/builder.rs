@@ -55,7 +55,6 @@ enum SimdArith {
 
 /// State for the function currently being lowered.
 pub struct FunctionBuild {
-    pub func: Function,
     pub name: Box<str>,
     pub is_global: bool,
     /// Instruction list for each basic block, indexed by block id (which is also its [`Label`]).
@@ -72,14 +71,8 @@ pub struct FunctionBuild {
 impl FunctionBuild {
     /// Create a function builder. `outgoing_bytes` is the size of the outgoing-argument area
     /// (computed up front by scanning the function's calls); it fixes where local slots begin.
-    pub fn new(
-        func: Function,
-        name: Box<str>,
-        is_global: bool,
-        outgoing_bytes: u64,
-    ) -> FunctionBuild {
+    pub fn new(name: Box<str>, is_global: bool, outgoing_bytes: u64) -> FunctionBuild {
         FunctionBuild {
-            func,
             name,
             is_global,
             blocks: Vec::new(),
@@ -706,6 +699,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let (size, align) = self.cx.type_size_align(result_ty);
         let roff = self.alloc_slot(size, align);
         let imsize = mem_size(self.cx, ielem);
+        debug_assert!(tcount <= 0xfff, "tbl1 table lane count exceeds 12-bit bounds immediate");
         for i in 0..icount {
             self.emit_mem_gpr(true, false, imsize, X10, SP, ioff + i * ies);
             // cmp index, #tcount  -> sets the carry used by both selects below.
@@ -1097,6 +1091,9 @@ fn cast_regs(cast: &CastTarget) -> Vec<CastReg> {
             regs.push(CastReg { fp: is_fp(unit.kind), width: usz, data, offset: offset + rel });
         }
     }
+    // FP cast pieces map to a single SIMD&FP register (s/d); 128-bit vector HFA lanes are not
+    // produced by Rust's C ABI and would mis-size below, so make that loud.
+    debug_assert!(regs.iter().all(|r| !r.fp || r.width <= 8), "FP cast piece wider than 8 bytes");
     regs
 }
 
@@ -2730,7 +2727,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 Some(instance) => outgoing_arg_bytes(cx, instance),
                 None => 0,
             };
-            let mut fb = FunctionBuild::new(llfn, name, is_global, outgoing as u64);
+            let mut fb = FunctionBuild::new(name, is_global, outgoing as u64);
             let entry = fb.new_block();
             setup_params(cx, &mut fb, entry);
             *cx.cur_fn.borrow_mut() = Some(fb);

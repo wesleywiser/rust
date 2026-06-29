@@ -126,7 +126,6 @@ impl<T: Clone + Eq + std::hash::Hash> Interner<T> {
 /// The codegen context for one codegen unit.
 pub struct CodegenCx<'tcx> {
     pub tcx: TyCtxt<'tcx>,
-    pub cgu_name: Symbol,
 
     types: RefCell<Interner<TypeData>>,
     symbols: RefCell<Interner<Box<str>>>,
@@ -159,10 +158,9 @@ pub struct CodegenCx<'tcx> {
 }
 
 impl<'tcx> CodegenCx<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, cgu_name: Symbol) -> CodegenCx<'tcx> {
+    pub fn new(tcx: TyCtxt<'tcx>, _cgu_name: Symbol) -> CodegenCx<'tcx> {
         CodegenCx {
             tcx,
-            cgu_name,
             types: RefCell::new(Interner::default()),
             symbols: RefCell::new(Interner::default()),
             module: RefCell::new(MachModule::new()),

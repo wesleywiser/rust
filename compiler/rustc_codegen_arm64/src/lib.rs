@@ -40,8 +40,8 @@
 
 // tidy-alphabetical-start
 #![feature(rustc_private)]
-// `mach` is built up incrementally and not yet wired into codegen; silence churn-y lints during
-// development. These will be tightened once the module is consumed by the codegen path.
+// The complete AArch64 register file (`mach::reg`) and a handful of trait-required stub methods are
+// intentionally present but unused; allow that rather than pruning the register set or the stubs.
 #![allow(dead_code)]
 #![allow(unreachable_pub)]
 // tidy-alphabetical-end
