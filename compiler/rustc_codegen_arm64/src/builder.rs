@@ -820,7 +820,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let (Some(xoff), Some(yoff), Some(ioff)) = (xoff, yoff, ioff) else {
             return Value::Undef { ty: result_ty };
         };
-        let lane = mem_size_for_bytes(es);
+        let lane = mem_size_from_bytes(es);
         let shift = es.trailing_zeros() as u8; // log2(element size); lanes are power-of-two sized
         // Concatenate the inputs into a `2*n`-lane buffer so an index in `0..2*n` selects a lane.
         let buf_off = self.alloc_slot(2 * n * es, es);
@@ -960,16 +960,6 @@ fn op_size(cx: &CodegenCx<'_>, ty: Type) -> OperandSize {
 fn mem_size(cx: &CodegenCx<'_>, ty: Type) -> MemSize {
     let (size, _) = cx.type_size_align(ty);
     match size {
-        1 => MemSize::B,
-        2 => MemSize::H,
-        4 => MemSize::W,
-        _ => MemSize::X,
-    }
-}
-
-/// Mach memory access size for a power-of-two byte count (1/2/4/8); >8 uses a 64-bit word.
-fn mem_size_for_bytes(bytes: u64) -> MemSize {
-    match bytes {
         1 => MemSize::B,
         2 => MemSize::H,
         4 => MemSize::W,

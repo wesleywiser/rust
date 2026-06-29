@@ -10,14 +10,14 @@
 //! These are deliberately unimplemented; the backend fails loudly (via `todo!`) rather than
 //! miscompiling when it hits them, so they show up as clear ICEs instead of wrong runtime results.
 //!
-//! - **SIMD / vector types.** Integer-lane SIMD is supported by a *scalar* lowering: vector values
-//!   live in frame slots and the `simd_*` intrinsics (`splat`, the comparisons, bitwise ops,
-//!   `bitmask`, `reduce_all`/`any`, `shuffle`, `extract`) are emitted as per-lane loops over those
-//!   slots. This is correct (it matches the IEEE/portable-SIMD semantics) but not fast, in keeping
-//!   with the rest of the baseline. It is enough for the portable-SIMD substring/slice search that
-//!   `str::contains`/`find` reach, and for the `hashbrown` SIMD group scan behind
-//!   `std::collections::HashMap`/`HashSet`. Floating-point lanes and a true NEON register model are
-//!   still unimplemented (float-lane intrinsics panic loudly).
+//! - **SIMD / vector types.** Vector values live in frame slots and the `simd_*` intrinsics are
+//!   emitted as per-lane loops over those slots (correct, matching portable-SIMD semantics, but not
+//!   fast). Supported: `splat`, comparisons, bitwise ops, `bitmask`, `reduce_all`/`any`, `shuffle`
+//!   (any lane size), `extract`, integer `add`/`sub`/`mul`, `shl`/`shr`, lane casts, and the
+//!   floating-point ops `add`/`sub`/`mul`/`div`/`neg`, `fabs`/`fsqrt`/`ceil`/`floor`/`round`/`trunc`,
+//!   and `fma`. Enough for the portable-SIMD substring/slice search reached by `str::contains`/`find`,
+//!   the `hashbrown` SIMD group scan behind `HashMap`/`HashSet`, and rand/chacha20. A true NEON
+//!   register model (operating on `q`/`v` registers rather than memory) is not implemented.
 //!
 //! Implemented since the first cut, for reference:
 //!
