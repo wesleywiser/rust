@@ -721,3 +721,219 @@ fn arrangement(q: bool, size: u8, float: bool, bitwise: bool) -> String {
     };
     format!("{lanes}{letter}")
 }
+
+/// Differential encoder fuzz test: render a broad sweep of instructions to text with `fmt_inst`,
+/// assemble that text with `llvm-mc --show-encoding` (the reference assembler), and check the bytes
+/// against our own `Inst::encode`. This systematically cross-checks the hand-rolled encoder over
+/// operand ranges, rather than the per-instruction hand-picked cases elsewhere.
+///
+/// `llvm-mc` is found via `$LLVM_MC` or the in-tree `build/*/ci-llvm/bin/llvm-mc`; if neither is
+/// present the test passes trivially (so it never breaks a checkout without the CI LLVM).
+#[cfg(test)]
+mod encoder_fuzz {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use crate::mach::inst::{AddSub, DataProc2, Inst, LogicOp, MovKind};
+    use crate::mach::reg::{Gpr, OperandSize};
+
+    fn find_llvm_mc() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("LLVM_MC") {
+            let p = PathBuf::from(p);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        // repo root = <crate>/../.. (compiler/rustc_codegen_arm64 -> repo root).
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?.to_path_buf();
+        let build = root.join("build");
+        for entry in std::fs::read_dir(&build).ok()?.flatten() {
+            let cand = entry.path().join("ci-llvm/bin/llvm-mc");
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+        None
+    }
+
+    fn gpr(n: u8) -> Gpr {
+        Gpr::from_encoding(n)
+    }
+
+    /// A representative sweep of register operands (avoiding `31`, which is `sp`/`xzr` and changes
+    /// the rendered mnemonic in ways that complicate the 1:1 comparison).
+    const REGS: &[u8] = &[0, 1, 2, 13, 29, 30];
+
+    /// Build the instruction sweep. Each `Inst` must render to exactly one assembly instruction.
+    fn gen_insts() -> Vec<Inst> {
+        let mut v = Vec::new();
+        let sizes = [OperandSize::S32, OperandSize::S64];
+        // Add/sub immediate.
+        for op in [AddSub::Add, AddSub::Sub] {
+            for size in sizes {
+                for set_flags in [false, true] {
+                    for &rd in REGS {
+                        for &rn in REGS {
+                            for imm12 in [0u16, 1, 42, 255, 4095] {
+                                for shift12 in [false, true] {
+                                    v.push(Inst::AddSubImm {
+                                        op,
+                                        size,
+                                        set_flags,
+                                        rd: gpr(rd),
+                                        rn: gpr(rn),
+                                        imm12,
+                                        shift12,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Add/sub shifted register.
+        for op in [AddSub::Add, AddSub::Sub] {
+            for size in sizes {
+                for set_flags in [false, true] {
+                    for &rd in REGS {
+                        for &rm in REGS {
+                            for amount in [0u8, 1, 7] {
+                                v.push(Inst::AddSubReg {
+                                    op,
+                                    size,
+                                    set_flags,
+                                    rd: gpr(rd),
+                                    rn: gpr(1),
+                                    rm: gpr(rm),
+                                    amount,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Bitwise logical shifted register.
+        for op in [LogicOp::And, LogicOp::Orr, LogicOp::Eor, LogicOp::Ands] {
+            for size in sizes {
+                for &rd in REGS {
+                    for &rm in REGS {
+                        for amount in [0u8, 1, 13] {
+                            v.push(Inst::Logical {
+                                op,
+                                size,
+                                rd: gpr(rd),
+                                rn: gpr(2),
+                                rm: gpr(rm),
+                                amount,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        // Wide moves (`movz`/`movk`/`movn`).
+        for kind in [MovKind::Zero, MovKind::Keep, MovKind::Inverse] {
+            for size in sizes {
+                let shifts: &[u8] = if size == OperandSize::S64 { &[0, 16, 32, 48] } else { &[0, 16] };
+                for &rd in REGS {
+                    for imm16 in [0u16, 1, 0xABCD, 0xFFFF] {
+                        for &shift in shifts {
+                            v.push(Inst::MovWide { kind, size, rd: gpr(rd), imm16, shift });
+                        }
+                    }
+                }
+            }
+        }
+        // Multiply-add (`madd`) and the two-source data-processing ops (divides / variable shifts).
+        for size in sizes {
+            for &rd in REGS {
+                for &rm in REGS {
+                    v.push(Inst::Madd { size, rd: gpr(rd), rn: gpr(1), rm: gpr(rm), ra: gpr(2) });
+                    for op in [
+                        DataProc2::Udiv,
+                        DataProc2::Sdiv,
+                        DataProc2::Lslv,
+                        DataProc2::Lsrv,
+                        DataProc2::Asrv,
+                    ] {
+                        v.push(Inst::DataProc2 { op, size, rd: gpr(rd), rn: gpr(1), rm: gpr(rm) });
+                    }
+                }
+            }
+        }
+        v
+    }
+
+    /// Parse the little-endian 4-byte words from `llvm-mc --show-encoding` output (one
+    /// `; encoding: [0x..,0x..,0x..,0x..]` per instruction, in order).
+    fn parse_encodings(stdout: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        for line in stdout.lines() {
+            let Some(idx) = line.find("encoding: [") else { continue };
+            let rest = &line[idx + "encoding: [".len()..];
+            let Some(end) = rest.find(']') else { continue };
+            let mut word = 0u32;
+            for (i, byte) in rest[..end].split(',').enumerate() {
+                let b = byte.trim().trim_start_matches("0x");
+                if let Ok(n) = u8::from_str_radix(b, 16) {
+                    word |= (n as u32) << (8 * i as u32);
+                }
+            }
+            out.push(word);
+        }
+        out
+    }
+
+    #[test]
+    fn encoder_matches_llvm_mc() {
+        let Some(mc) = find_llvm_mc() else {
+            eprintln!("encoder_fuzz: llvm-mc not found (set $LLVM_MC); skipping cross-check");
+            return;
+        };
+        let insts = gen_insts();
+        let mut asm = String::from("\t.text\n");
+        for inst in &insts {
+            super::fmt_inst(&mut asm, inst, 0);
+        }
+        let src = std::env::temp_dir().join(format!("arm64_encfuzz_{}.s", std::process::id()));
+        std::fs::write(&src, &asm).expect("write asm");
+        let output = Command::new(&mc)
+            .args(["-triple=arm64-apple-macos", "--show-encoding"])
+            .arg(&src)
+            .output()
+            .expect("run llvm-mc");
+        let _ = std::fs::remove_file(&src);
+        assert!(
+            output.status.success(),
+            "llvm-mc failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let refs = parse_encodings(&String::from_utf8_lossy(&output.stdout));
+        assert_eq!(
+            refs.len(),
+            insts.len(),
+            "llvm-mc emitted {} encodings for {} instructions",
+            refs.len(),
+            insts.len()
+        );
+        let mut mismatches = Vec::new();
+        for (inst, &reference) in insts.iter().zip(&refs) {
+            let mine = inst.encode();
+            if mine != reference {
+                mismatches.push(format!(
+                    "  {inst:?}\n    ours={mine:#010x}  llvm-mc={reference:#010x}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} of {} encodings disagree with llvm-mc:\n{}",
+            mismatches.len(),
+            insts.len(),
+            mismatches.join("\n")
+        );
+    }
+}
+
