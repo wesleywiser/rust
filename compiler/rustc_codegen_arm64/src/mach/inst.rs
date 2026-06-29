@@ -699,7 +699,9 @@ impl Inst {
                 let base: u32 = match (from, to) {
                     (FpSize::S64, FpSize::S32) => 0x1E62_4000,
                     (FpSize::S32, FpSize::S64) => 0x1E22_C000,
-                    _ => panic!("unsupported fcvt {from:?} -> {to:?}"),
+                    // Same-size "cast" is an identity copy: emit `fmov` (S/D), not a real convert.
+                    (FpSize::S32, FpSize::S32) => 0x1E20_4000,
+                    (FpSize::S64, FpSize::S64) => 0x1E60_4000,
                 };
                 base | (rn.encoding() << 5) | rd.encoding()
             }

@@ -393,16 +393,20 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
     }
 
-    /// `simd_splat`: broadcast a scalar into every lane of a fresh vector slot. Integer lanes only;
-    /// the string/slice SIMD search code that reaches this only uses byte vectors.
+    /// `simd_splat`: broadcast a scalar into every lane of a fresh vector slot. Integer lanes go
+    /// through a GPR; floating-point lanes through an FP register.
     fn emit_simd_splat(&mut self, scalar: Value, vec_ty: Type) -> Value {
         let (elem, count, es) = self.vector_info(vec_ty);
-        assert!(
-            !type_is_float(self.cx, elem),
-            "rustc_codegen_arm64: floating-point SIMD lanes are not yet supported"
-        );
         let (size, align) = self.cx.type_size_align(vec_ty);
         let off = self.alloc_slot(size, align);
+        if type_is_float(self.cx, elem) {
+            let fs = fp_size(self.cx, elem);
+            self.materialize_fp(scalar, V16);
+            for i in 0..count {
+                self.emit_mem_fp(false, fs, V16, SP, off + i * es);
+            }
+            return Value::Slot { off, ty: vec_ty };
+        }
         self.materialize(scalar, X10);
         let msize = mem_size(self.cx, elem);
         for i in 0..count {
@@ -416,10 +420,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// lanes first (the loads zero-extend). Integer lanes only.
     fn emit_simd_cmp(&mut self, cond: Cond, signed: bool, a: Value, b: Value, mask_ty: Type) -> Value {
         let (elem, count, es) = self.vector_info(a.ty());
-        assert!(
-            !type_is_float(self.cx, elem),
-            "rustc_codegen_arm64: floating-point SIMD lanes are not yet supported"
-        );
         let aoff = self.vector_to_slot(a);
         let boff = self.vector_to_slot(b);
         let (Some(aoff), Some(boff)) = (aoff, boff) else {
@@ -428,6 +428,26 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let (melem, _mcount, mes) = self.vector_info(mask_ty);
         let (size, align) = self.cx.type_size_align(mask_ty);
         let roff = self.alloc_slot(size, align);
+        let mmsize = mem_size(self.cx, melem);
+        if type_is_float(self.cx, elem) {
+            // Float lanes: fcmp + csetm. `lt`/`le` become `mi`/`ls` against the fcmp flags.
+            let fcond = match cond {
+                Cond::Lt | Cond::Lo => Cond::Mi,
+                Cond::Le | Cond::Ls => Cond::Ls,
+                Cond::Hi => Cond::Gt,
+                Cond::Hs => Cond::Ge,
+                other => other,
+            };
+            let fs = fp_size(self.cx, elem);
+            for i in 0..count {
+                self.emit_mem_fp(true, fs, V16, SP, aoff + i * es);
+                self.emit_mem_fp(true, fs, V17, SP, boff + i * es);
+                self.emit(Inst::FpCmp { size: fs, rn: V16, rm: V17 });
+                self.emit(Inst::CondSel { op: CondSel::Csinv, size: OperandSize::S64, rd: X10, rn: ZR, rm: ZR, cond: fcond.invert() });
+                self.emit_mem_gpr(false, false, mmsize, X10, SP, roff + i * mes);
+            }
+            return Value::Slot { off: roff, ty: mask_ty };
+        }
         let emsize = mem_size(self.cx, elem);
         let mmsize = mem_size(self.cx, melem);
         for i in 0..count {
@@ -538,6 +558,42 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 SimdArith::Div => panic!("rustc_codegen_arm64: integer SIMD division is not supported"),
             }
             self.emit_mem_gpr(false, false, msize, X10, SP, roff + i * es);
+        }
+        Value::Slot { off: roff, ty: vec_ty }
+    }
+
+    /// Lane-wise SIMD floating-point unary op (`simd_fabs`/`fsqrt`/`ceil`/`floor`/`round`/`trunc`).
+    fn emit_simd_fp_unary(&mut self, a: Value, op: crate::mach::inst::FpOp1) -> Value {
+        let vec_ty = a.ty();
+        let (elem, count, es) = self.vector_info(vec_ty);
+        let Some(aoff) = self.vector_to_slot(a) else { return Value::Undef { ty: vec_ty } };
+        let (size, align) = self.cx.type_size_align(vec_ty);
+        let roff = self.alloc_slot(size, align);
+        let fs = fp_size(self.cx, elem);
+        for i in 0..count {
+            self.emit_mem_fp(true, fs, V16, SP, aoff + i * es);
+            self.emit(Inst::FpDataProc1 { op, size: fs, rd: V16, rn: V16 });
+            self.emit_mem_fp(false, fs, V16, SP, roff + i * es);
+        }
+        Value::Slot { off: roff, ty: vec_ty }
+    }
+
+    /// `simd_fma`: lane-wise fused multiply-add `a*b + c`.
+    fn emit_simd_fma(&mut self, a: Value, b: Value, c: Value) -> Value {
+        let vec_ty = a.ty();
+        let (elem, count, es) = self.vector_info(vec_ty);
+        let (Some(aoff), Some(boff), Some(coff)) = (self.vector_to_slot(a), self.vector_to_slot(b), self.vector_to_slot(c)) else {
+            return Value::Undef { ty: vec_ty };
+        };
+        let (size, align) = self.cx.type_size_align(vec_ty);
+        let roff = self.alloc_slot(size, align);
+        let fs = fp_size(self.cx, elem);
+        for i in 0..count {
+            self.emit_mem_fp(true, fs, V16, SP, aoff + i * es);
+            self.emit_mem_fp(true, fs, V17, SP, boff + i * es);
+            self.emit_mem_fp(true, fs, V0, SP, coff + i * es);
+            self.emit(Inst::FpFma { size: fs, rd: V16, rn: V16, rm: V17, ra: V0 });
+            self.emit_mem_fp(false, fs, V16, SP, roff + i * es);
         }
         Value::Slot { off: roff, ty: vec_ty }
     }
@@ -2441,6 +2497,44 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let r = self.emit_simd_arith(args[0].immediate(), args[1].immediate(), kind);
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
+            sym::simd_fabs | sym::simd_fsqrt | sym::simd_ceil | sym::simd_floor | sym::simd_round
+            | sym::simd_trunc | sym::simd_round_ties_even => {
+                let op = match name {
+                    sym::simd_fabs => crate::mach::inst::FpOp1::Fabs,
+                    sym::simd_fsqrt => crate::mach::inst::FpOp1::Fsqrt,
+                    sym::simd_ceil => crate::mach::inst::FpOp1::Frintp,
+                    sym::simd_floor => crate::mach::inst::FpOp1::Frintm,
+                    sym::simd_trunc => crate::mach::inst::FpOp1::Frintz,
+                    sym::simd_round_ties_even => crate::mach::inst::FpOp1::Frintn,
+                    _ => crate::mach::inst::FpOp1::Frinta, // simd_round (ties away)
+                };
+                let r = self.emit_simd_fp_unary(args[0].immediate(), op);
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_fma | sym::simd_relaxed_fma => {
+                let r = self.emit_simd_fma(args[0].immediate(), args[1].immediate(), args[2].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_neg => {
+                let a = args[0].immediate();
+                let (elem, count, es) = self.vector_info(a.ty());
+                let r = if type_is_float(self.cx, elem) {
+                    self.emit_simd_fp_unary(a, crate::mach::inst::FpOp1::Fneg)
+                } else if let Some(aoff) = self.vector_to_slot(a) {
+                    let (size, align) = self.cx.type_size_align(a.ty());
+                    let roff = self.alloc_slot(size, align);
+                    let msize = mem_size(self.cx, elem);
+                    for i in 0..count {
+                        self.emit_mem_gpr(true, false, msize, X10, SP, aoff + i * es);
+                        self.emit(Inst::AddSubReg { op: AddSub::Sub, size: OperandSize::S64, set_flags: false, rd: X10, rn: ZR, rm: X10, amount: 0 });
+                        self.emit_mem_gpr(false, false, msize, X10, SP, roff + i * es);
+                    }
+                    Value::Slot { off: roff, ty: a.ty() }
+                } else {
+                    Value::Undef { ty: a.ty() }
+                };
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
             sym::simd_shl | sym::simd_shr => {
                 // The right shift is arithmetic for signed lanes, logical for unsigned.
                 let signed = args[0].layout.ty.simd_size_and_type(self.cx.tcx).1.is_signed();
@@ -2725,6 +2819,23 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         else_llbb: BasicBlock,
         cases: impl ExactSizeIterator<Item = (u128, BasicBlock)>,
     ) {
+        if self.is_int128(v.ty()) {
+            // Match on a 128-bit value: a case matches iff both 64-bit words are equal. Compute
+            // (lo==case.lo) & (hi==case.hi) into a register and branch on non-zero.
+            self.materialize128(v, X9, X10);
+            for (case, bb) in cases {
+                self.load_imm(X11_HACK, case as u64 as u128, OperandSize::S64);
+                self.load_imm(X12, (case >> 64) as u64 as u128, OperandSize::S64);
+                self.emit(Inst::AddSubReg { op: AddSub::Sub, size: OperandSize::S64, set_flags: true, rd: ZR, rn: X9, rm: X11_HACK, amount: 0 });
+                self.emit(Inst::CondSel { op: CondSel::Csinc, size: OperandSize::S64, rd: X13, rn: ZR, rm: ZR, cond: Cond::Ne }); // X13 = (lo==case.lo)
+                self.emit(Inst::AddSubReg { op: AddSub::Sub, size: OperandSize::S64, set_flags: true, rd: ZR, rn: X10, rm: X12, amount: 0 });
+                self.emit(Inst::CondSel { op: CondSel::Csinc, size: OperandSize::S64, rd: X16, rn: ZR, rm: ZR, cond: Cond::Ne }); // X16 = (hi==case.hi)
+                self.emit(Inst::Logical { op: LogicOp::And, size: OperandSize::S64, rd: X13, rn: X13, rm: X16, amount: 0 });
+                self.emit(Inst::CbNz { size: OperandSize::S64, rt: X13, target: bb.0 as Label, nonzero: true });
+            }
+            self.emit(Inst::B { target: else_llbb.0 as Label });
+            return;
+        }
         self.materialize(v, X9);
         let size = op_size(self.cx, v.ty());
         for (case, bb) in cases {
@@ -2975,9 +3086,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn fdiv_algebraic(&mut self, lhs: Value, rhs: Value) -> Value {
         self.fdiv(lhs, rhs)
     }
-    fn frem(&mut self, _lhs: Value, _rhs: Value) -> Value {
-        // `frem` has no hardware instruction; it requires a call to `fmod`/`fmodf`. Deferred.
-        todo!("rustc_codegen_arm64: frem")
+    fn frem(&mut self, lhs: Value, rhs: Value) -> Value {
+        // `frem` has no hardware instruction; lower to the C library `fmod`/`fmodf`.
+        self.fp_libm_binary("fmod", lhs, rhs)
     }
     fn frem_fast(&mut self, lhs: Value, rhs: Value) -> Value {
         self.frem(lhs, rhs)
@@ -3740,8 +3851,34 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             AtomicRmwBinOp::AtomicMin => (AtomicRmwOp::Smin, src),
             AtomicRmwBinOp::AtomicUMax => (AtomicRmwOp::Umax, src),
             AtomicRmwBinOp::AtomicUMin => (AtomicRmwOp::Umin, src),
-            // `nand` has no single LSE op (it needs a load/store-exclusive loop); deferred.
-            AtomicRmwBinOp::AtomicNand => todo!("rustc_codegen_arm64: atomic nand"),
+            // `nand` has no single LSE op; do a CAS retry loop: new = ~(old & src).
+            AtomicRmwBinOp::AtomicNand => {
+                let pslot = self.alloc_slot(8, 8);
+                let oslot = self.alloc_slot(8, 8);
+                self.materialize(dst, X9);
+                self.emit_mem_gpr(false, false, MemSize::X, X9, SP, pslot);
+                self.materialize(src, X12);
+                self.emit_mem_gpr(true, false, size, X10, X9, 0); // old = *ptr
+                self.emit_mem_gpr(false, false, MemSize::X, X10, SP, oslot);
+                let head = self.append_sibling_block("nand_loop");
+                let done = self.append_sibling_block("nand_done");
+                self.br(head);
+                self.switch_to_block(head);
+                self.emit_mem_gpr(true, false, MemSize::X, X9, SP, pslot);
+                self.emit_mem_gpr(true, false, size, X10, SP, oslot); // expected
+                self.materialize(src, X12);
+                self.emit(Inst::Logical { op: LogicOp::And, size: OperandSize::S64, rd: X11_HACK, rn: X10, rm: X12, amount: 0 });
+                self.load_imm(X13, u128::MAX, OperandSize::S64);
+                self.emit(Inst::Logical { op: LogicOp::Eor, size: OperandSize::S64, rd: X11_HACK, rn: X11_HACK, rm: X13, amount: 0 }); // ~(old&src)
+                self.emit(Inst::AtomicCas { acquire, release, size, rs: X10, rt: X11_HACK, rn: X9 }); // rs(old)->prev
+                self.emit_mem_gpr(true, false, size, X13, SP, oslot); // expected
+                self.emit(Inst::AddSubReg { op: AddSub::Sub, size: OperandSize::S64, set_flags: true, rd: ZR, rn: X10, rm: X13, amount: 0 });
+                self.emit_mem_gpr(false, false, MemSize::X, X10, SP, oslot); // remember prev for next round
+                self.emit(Inst::BCond { cond: Cond::Eq, target: done.0 as Label });
+                self.br(head);
+                self.switch_to_block(done);
+                return self.spill(X10, ty);
+            }
         };
         self.materialize(dst, X9); // pointer
         self.materialize(operand, X10); // rs
