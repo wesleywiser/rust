@@ -7,6 +7,8 @@ use rustc_codegen_ssa::traits::{
 use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
 
 use crate::context::{CodegenCx, Type, TypeData, Value};
+use crate::mach::frame::align_up;
+use crate::mach::func::{Reloc, RelocKind};
 use crate::mach::module::{DataItem, DataSection};
 
 impl<'tcx> CodegenCx<'tcx> {
@@ -100,10 +102,58 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
         (ptr, len)
     }
 
-    fn const_struct(&self, _elts: &[Value], _packed: bool) -> Value {
-        // Aggregate constants are materialized into data items during static/const-allocation
-        // lowering; the scalar `Value` model can't represent them directly.
-        todo!("rustc_codegen_arm64: const_struct")
+    fn const_struct(&self, elts: &[Value], packed: bool) -> Value {
+        // Lay the element constants out into a data item — padding each field to its alignment
+        // unless `packed` — and return a pointer to it, typed as an aggregate. Pointer-valued
+        // elements (`Value::Sym`) become `UNSIGNED64` relocations with the in-symbol offset left in
+        // the data as the Mach-O implicit addend (matching `lower_alloc`). The cg_ssa driver lowers
+        // aggregate constants through allocations, so this is only reached by callers that use
+        // `const_struct` directly; it is implemented here for completeness so the method is total.
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut relocs: Vec<Reloc> = Vec::new();
+        let mut align: u64 = 1;
+        for &elt in elts {
+            let (es, ea) = self.type_size_align(elt.ty());
+            if !packed {
+                bytes.resize(align_up(bytes.len() as u64, ea) as usize, 0);
+                align = align.max(ea);
+            }
+            let field_off = bytes.len() as u64;
+            match elt {
+                Value::Const { bits, .. } => {
+                    bytes.extend_from_slice(&bits.to_le_bytes()[..es as usize]);
+                }
+                Value::Sym { sym, offset, .. } => {
+                    relocs.push(Reloc {
+                        offset: field_off,
+                        sym: self.sym_name(sym),
+                        addend: 0,
+                        kind: RelocKind::Unsigned64,
+                    });
+                    bytes.extend_from_slice(&(offset as u64).to_le_bytes()[..es as usize]);
+                }
+                // Undef/poison and (invalid here) runtime slots contribute zeroed bytes.
+                Value::Undef { .. } | Value::Slot { .. } => {
+                    bytes.resize(bytes.len() + es as usize, 0);
+                }
+            }
+        }
+        let size = if packed { bytes.len() as u64 } else { align_up(bytes.len() as u64, align) };
+        bytes.resize(size as usize, 0);
+        let agg_ty = self.intern_type(TypeData::Aggregate { size, align });
+        let section = if relocs.is_empty() { DataSection::ReadOnly } else { DataSection::Data };
+        let name = self.mangle(&self.generate_local_symbol_name("struct"));
+        let sym = self.intern_sym(&name);
+        self.module.borrow_mut().push_data(DataItem {
+            name: name.into(),
+            is_global: false,
+            section,
+            align: align.max(1) as u32,
+            bytes,
+            bss_size: 0,
+            relocs,
+        });
+        Value::Sym { sym, offset: 0, ty: agg_ty }
     }
     fn const_vector(&self, elts: &[Value]) -> Value {
         // Serialize the lane constants into read-only data and return a pointer to it (typed as the
