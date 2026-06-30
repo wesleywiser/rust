@@ -2539,6 +2539,29 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.spill128(X0, X1, ty)
     }
 
+    /// Lower the `rotate_left`/`rotate_right` intrinsics as `(x << k) | (x >>u (W - k))`. The shift
+    /// (a `u32`) is widened/narrowed to the value's type and masked to `W - 1`; the complement
+    /// `(W - k) & (W - 1)` is masked too so a zero rotate degenerates to `x | x` instead of an
+    /// out-of-range shift. Works for every integer width — sub-word results are masked by the narrow
+    /// spill, and 128-bit values go through the shift libcalls. The right shift is always logical.
+    fn emit_rotate(&mut self, x: Value, raw_shift: Value, left: bool) -> Value {
+        let ty = x.ty();
+        let bits = match self.cx.type_data(ty) {
+            TypeData::Int(b) => b as u128,
+            _ => 64,
+        };
+        let shift = self.intcast(raw_shift, ty, false);
+        let mask = self.cx.const_uint(ty, (bits - 1) as u64);
+        let k = self.and(shift, mask);
+        let width = self.cx.const_uint(ty, bits as u64);
+        let comp = self.sub(width, k);
+        let comp = self.and(comp, mask);
+        let (shl_amt, shr_amt) = if left { (k, comp) } else { (comp, k) };
+        let lo = self.shl(x, shl_amt);
+        let hi = self.lshr(x, shr_amt);
+        self.or(lo, hi)
+    }
+
     /// Convert a 128-bit integer to a float via a compiler-builtins libcall (`__float[un]tidf` /
     /// `__float[un]tisf`): the integer is in `x0:x1`, the result returns in `d0`/`s0`.
     fn int128_to_fp(&mut self, signed: bool, val: Value, dest_ty: Type) -> Value {
@@ -3244,6 +3267,13 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let result_ty = self.cx.immediate_backend_type(result_layout);
                 let count = self.intcast(count, result_ty, false);
                 IntrinsicResult::Operand(OperandValue::Immediate(count))
+            }
+            // Bit rotation. AArch64 only rotates right (and only at 32/64-bit), so both directions
+            // are lowered uniformly to a shift/or pair that handles every width including i128.
+            sym::rotate_left | sym::rotate_right => {
+                let left = name == sym::rotate_left;
+                let r = self.emit_rotate(args[0].immediate(), args[1].immediate(), left);
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
             // Count leading zeros (`ctlz_nonzero` shares the lowering; `clz` handles zero anyway).
             sym::ctlz | sym::ctlz_nonzero => {
