@@ -54,6 +54,18 @@ enum SimdArith {
     Rem,
 }
 
+/// Horizontal SIMD reduction kind for [`Builder::emit_simd_reduce`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SimdReduce {
+    Add,
+    Mul,
+    Max,
+    Min,
+    And,
+    Or,
+    Xor,
+}
+
 /// State for the function currently being lowered.
 pub struct FunctionBuild {
     pub name: Box<str>,
@@ -881,31 +893,80 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         Value::Slot { off: roff, ty: vec_ty }
     }
 
-    /// `simd_cast`/`simd_as`: lane-wise integer cast (`as` per lane). Narrowing truncates (store the
-    /// low destination-width bytes); widening zero- or sign-extends per the *source* lane's
-    /// signedness. The lane count is unchanged. Integer lanes only.
-    fn emit_simd_cast(&mut self, src: Value, src_signed: bool, dst_ty: Type) -> Value {
+    /// `simd_cast`/`simd_as`: lane-wise numeric cast (`as` per lane), with the lane count unchanged.
+    /// Integer↔integer narrows by truncation and widens by sign/zero extension (per the source
+    /// signedness). Casts involving floating-point lanes (int↔float, float↔float) reuse the scalar
+    /// conversion lowering per lane, which saturates float→int and maps NaN to zero (matching `as`).
+    fn emit_simd_cast(
+        &mut self,
+        src: Value,
+        src_signed: bool,
+        dst_signed: bool,
+        dst_ty: Type,
+    ) -> Value {
         let (src_elem, count, src_es) = self.vector_info(src.ty());
         let (dst_elem, _dcount, dst_es) = self.vector_info(dst_ty);
-        assert!(
-            !type_is_float(self.cx, src_elem) && !type_is_float(self.cx, dst_elem),
-            "rustc_codegen_arm64: floating-point SIMD lane casts are not yet supported"
-        );
+        let src_float = type_is_float(self.cx, src_elem);
+        let dst_float = type_is_float(self.cx, dst_elem);
         let Some(soff) = self.vector_to_slot(src) else {
             return Value::Undef { ty: dst_ty };
         };
         let (size, align) = self.cx.type_size_align(dst_ty);
         let roff = self.alloc_slot(size, align);
-        let src_msize = mem_size(self.cx, src_elem);
-        let dst_msize = mem_size(self.cx, dst_elem);
-        for i in 0..count {
-            self.emit_mem_gpr(true, false, src_msize, X10, SP, soff + i * src_es);
-            // Sign-extend only when widening a signed source; truncation just drops high bytes and
-            // zero-extension is already what the load produced.
-            if src_signed && dst_es > src_es {
-                self.sign_extend_reg(X10, src_es);
+
+        if !src_float && !dst_float {
+            // Integer→integer fast path: load each lane, sign-extend a widening signed source, and
+            // store the destination-width low bytes.
+            let src_msize = mem_size(self.cx, src_elem);
+            let dst_msize = mem_size(self.cx, dst_elem);
+            for i in 0..count {
+                self.emit_mem_gpr(true, false, src_msize, X10, SP, soff + i * src_es);
+                if src_signed && dst_es > src_es {
+                    self.sign_extend_reg(X10, src_es);
+                }
+                self.emit_mem_gpr(false, false, dst_msize, X10, SP, roff + i * dst_es);
             }
-            self.emit_mem_gpr(false, false, dst_msize, X10, SP, roff + i * dst_es);
+            return Value::Slot { off: roff, ty: dst_ty };
+        }
+
+        // At least one side is floating-point: convert each lane through the scalar cast helpers
+        // (which materialize the lane in a register, convert, and clamp as needed).
+        let dst_msize = mem_size(self.cx, dst_elem);
+        let dst_fp = if dst_float { Some(fp_size(self.cx, dst_elem)) } else { None };
+        for i in 0..count {
+            let lane = Value::Slot { off: soff + i * src_es, ty: src_elem };
+            let converted = match (src_float, dst_float) {
+                (false, true) => {
+                    if src_signed {
+                        self.sitofp(lane, dst_elem)
+                    } else {
+                        self.uitofp(lane, dst_elem)
+                    }
+                }
+                (true, false) => {
+                    if dst_signed {
+                        self.fptosi(lane, dst_elem)
+                    } else {
+                        self.fptoui(lane, dst_elem)
+                    }
+                }
+                // float→float: widen with `fpext`, narrow with `fptrunc` (both lower to `fcvt`).
+                (true, true) => {
+                    if dst_es > src_es {
+                        self.fpext(lane, dst_elem)
+                    } else {
+                        self.fptrunc(lane, dst_elem)
+                    }
+                }
+                (false, false) => unreachable!(),
+            };
+            if let Some(fp) = dst_fp {
+                self.materialize_fp(converted, V16);
+                self.emit_mem_fp(false, fp, V16, SP, roff + i * dst_es);
+            } else {
+                self.materialize(converted, X10);
+                self.emit_mem_gpr(false, false, dst_msize, X10, SP, roff + i * dst_es);
+            }
         }
         Value::Slot { off: roff, ty: dst_ty }
     }
@@ -1196,6 +1257,161 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             });
         }
         self.spill(X10, result_ty)
+    }
+
+    /// Horizontal reduction of a vector to a scalar (`simd_reduce_*`). `add`/`mul` are the *ordered*
+    /// forms and take an initial accumulator (`init`); the others fold from lane 0. Integer `max`/
+    /// `min` use `signed` to pick the comparison; `add`/`mul`/bitwise ops fold in 64-bit and
+    /// truncate to the lane width on store. Floating-point `add`/`mul` fold left-to-right with the
+    /// matching FP instruction (preserving the ordered semantics).
+    fn emit_simd_reduce(
+        &mut self,
+        op: SimdReduce,
+        x: Value,
+        init: Option<Value>,
+        signed: bool,
+        result_ty: Type,
+    ) -> Value {
+        let (elem, count, es) = self.vector_info(x.ty());
+        let Some(off) = self.vector_to_slot(x) else {
+            return Value::Undef { ty: result_ty };
+        };
+
+        if type_is_float(self.cx, elem) {
+            let fp = fp_size(self.cx, elem);
+            let fpop = match op {
+                SimdReduce::Add => FpOp2::Fadd,
+                SimdReduce::Mul => FpOp2::Fmul,
+                _ => self.cx.tcx.dcx().fatal(
+                    "rustc_codegen_arm64: floating-point SIMD min/max/bitwise reductions are not \
+                     yet supported",
+                ),
+            };
+            // Accumulator in V16: the supplied initial value, or lane 0 when there is none.
+            let start = match init {
+                Some(acc) => {
+                    self.materialize_fp(acc, V16);
+                    0
+                }
+                None => {
+                    self.emit_mem_fp(true, fp, V16, SP, off);
+                    1
+                }
+            };
+            for i in start..count {
+                self.emit_mem_fp(true, fp, V17, SP, off + i * es);
+                self.emit(Inst::FpDataProc2 { op: fpop, size: fp, rd: V16, rn: V16, rm: V17 });
+            }
+            return self.spill_fp(V16, result_ty);
+        }
+
+        // Integer reduction folded in X10. Signed min/max need their lanes sign-extended before
+        // comparison (loads zero-extend); add/mul/bitwise only care about the low `elem` bits.
+        let msize = mem_size(self.cx, elem);
+        let need_sext = signed && matches!(op, SimdReduce::Max | SimdReduce::Min);
+        let start = match init {
+            Some(acc) => {
+                self.materialize(acc, X10);
+                0
+            }
+            None => {
+                self.emit_mem_gpr(true, false, msize, X10, SP, off);
+                if need_sext {
+                    self.sign_extend_reg(X10, es);
+                }
+                1
+            }
+        };
+        for i in start..count {
+            self.emit_mem_gpr(true, false, msize, X11_HACK, SP, off + i * es);
+            if need_sext {
+                self.sign_extend_reg(X11_HACK, es);
+            }
+            match op {
+                SimdReduce::Add => self.emit(Inst::AddSubReg {
+                    op: AddSub::Add,
+                    size: OperandSize::S64,
+                    set_flags: false,
+                    rd: X10,
+                    rn: X10,
+                    rm: X11_HACK,
+                    amount: 0,
+                }),
+                SimdReduce::Mul => self.emit(Inst::Madd {
+                    size: OperandSize::S64,
+                    rd: X10,
+                    rn: X10,
+                    rm: X11_HACK,
+                    ra: ZR,
+                }),
+                SimdReduce::And | SimdReduce::Or | SimdReduce::Xor => {
+                    let logic = match op {
+                        SimdReduce::And => LogicOp::And,
+                        SimdReduce::Or => LogicOp::Orr,
+                        _ => LogicOp::Eor,
+                    };
+                    self.emit(Inst::Logical {
+                        op: logic,
+                        size: OperandSize::S64,
+                        rd: X10,
+                        rn: X10,
+                        rm: X11_HACK,
+                        amount: 0,
+                    });
+                }
+                SimdReduce::Max | SimdReduce::Min => {
+                    // Keep the accumulator (X10) when it already wins, else take the lane (X11).
+                    let cond = match (op, signed) {
+                        (SimdReduce::Max, true) => Cond::Ge,
+                        (SimdReduce::Max, false) => Cond::Hs,
+                        (SimdReduce::Min, true) => Cond::Le,
+                        (SimdReduce::Min, false) => Cond::Ls,
+                        _ => unreachable!(),
+                    };
+                    self.emit(Inst::AddSubReg {
+                        op: AddSub::Sub,
+                        size: OperandSize::S64,
+                        set_flags: true,
+                        rd: ZR,
+                        rn: X10,
+                        rm: X11_HACK,
+                        amount: 0,
+                    });
+                    self.emit(Inst::CondSel {
+                        op: CondSel::Csel,
+                        size: OperandSize::S64,
+                        rd: X10,
+                        rn: X10,
+                        rm: X11_HACK,
+                        cond,
+                    });
+                }
+            }
+        }
+        self.spill(X10, result_ty)
+    }
+
+    /// `simd_saturating_add`/`simd_saturating_sub`: lane-wise saturating add/subtract, reusing the
+    /// scalar saturating lowering (which clamps to the lane type's bounds) per lane. Integer lanes.
+    fn emit_simd_saturating(&mut self, a: Value, b: Value, is_add: bool, signed: bool) -> Value {
+        let vec_ty = a.ty();
+        let (elem, count, es) = self.vector_info(vec_ty);
+        let aoff = self.vector_to_slot(a);
+        let boff = self.vector_to_slot(b);
+        let (Some(aoff), Some(boff)) = (aoff, boff) else {
+            return Value::Undef { ty: vec_ty };
+        };
+        let (size, align) = self.cx.type_size_align(vec_ty);
+        let roff = self.alloc_slot(size, align);
+        let msize = mem_size(self.cx, elem);
+        for i in 0..count {
+            let av = Value::Slot { off: aoff + i * es, ty: elem };
+            let bv = Value::Slot { off: boff + i * es, ty: elem };
+            let r = self.emit_saturating(av, bv, is_add, signed, elem);
+            self.materialize(r, X10);
+            self.emit_mem_gpr(false, false, msize, X10, SP, roff + i * es);
+        }
+        Value::Slot { off: roff, ty: vec_ty }
     }
 
     /// `simd_shuffle`: build a result vector by gathering lanes from the concatenation `x ++ y` at
@@ -3204,6 +3420,17 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let r = self.emit_simd_arith(args[0].immediate(), args[1].immediate(), kind, signed);
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
+            sym::simd_saturating_add | sym::simd_saturating_sub => {
+                let is_add = name == sym::simd_saturating_add;
+                let signed = args[0].layout.ty.simd_size_and_type(self.cx.tcx).1.is_signed();
+                let r = self.emit_simd_saturating(
+                    args[0].immediate(),
+                    args[1].immediate(),
+                    is_add,
+                    signed,
+                );
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
             sym::simd_fabs | sym::simd_fsqrt | sym::simd_ceil | sym::simd_floor | sym::simd_round
             | sym::simd_trunc | sym::simd_round_ties_even => {
                 let op = match name {
@@ -3253,15 +3480,52 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
             sym::simd_cast | sym::simd_as => {
-                // Lane-wise integer cast; widening of a signed source sign-extends.
+                // Lane-wise numeric cast (`as` per lane), across integer and floating-point lanes.
                 let src_signed = args[0].layout.ty.simd_size_and_type(self.cx.tcx).1.is_signed();
+                let dst_signed = result_layout.ty.simd_size_and_type(self.cx.tcx).1.is_signed();
                 let dst_ty = self.cx.immediate_backend_type(result_layout);
-                let r = self.emit_simd_cast(args[0].immediate(), src_signed, dst_ty);
+                let r = self.emit_simd_cast(args[0].immediate(), src_signed, dst_signed, dst_ty);
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
             sym::simd_bitmask => {
                 let result_ty = self.cx.immediate_backend_type(result_layout);
                 let r = self.emit_simd_bitmask(args[0].immediate(), result_ty);
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_reduce_add_ordered | sym::simd_reduce_mul_ordered => {
+                // The ordered reductions carry an explicit accumulator (`args[1]`) and fold the
+                // lanes into it left-to-right, preserving the floating-point evaluation order.
+                let op = if name == sym::simd_reduce_mul_ordered {
+                    SimdReduce::Mul
+                } else {
+                    SimdReduce::Add
+                };
+                let signed = args[0].layout.ty.simd_size_and_type(self.cx.tcx).1.is_signed();
+                let result_ty = self.cx.immediate_backend_type(result_layout);
+                let r = self.emit_simd_reduce(
+                    op,
+                    args[0].immediate(),
+                    Some(args[1].immediate()),
+                    signed,
+                    result_ty,
+                );
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_reduce_max | sym::simd_reduce_min => {
+                let op = if name == sym::simd_reduce_max { SimdReduce::Max } else { SimdReduce::Min };
+                let signed = args[0].layout.ty.simd_size_and_type(self.cx.tcx).1.is_signed();
+                let result_ty = self.cx.immediate_backend_type(result_layout);
+                let r = self.emit_simd_reduce(op, args[0].immediate(), None, signed, result_ty);
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_reduce_and | sym::simd_reduce_or | sym::simd_reduce_xor => {
+                let op = match name {
+                    sym::simd_reduce_and => SimdReduce::And,
+                    sym::simd_reduce_or => SimdReduce::Or,
+                    _ => SimdReduce::Xor,
+                };
+                let result_ty = self.cx.immediate_backend_type(result_layout);
+                let r = self.emit_simd_reduce(op, args[0].immediate(), None, false, result_ty);
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
             sym::simd_reduce_all | sym::simd_reduce_any => {

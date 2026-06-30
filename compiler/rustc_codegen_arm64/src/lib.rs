@@ -20,10 +20,13 @@
 //!   Everything else, and any wider-than-128-bit
 //!   vector (and the 64-bit-lane integer multiply, which NEON lacks), is emitted as a per-lane loop
 //!   over the slot (correct, matching portable-SIMD semantics, but not fast). Supported across these
-//!   two paths: `splat`, comparisons, bitwise ops, `bitmask`, `reduce_all`/`any`, `shuffle` (any
-//!   lane size), `extract`, `insert`, `select`, integer `add`/`sub`/`mul`/`div`/`rem`, `shl`/`shr`,
-//!   lane casts, and the floating-point ops `add`/`sub`/`mul`/`div`/`rem`/`neg`,
-//!   `fabs`/`fsqrt`/`ceil`/`floor`/`round`/`trunc`, and `fma`. A handful of `llvm.aarch64.neon.*` ops that the generic `simd_*` family
+//!   two paths: `splat`, comparisons, bitwise ops, `bitmask`, `shuffle` (any lane size), `extract`,
+//!   `insert`, `select`, integer `add`/`sub`/`mul`/`div`/`rem`, `shl`/`shr`, saturating
+//!   `add`/`sub`, numeric lane casts (integer↔integer and the float conversions int↔float and
+//!   float↔float), the horizontal reductions (`reduce_all`/`any`, ordered `add`/`mul`, integer
+//!   `max`/`min`/`and`/`or`/`xor`), and the floating-point ops `add`/`sub`/`mul`/`div`/`rem`/`neg`,
+//!   `fabs`/`fsqrt`/`ceil`/`floor`/`round`/`trunc`, and `fma`. (Floating-point `min`/`max`/bitwise
+//!   reductions are the one reduction gap and error loudly.) A handful of `llvm.aarch64.neon.*` ops that the generic `simd_*` family
 //!   can't express are also lowered lane-by-lane: `umaxp` (pairwise max), `tbl1` (byte table
 //!   lookup), `uaddlp`/`saddlp` (pairwise-add-long), `addp` (pairwise add), and `umull`/`smull`
 //!   (widening multiply) — enough for the portable-SIMD substring/slice search reached by
