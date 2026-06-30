@@ -805,6 +805,14 @@
 # Currently, the only standard options supported here are `"llvm"`, `"cranelift"` and `"gcc"`.
 #rust.codegen-backends = ["llvm"]
 
+# Codegen backend used to compile the `rustc` compiler crates themselves, instead of LLVM. This is
+# for bootstrapping/dogfooding an alternative in-tree backend (e.g. `"arm64"` or `"cranelift"`):
+# unlike making the backend the default via `rust.codegen-backends`, this only changes how the
+# compiler crates are compiled — the standard library and the produced compiler's default backend
+# are left untouched. It only takes effect from stage 2 onwards, because the downloaded stage 0
+# compiler cannot load an in-tree codegen backend.
+#rust.codegen-backend-for-rustc = <none> (string)
+
 # Indicates whether LLD will be compiled and made available in the sysroot for rustc to execute,
 #rust.lld = false, except for targets that opt into LLD (see `target.default-linker-linux-override`)
 

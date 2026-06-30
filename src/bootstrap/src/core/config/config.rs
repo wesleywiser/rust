@@ -218,6 +218,10 @@ pub struct Config {
     pub rust_optimize_tests: bool,
     pub rust_dist_src: bool,
     pub rust_codegen_backends: Vec<CodegenBackendKind>,
+    /// Codegen backend used to compile the `rustc` compiler crates themselves (instead of LLVM),
+    /// for bootstrapping/dogfooding an alternative backend. Only applies to stage 2+ rustc builds,
+    /// since the downloaded stage 0 compiler cannot load an in-tree backend.
+    pub rust_codegen_backend_for_rustc: Option<CodegenBackendKind>,
     pub rust_verify_llvm_ir: bool,
     pub rust_thin_lto_import_instr_limit: Option<u32>,
     pub rust_randomize_layout: bool,
@@ -564,6 +568,7 @@ impl Config {
             dist_src: rust_dist_src,
             save_toolstates: rust_save_toolstates,
             codegen_backends: rust_codegen_backends,
+            codegen_backend_for_rustc: rust_codegen_backend_for_rustc,
             lld: rust_lld_enabled,
             llvm_tools: rust_llvm_tools,
             llvm_bitcode_linker: rust_llvm_bitcode_linker,
@@ -1467,6 +1472,8 @@ impl Config {
             rust_codegen_backends: rust_codegen_backends
                 .map(|backends| parse_codegen_backends(backends, "rust"))
                 .unwrap_or(vec![CodegenBackendKind::Llvm]),
+            rust_codegen_backend_for_rustc: rust_codegen_backend_for_rustc
+                .map(|backend| parse_codegen_backends(vec![backend], "rust").pop().unwrap()),
             rust_codegen_units: rust_codegen_units.map(threads_from_config),
             rust_codegen_units_std: rust_codegen_units_std.map(threads_from_config),
             rust_debug_logging: rust_debug_logging

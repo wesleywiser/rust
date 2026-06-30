@@ -631,4 +631,9 @@ pub const CONFIG_CHANGE_HISTORY: &[ChangeInfo] = &[
         severity: ChangeSeverity::Info,
         summary: "New `--verbose-run-make-subprocess-output` flag for `x.py test` (defaults to true). Set `--verbose-run-make-subprocess-output=false` to suppress verbose subprocess output for passing run-make tests when using `--no-capture`.",
     },
+    ChangeInfo {
+        change_id: 155000,
+        severity: ChangeSeverity::Info,
+        summary: "New option `rust.codegen-backend-for-rustc` to compile the compiler crates themselves with an alternative in-tree codegen backend (e.g. `arm64`) instead of LLVM.",
+    },
 ];

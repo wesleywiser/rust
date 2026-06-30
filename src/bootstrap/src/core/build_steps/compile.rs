@@ -1149,6 +1149,21 @@ impl Step for Rustc {
         // NB: all RUSTFLAGS should be added to `rustc_cargo()` so they will be
         // consistently applied by check/doc/test modes too.
 
+        // Optionally compile the compiler crates themselves with an alternative codegen backend
+        // (e.g. `cg_aarch64`) instead of LLVM, for bootstrapping/dogfooding that backend. This is
+        // deliberately *not* in `rustc_cargo`: it only makes sense for an actual `build` (check/doc
+        // do not codegen), and it requires the backend dylib to be installed in `build_compiler`'s
+        // sysroot, which we arrange for right here. It is only possible from stage 1 onwards,
+        // because the downloaded stage 0 compiler cannot load an in-tree codegen backend (its
+        // `rustc_driver` ABI differs).
+        if let Some(backend) = &builder.config.rust_codegen_backend_for_rustc
+            && build_compiler.stage >= 1
+            && !builder.download_rustc()
+        {
+            let name = ensure_codegen_backend_for_rustc(builder, backend, build_compiler);
+            cargo.rustflag(&format!("-Zcodegen-backend={name}"));
+        }
+
         for krate in &*self.crates {
             cargo.arg("-p").arg(krate);
         }
@@ -1953,6 +1968,30 @@ pub(crate) fn copy_codegen_backends_to_sysroot(
             FileType::NativeLibrary,
         );
     }
+}
+
+/// Build the codegen backend selected by `rust.codegen-backend-for-rustc` so it can be loaded by
+/// `target_compiler` (installing it into that compiler's sysroot), for compiling the compiler
+/// itself with an alternative backend. Returns the `-Zcodegen-backend` name to pass to rustc.
+fn ensure_codegen_backend_for_rustc(
+    builder: &Builder<'_>,
+    backend: &CodegenBackendKind,
+    target_compiler: Compiler,
+) -> String {
+    let compilers = RustcPrivateCompilers::from_target_compiler(builder, target_compiler);
+    let stamp = match backend {
+        CodegenBackendKind::Custom(name) if name == "arm64" => {
+            builder.ensure(Arm64CodegenBackend { compilers })
+        }
+        CodegenBackendKind::Cranelift => builder.ensure(CraneliftCodegenBackend { compilers }),
+        _ => panic!(
+            "`rust.codegen-backend-for-rustc = \"{}\"` is not supported; only in-tree backends \
+             with a bootstrap build step (`arm64`, `cranelift`) can compile the compiler",
+            backend.name()
+        ),
+    };
+    copy_codegen_backends_to_sysroot(builder, stamp, target_compiler);
+    backend.name().to_string()
 }
 
 /// Gets the path to a dynamic codegen backend library from its build stamp.
