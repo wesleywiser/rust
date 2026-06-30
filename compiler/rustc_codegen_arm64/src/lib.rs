@@ -31,12 +31,17 @@
 //!   rand/chacha20, and the NEON `adler32` checksum in `simd-adler32`. A true NEON register model
 //!   (operating on `q`/`v` registers rather than memory) is not implemented.
 //!
-//! - **Inline assembly is not supported.** `asm!`/`global_asm!` (`codegen_inline_asm`) would
-//!   require a textual AArch64 assembler, which this object-emitting backend does not have, so any
-//!   crate using inline asm fails loudly (`zlib-rs`, the `sha2`/`constant_time_eq` asm paths, ...).
-//!   Such crates can usually still be built via their software fallbacks. The dedicated AArch64
-//!   `crc32{c}{b,h,w,x}` instructions *are* supported even though `zlib-rs` reaches them through
-//!   `asm!` (other crates such as `crc32fast` use the intrinsics, which work).
+//! - **`global_asm!` and `#[naked]` functions are supported; inline `asm!` is not (yet).** This
+//!   object-emitting backend has no built-in textual assembler, so `global_asm!` blocks and
+//!   `#[naked]` function bodies (which `rustc_codegen_ssa` lowers through the same
+//!   `codegen_global_asm` path) are accumulated as assembly text and handed to the platform C
+//!   compiler (`$CC`/`cc`) to assemble into a side object that is linked in — the same approach the
+//!   cranelift backend uses. `sym` operands referencing internal-linkage items are force-promoted
+//!   to global symbols so the separately-assembled object can resolve them. Inline `asm!`
+//!   (`codegen_inline_asm`) is still unimplemented and fails loudly; crates using it can usually be
+//!   built via their software fallbacks. The dedicated AArch64 `crc32{c}{b,h,w,x}` instructions
+//!   *are* supported even though `zlib-rs` reaches them through `asm!` (other crates such as
+//!   `crc32fast` use the intrinsics, which work).
 //!
 //! - **ARMv8 cryptography** *is* supported: the AES round/mix-columns intrinsics (`aese`/`aesd`/
 //!   `aesmc`/`aesimc`) and the SHA-1/SHA-256 round and message-schedule intrinsics
@@ -158,6 +163,9 @@ pub struct Arm64Module {
     /// DWARF debug info for this codegen unit, finalized into the object during `codegen`. `None`
     /// when debug info is disabled.
     pub debug: Option<crate::dwarf::DebugContext>,
+    /// Accumulated textual assembly (`global_asm!` blocks and `#[naked]` function bodies). When
+    /// non-empty it is assembled into a side object (`asm.o`) during `codegen` and linked in.
+    pub global_asm: String,
 }
 
 /// The codegen backend. It implements `CodegenBackend` (the entry point rustc calls) as well as
@@ -232,7 +240,7 @@ impl ExtraBackendMethods for Arm64CodegenBackend {
         _module_name: &str,
         methods: &[AllocatorMethod],
     ) -> Self::Module {
-        Arm64Module { mach: crate::allocator::codegen(tcx, methods), debug: None }
+        Arm64Module { mach: crate::allocator::codegen(tcx, methods), debug: None, global_asm: String::new() }
     }
 
     fn compile_codegen_unit(
@@ -277,9 +285,11 @@ impl ExtraBackendMethods for Arm64CodegenBackend {
             }
         }
 
+        cx.module.borrow_mut().forced_globals = std::mem::take(&mut *cx.asm_syms.borrow_mut());
         let mach = std::mem::take(&mut *cx.module.borrow_mut());
         let debug = cx.debug.take().map(std::cell::RefCell::into_inner);
-        let module = ModuleCodegen::new_regular(cgu_name.as_str().to_owned(), Arm64Module { mach, debug });
+        let global_asm = std::mem::take(&mut *cx.global_asm.borrow_mut());
+        let module = ModuleCodegen::new_regular(cgu_name.as_str().to_owned(), Arm64Module { mach, debug, global_asm });
         (module, 0)
     }
 }
@@ -352,11 +362,36 @@ impl WriteBackendMethods for Arm64CodegenBackend {
         let name = module.name.clone();
         let kind = module.kind;
         let debug = module.module_llvm.debug.take();
+        let global_asm = std::mem::take(&mut module.module_llvm.global_asm);
         let mach = &module.module_llvm.mach;
 
         let object = cgcx.output_filenames.temp_path_for_cgu(OutputType::Object, &name);
         std::fs::write(&object, crate::mach::emit_obj::emit_object(mach, debug))
             .expect("failed to write object file");
+
+        // Assemble any `global_asm!` / `#[naked]` assembly into a side object, linked alongside the
+        // main object by rustc. This backend has no built-in textual assembler, so it defers to the
+        // platform C compiler (`$CC` or `cc`) — the same toolchain rustc uses for linking.
+        let global_asm_object = (!global_asm.is_empty()).then(|| {
+            let asm_s = cgcx.output_filenames.temp_path_ext_for_cgu("asm.s", &name);
+            let asm_o = cgcx.output_filenames.temp_path_ext_for_cgu("asm.o", &name);
+            std::fs::write(&asm_s, &global_asm).expect("failed to write global asm source");
+            // Match the main object's deployment target so the linker doesn't warn about a version
+            // mismatch (`mach.macho_min_os` is packed `major << 16 | minor << 8 | patch`).
+            let v = mach.macho_min_os;
+            let min_os = format!("-mmacosx-version-min={}.{}", (v >> 16) & 0xff, (v >> 8) & 0xff);
+            let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+            let status = std::process::Command::new(&cc)
+                .args(["-c", "-arch", "arm64"])
+                .arg(min_os)
+                .arg("-o")
+                .arg(&asm_o)
+                .arg(&asm_s)
+                .status()
+                .unwrap_or_else(|e| panic!("failed to run `{cc}` to assemble global asm: {e}"));
+            assert!(status.success(), "`{cc}` failed to assemble global asm ({asm_s:?})");
+            asm_o
+        });
 
         let assembly = if config.emit_asm {
             let path = cgcx.output_filenames.temp_path_for_cgu(OutputType::Assembly, &name);
@@ -371,7 +406,7 @@ impl WriteBackendMethods for Arm64CodegenBackend {
             name,
             kind,
             object: Some(object),
-            global_asm_object: None,
+            global_asm_object,
             dwarf_object: None,
             bytecode: None,
             assembly,

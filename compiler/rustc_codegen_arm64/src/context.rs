@@ -159,6 +159,14 @@ pub struct CodegenCx<'tcx> {
     /// DWARF debug-info builder for this codegen unit. `Some` iff debug info is enabled. Taken out
     /// (via [`CodegenCx::take_debug_context`]) at the end of codegen to travel with the module.
     pub debug: Option<RefCell<crate::dwarf::DebugContext>>,
+
+    /// Accumulated textual assembly for this codegen unit (`global_asm!` blocks and `#[naked]`
+    /// function bodies). Assembled by an external assembler into a side object at emit time.
+    pub global_asm: RefCell<String>,
+
+    /// Symbol names referenced by `sym` operands in this codegen unit's `global_asm!`/`asm!`. They
+    /// must be emitted with global scope so the separately-assembled asm object can resolve them.
+    pub asm_syms: RefCell<rustc_data_structures::fx::FxHashSet<Box<str>>>,
 }
 
 /// The target's macOS deployment version, packed as `major << 16 | minor << 8 | patch` for the
@@ -189,6 +197,8 @@ impl<'tcx> CodegenCx<'tcx> {
             eh_personality: Cell::new(None),
             local_gen_sym_counter: Cell::new(0),
             debug: crate::dwarf::DebugContext::new(tcx).map(RefCell::new),
+            global_asm: RefCell::new(String::new()),
+            asm_syms: RefCell::new(rustc_data_structures::fx::FxHashSet::default()),
         }
     }
 

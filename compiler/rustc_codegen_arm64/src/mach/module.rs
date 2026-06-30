@@ -4,6 +4,8 @@
 //! Symbol names are stored exactly as they must appear in the final symbol table (including any
 //! platform prefix such as the Mach-O leading underscore); the emitters do no name mangling.
 
+use rustc_data_structures::fx::FxHashSet;
+
 use crate::mach::func::{MachFunction, Reloc};
 
 /// Where a data item lives, which selects its Mach-O section.
@@ -41,11 +43,20 @@ pub struct MachModule {
     /// `LC_BUILD_VERSION` load command, captured from the session target. Defaults to 11.0, the
     /// first Apple-Silicon macOS, when no session is available.
     pub macho_min_os: u32,
+    /// Symbol names that must be emitted with global (external) scope even if their item has
+    /// internal linkage, because they are referenced by a `sym` operand from this codegen unit's
+    /// `global_asm!`/`asm!` (which is assembled into a separate object that can only see globals).
+    pub forced_globals: FxHashSet<Box<str>>,
 }
 
 impl MachModule {
     pub fn new() -> MachModule {
-        MachModule { functions: Vec::new(), data: Vec::new(), macho_min_os: 0x000B_0000 }
+        MachModule {
+            functions: Vec::new(),
+            data: Vec::new(),
+            macho_min_os: 0x000B_0000,
+            forced_globals: FxHashSet::default(),
+        }
     }
 
     pub fn push_function(&mut self, func: MachFunction) {
