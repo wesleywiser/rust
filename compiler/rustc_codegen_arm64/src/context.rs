@@ -69,7 +69,11 @@ impl Value {
 }
 
 /// The structural description behind an interned [`Type`].
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+///
+/// `Copy` so that [`CodegenCx::type_data`] — one of the hottest paths in the backend, hit for almost
+/// every value and instruction — is a trivial register copy out of the interner rather than a clone
+/// (which, for the `Func` variant, used to allocate). No variant may hold owned heap data.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TypeData {
     Void,
     /// An integer of the given bit width (1 for `i1`/`bool` in registers).
@@ -86,8 +90,10 @@ pub enum TypeData {
     /// Any aggregate (struct/union/scalar-pair) — only its size/align matter to the baseline, which
     /// addresses fields by byte offset.
     Aggregate { size: u64, align: u64 },
-    /// A function signature.
-    Func { params: Vec<Type>, ret: Type },
+    /// A function signature. Only the return type is tracked: calls are lowered from the `FnAbi`,
+    /// not from this handle, so the argument types are never read and are not stored (keeping
+    /// `TypeData` `Copy`).
+    Func { ret: Type },
 }
 
 struct Interner<T: Clone + Eq + std::hash::Hash> {
@@ -211,9 +217,9 @@ impl<'tcx> CodegenCx<'tcx> {
         Type(self.types.borrow_mut().intern(data))
     }
 
-    /// Look up the structure behind a [`Type`] (cloned out of the interner).
+    /// Look up the structure behind a [`Type`] (a cheap `Copy` out of the interner).
     pub fn type_data(&self, ty: Type) -> TypeData {
-        self.types.borrow().get(ty.0).clone()
+        *self.types.borrow().get(ty.0)
     }
 
     /// Intern a symbol name.

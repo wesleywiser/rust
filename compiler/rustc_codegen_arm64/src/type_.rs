@@ -104,8 +104,10 @@ impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
         self.intern_type(TypeData::Array(ty, len))
     }
 
-    fn type_func(&self, args: &[Type], ret: Type) -> Type {
-        self.intern_type(TypeData::Func { params: args.to_vec(), ret })
+    fn type_func(&self, _args: &[Type], ret: Type) -> Type {
+        // Only the return type is recorded (see `TypeData::Func`); argument types are unused by the
+        // baseline, so we avoid the `to_vec` allocation here.
+        self.intern_type(TypeData::Func { ret })
     }
 
     fn type_kind(&self, ty: Type) -> TypeKind {
@@ -205,7 +207,7 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
         // The structural signature is unused by the baseline (the real ABI is taken from `FnAbi`);
         // a placeholder keeps the `BackendTypes::FunctionSignature` contract satisfied.
         let void = self.intern_type(TypeData::Void);
-        self.intern_type(TypeData::Func { params: Vec::new(), ret: void })
+        self.intern_type(TypeData::Func { ret: void })
     }
 
     fn fn_ptr_backend_type(&self, _fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Type {
