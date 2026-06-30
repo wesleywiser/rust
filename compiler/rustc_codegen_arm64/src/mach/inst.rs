@@ -11,14 +11,19 @@ use crate::mach::reg::{Cond, FpSize, Gpr, OperandSize, Vreg};
 pub type Label = u32;
 
 /// A resolved source location for debug info, attached to the instruction stream via the
-/// [`Inst::DebugLoc`] pseudo-op. The fields are already resolved against the source map (so the
-/// object-emitting back-half needs no `TyCtxt`): `file` is an index into the debug context's file
-/// table, `line`/`col` are 1-based (0 meaning "unknown").
+/// [`Inst::DebugLoc`] pseudo-op. The `file`/`line`/`col` fields are already resolved against the
+/// source map (so the object-emitting back-half needs no `TyCtxt`): `file` is an index into the
+/// debug context's file table, `line`/`col` are 1-based (0 meaning "unknown"). They describe the
+/// *innermost* (most-inlined) source location, which is what the `.debug_line` program records.
+///
+/// `loc` indexes the debug context's location table, which additionally records the lexical scope
+/// and the inlined-at call chain; it is used to reconstruct `DW_TAG_inlined_subroutine` frames.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct DebugLoc {
     pub file: u32,
     pub line: u32,
     pub col: u32,
+    pub loc: u32,
 }
 
 /// A reference to a named symbol plus an addend, used by calls and address-formation sequences.

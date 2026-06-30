@@ -34,8 +34,9 @@ impl<'tcx> DebugInfoCodegenMethods<'tcx> for CodegenCx<'tcx> {
         loc: DebugLoc,
         _discriminator: u32,
     ) -> Option<DebugLoc> {
-        // Discriminators are not modeled yet; reuse the same location.
-        Some(loc)
+        // Give the cloned location a distinct identity so two inlinings sharing a call-site span
+        // (e.g. from a macro) form separate inline frames rather than being merged.
+        Some(self.debug.as_ref().expect("debug info enabled").borrow_mut().clone_location(loc))
     }
 
     fn dbg_scope_fn(
@@ -52,18 +53,23 @@ impl<'tcx> DebugInfoCodegenMethods<'tcx> for CodegenCx<'tcx> {
                 let name = self.mangle(self.tcx.symbol_name(instance).name);
                 debug.define_function(self.tcx, instance, &name)
             }
-            // A declaration referenced from an inlined frame (Phase 3); use the CU root for now.
-            None => debug.root(),
+            // A callee inlined into the function being codegen'd: create (or reuse) its abstract
+            // subprogram DIE, which `DW_TAG_inlined_subroutine`s reference via `abstract_origin`.
+            None => debug.define_abstract_function(self.tcx, instance),
         }
     }
 
     fn dbg_loc(
         &self,
-        _scope: UnitEntryId,
-        _inlined_at: Option<DebugLoc>,
+        scope: UnitEntryId,
+        inlined_at: Option<DebugLoc>,
         span: Span,
     ) -> DebugLoc {
-        self.debug.as_ref().expect("debug info enabled").borrow_mut().source_loc(self.tcx, span)
+        self.debug
+            .as_ref()
+            .expect("debug info enabled")
+            .borrow_mut()
+            .make_location(self.tcx, scope, inlined_at, span)
     }
 
     fn extend_scope_to_file(&self, scope_metadata: UnitEntryId, _file: &SourceFile) -> UnitEntryId {
