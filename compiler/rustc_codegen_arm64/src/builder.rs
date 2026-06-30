@@ -2381,10 +2381,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             self.emit(Inst::Bl { sym: SymRef::new(sym) });
             return self.spill128(X0, X1, dest_ty);
         }
+        // `___fixtfdi`/`___fixunstfdi` convert to a 64-bit integer (saturating); narrower
+        // destinations are clamped from that 64-bit result.
         let sym = if signed { "___fixtfdi" } else { "___fixunstfdi" };
         self.materialize_q(val, V0);
         self.emit(Inst::Bl { sym: SymRef::new(sym) });
-        self.clamp_fp_to_int(X0, dest_ty, signed)
+        self.clamp_fp_to_int(X0, dest_ty, signed, OperandSize::S64)
     }
 
     /// Emit a carry-chained 128-bit add or subtract: `(lo, hi) op= (b_lo, b_hi)`. With `set_flags`,
@@ -2878,19 +2880,31 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// AArch64's `fcvtzs`/`fcvtzu` saturate to the 32- or 64-bit register, so for an `i8`/`i16`/etc.
     /// destination the out-of-range value must be additionally clamped (e.g. `300.0 as u8 == 255`,
     /// not `44`). Returns `raw_reg` spilled directly when the destination already spans the op width.
-    fn clamp_fp_to_int(&mut self, raw_reg: Gpr, dest_ty: Type, signed: bool) -> Value {
+    fn clamp_fp_to_int(
+        &mut self,
+        raw_reg: Gpr,
+        dest_ty: Type,
+        signed: bool,
+        raw_size: OperandSize,
+    ) -> Value {
         let n = match self.cx.type_data(dest_ty) {
             TypeData::Int(b) => b,
             _ => return self.spill(raw_reg, dest_ty),
         };
-        let op_bits = match op_size(self.cx, dest_ty) {
+        // The raw register holds a value of `raw_size` width which the converting instruction or
+        // libcall already saturated to that width's range; clamp it down to the (narrower)
+        // destination range and truncate. The width is taken from `raw_size`, not from `dest_ty`:
+        // the `f128` libcall (`___fixtfdi`) always yields a 64-bit result even when the destination
+        // is sub-word, and spilling that as 32 bits would drop the high half of the saturated value
+        // (turning a saturated `i64::MAX` into `-1`).
+        let raw_bits = match raw_size {
             OperandSize::S32 => 32,
             OperandSize::S64 => 64,
         };
-        if n >= op_bits {
+        if n >= raw_bits {
             return self.spill(raw_reg, dest_ty);
         }
-        let op_ty = self.cx.intern_type(TypeData::Int(op_bits));
+        let op_ty = self.cx.intern_type(TypeData::Int(raw_bits));
         let raw = self.spill(raw_reg, op_ty);
         let clamped = if signed {
             let max = self.cx.const_uint(op_ty, ((1i128 << (n - 1)) - 1) as u64);
@@ -5150,7 +5164,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let int = op_size(self.cx, dest_ty);
         self.materialize_fp(val, V16);
         self.emit(Inst::FpToInt { signed: false, fp, int, rd: X9, rn: V16 });
-        self.clamp_fp_to_int(X9, dest_ty, false)
+        self.clamp_fp_to_int(X9, dest_ty, false, int)
     }
     fn fptosi(&mut self, val: Value, dest_ty: Type) -> Value {
         if self.is_f128(val.ty()) {
@@ -5163,7 +5177,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let int = op_size(self.cx, dest_ty);
         self.materialize_fp(val, V16);
         self.emit(Inst::FpToInt { signed: true, fp, int, rd: X9, rn: V16 });
-        self.clamp_fp_to_int(X9, dest_ty, true)
+        self.clamp_fp_to_int(X9, dest_ty, true, int)
     }
     fn uitofp(&mut self, val: Value, dest_ty: Type) -> Value {
         if self.is_f128(dest_ty) {
