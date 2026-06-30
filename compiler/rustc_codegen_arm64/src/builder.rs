@@ -66,6 +66,16 @@ enum SimdReduce {
     Xor,
 }
 
+/// Lane-wise integer bit operation for [`Builder::emit_simd_bit_unary`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SimdBitOp {
+    Ctpop,
+    Ctlz,
+    Cttz,
+    Bswap,
+    Bitreverse,
+}
+
 /// State for the function currently being lowered.
 pub struct FunctionBuild {
     pub name: Box<str>,
@@ -1408,6 +1418,42 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             let av = Value::Slot { off: aoff + i * es, ty: elem };
             let bv = Value::Slot { off: boff + i * es, ty: elem };
             let r = self.emit_saturating(av, bv, is_add, signed, elem);
+            self.materialize(r, X10);
+            self.emit_mem_gpr(false, false, msize, X10, SP, roff + i * es);
+        }
+        Value::Slot { off: roff, ty: vec_ty }
+    }
+
+    /// `simd_ctpop`/`simd_ctlz`/`simd_cttz`/`simd_bswap`/`simd_bitreverse`: lane-wise integer bit
+    /// operations, each reusing the scalar lowering per lane. The population/zero counts come back
+    /// 64-bit and are narrowed to the lane width.
+    fn emit_simd_bit_unary(&mut self, op: SimdBitOp, v: Value) -> Value {
+        let vec_ty = v.ty();
+        let (elem, count, es) = self.vector_info(vec_ty);
+        let Some(off) = self.vector_to_slot(v) else {
+            return Value::Undef { ty: vec_ty };
+        };
+        let (size, align) = self.cx.type_size_align(vec_ty);
+        let roff = self.alloc_slot(size, align);
+        let msize = mem_size(self.cx, elem);
+        for i in 0..count {
+            let lane = Value::Slot { off: off + i * es, ty: elem };
+            let r = match op {
+                SimdBitOp::Ctpop => {
+                    let c = self.emit_ctpop(lane);
+                    self.intcast(c, elem, false)
+                }
+                SimdBitOp::Ctlz => {
+                    let c = self.emit_ctlz(lane);
+                    self.intcast(c, elem, false)
+                }
+                SimdBitOp::Cttz => {
+                    let c = self.emit_cttz(lane);
+                    self.intcast(c, elem, false)
+                }
+                SimdBitOp::Bswap => self.emit_reverse(lane, DataProc1::Rev),
+                SimdBitOp::Bitreverse => self.emit_reverse(lane, DataProc1::Rbit),
+            };
             self.materialize(r, X10);
             self.emit_mem_gpr(false, false, msize, X10, SP, roff + i * es);
         }
@@ -3429,6 +3475,18 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                     is_add,
                     signed,
                 );
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::simd_ctpop | sym::simd_ctlz | sym::simd_cttz | sym::simd_bswap
+            | sym::simd_bitreverse => {
+                let op = match name {
+                    sym::simd_ctpop => SimdBitOp::Ctpop,
+                    sym::simd_ctlz => SimdBitOp::Ctlz,
+                    sym::simd_cttz => SimdBitOp::Cttz,
+                    sym::simd_bswap => SimdBitOp::Bswap,
+                    _ => SimdBitOp::Bitreverse,
+                };
+                let r = self.emit_simd_bit_unary(op, args[0].immediate());
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
             sym::simd_fabs | sym::simd_fsqrt | sym::simd_ceil | sym::simd_floor | sym::simd_round
