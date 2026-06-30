@@ -2205,6 +2205,23 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.spill128(X9, X10, ty)
     }
 
+    /// `f128` negation: flip the sign bit (bit 127), which lives in the high 64-bit word. A native
+    /// `fneg` would treat the value as `f64` and corrupt it, so operate on the two GPR words.
+    fn f128_fneg(&mut self, arg: Value) -> Value {
+        let ty = arg.ty();
+        self.materialize128(arg, X9, X10);
+        self.load_imm(X11_HACK, 0x8000_0000_0000_0000, OperandSize::S64);
+        self.emit(Inst::Logical {
+            op: LogicOp::Eor,
+            size: OperandSize::S64,
+            rd: X10,
+            rn: X10,
+            rm: X11_HACK,
+            amount: 0,
+        });
+        self.spill128(X9, X10, ty)
+    }
+
     /// Load a 16-byte `f128` value into the `q` register `qreg`.
     fn materialize_q(&mut self, val: Value, qreg: Vreg) {
         match val {
@@ -4359,6 +4376,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
     fn fneg(&mut self, v: Value) -> Value {
         let ty = v.ty();
+        if self.is_f128(ty) {
+            return self.f128_fneg(v);
+        }
         let size = fp_size(self.cx, ty);
         self.materialize_fp(v, V16);
         self.emit(Inst::FpDataProc1 { op: FpOp1::Fneg, size, rd: V16, rn: V16 });
