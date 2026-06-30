@@ -5,10 +5,13 @@
 //! It reuses `rustc_codegen_ssa`'s generic MIR-lowering driver (like the LLVM and GCC backends) by
 //! implementing the backend trait family, rather than walking MIR itself.
 //!
-//! # Future work / known limitations
+//! # Notable feature areas and known limitations
 //!
-//! These are deliberately unimplemented; the backend fails loudly (via `todo!`) rather than
-//! miscompiling when it hits them, so they show up as clear ICEs instead of wrong runtime results.
+//! Most of the backend is implemented; the bullets below record the areas with non-obvious lowerings
+//! or remaining gaps. Genuinely unimplemented operations fail loudly (an ICE via `todo!`) rather than
+//! miscompiling, so they surface as clear errors instead of wrong runtime results. The one exception
+//! is unwinding — running destructors during a panic — which currently does less than it should
+//! without erroring (see below).
 //!
 //! - **SIMD / vector types.** Vector values live in frame slots. Native-width vectors (exactly 8 or
 //!   16 bytes) use real NEON instructions for the common arithmetic, bitwise, comparison, and unary
@@ -31,8 +34,12 @@
 //!   lookup), `uaddlp`/`saddlp` (pairwise-add-long), `addp` (pairwise add), and `umull`/`smull`
 //!   (widening multiply) — enough for the portable-SIMD substring/slice search reached by
 //!   `str::contains`/`find`, the `hashbrown` SIMD group scan behind `HashMap`/`HashSet`,
-//!   rand/chacha20, and the NEON `adler32` checksum in `simd-adler32`. A true NEON register model
-//!   (operating on `q`/`v` registers rather than memory) is not implemented.
+//!   rand/chacha20, and the NEON `adler32` checksum in `simd-adler32`. Vectors are never kept live in
+//!   the `v` register file across operations: like every other value they live in a stack slot and
+//!   are loaded into a `v` register per operation and stored straight back. A true NEON register model
+//!   would need a vector register allocator (liveness/spilling) — exactly the machinery this
+//!   allocation-free, single-pass backend deliberately omits — and would only improve runtime speed,
+//!   which is a non-goal, so it is intentionally not pursued.
 //!
 //! - **`global_asm!`, `#[naked]` functions, and inline `asm!` are all supported.** This
 //!   object-emitting backend has no built-in textual assembler, so every kind of inline assembly is
@@ -58,11 +65,27 @@
 //!   `sha256su1`) are lowered to the real instructions, moving the 128-bit operands between frame
 //!   slots and `v` registers via `q` loads/stores. Differential-tested against the LLVM backend.
 //!
-//! - **Debug info is not generated.** All the `DebugInfoCodegenMethods` (variable/scope/location
-//!   creation, vtable debuginfo, the gdb scripts section) are no-ops over unit `DIScope`/
-//!   `DILocation`/`DIVariable` types, so `-g` builds produce working binaries with no DWARF —
-//!   debuggers and profilers see only symbol names, not line tables, types, or local variables.
-//!   Emitting DWARF (a `__debug_*` section set plus per-function line programs) is future work.
+//! - **Debug info: line tables and (inlined) function frames, but not locals.** Under `-g` the
+//!   backend emits DWARF — a `__DWARF` section set built with `gimli`: a compilation-unit DIE, a
+//!   `DW_TAG_subprogram` per function (name, linkage name, decl file/line, `low_pc`/`high_pc`, an
+//!   `x29` frame base), a line-number program mapping each instruction to its file/line/column, and
+//!   `DW_TAG_inlined_subroutine` trees that reconstruct the inline-call chain (so optimized
+//!   backtraces expand each inlined frame with its own name and call-site line). lldb gets accurate
+//!   backtraces and column-precise line breakpoints, and `llvm-dwarfdump --verify` is clean. Still
+//!   missing: local variable / parameter locations (`create_dbg_var` is a no-op) and type DIEs, so
+//!   lldb's `frame variable` shows nothing — emitting `DW_OP_fbreg` locations (values live at known
+//!   frame-slot offsets) plus base/aggregate type DIEs is the remaining work.
+//!
+//! - **Unwinding is partial: panics propagate, but destructors do not run while unwinding.** With
+//!   `-Cpanic=abort` everything is clean. Under the default `-Cpanic=unwind` a panic still unwinds
+//!   and exits cleanly (libunwind walks the `fp`/`lr` frames via macOS compact unwind), but the
+//!   backend does not emit a working `__eh_frame` personality entry, so cleanup landing pads never
+//!   fire: a value whose `Drop` would run only on the unwinding path is leaked, and `catch_unwind`
+//!   cannot catch. The CIE/FDE bytes are written byte-for-byte like LLVM but are gated off behind a
+//!   single tooling blocker — the `object` crate (0.39.1) cannot emit the GOT-indirect personality
+//!   relocation (`ARM64_RELOC_POINTER_TO_GOT`, pc-relative) that ld64 requires (see
+//!   `mach::emit_obj`). This is the one area that silently does less than it should rather than
+//!   failing loudly.
 //!
 //! Implemented since the first cut, for reference:
 //!
@@ -82,19 +105,14 @@
 //!   is passed/returned in an `h` register. `f16` transcendental math (`sin`/`cos`/`exp`/`log`/
 //!   `pow`/`powi`/`fmod`) has no libm form, so it is promoted to `f32`, computed with the `f32`
 //!   routine, and rounded back to `f16` (matching how LLVM legalizes it). `f128` (IEEE binary128, no
-//!   AArch64 hardware) is a 16-byte value held in a `q` register; arithmetic, comparison, `fabs`,
-//!   and the conversions to/from the other floats and the integers are `compiler_builtins` libcalls
-//!   (`__addtf3`, `__lttf2`, `__trunctfdf2`, `__floatditf`, ...) or a sign-bit clear, passed/returned
+//!   AArch64 hardware) is a 16-byte value held in a `q` register; arithmetic, comparison, and the
+//!   conversions to/from the other floats and the integers are `compiler_builtins` libcalls
+//!   (`__addtf3`, `__lttf2`, `__trunctfdf2`, `__floatditf`, ...), while `fabs`/`fneg`/`copysign` are
+//!   sign-bit manipulations on the high word, all passed/returned
 //!   in a `q` register. `f128` transcendental math, `fma`, and `sqrt` are *not* supported: macOS has
 //!   no `f128` libm, and even the LLVM backend miscompiles them here (it calls the `long double`
 //!   = `f64` routines `fmal`/`sqrtl`), so `has_reliable_f128_math` is `false` and the backend fails
 //!   loudly rather than emitting garbage. Everything else is differential-tested against LLVM.
-//!
-//! - **Thread-local storage** uses the macOS thread-local-variable (TLV) model: a thread-local
-//!   static is emitted as a `$tlv$init` initializer in `__thread_data` plus a three-word descriptor
-//!   in `__thread_vars`, and a read loads the descriptor address (`TLVP_LOAD_PAGE21`/`PAGEOFF12`
-//!   relocations) and calls the thunk in its first word to get the per-thread address. This is what
-//!   unblocks `HashMap`/`HashSet`, whose `RandomState` seed is a thread-local.
 //!
 //! - **Thread-local storage** uses the macOS thread-local-variable (TLV) model: a thread-local
 //!   static is emitted as a `$tlv$init` initializer in `__thread_data` plus a three-word descriptor
