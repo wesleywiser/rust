@@ -41,7 +41,7 @@ use crate::mach::inst::{
 };
 use crate::mach::reg::{
     Cond, FpSize, Gpr, OperandSize, Vreg, FP, LR, SP, V0, V1, V16, V17, V18, X0, X1, X2, X3, X4, X9,
-    X10, X11, X12, X13, X16, ZR,
+    X10, X11, X12, X13, X16, X17, ZR,
 };
 
 /// Lane-wise SIMD arithmetic operation kind for [`Builder::emit_simd_arith`].
@@ -96,6 +96,11 @@ impl FunctionBuild {
     /// the stack-teardown sequence followed by the return.
     pub fn finish(self) -> MachFunction {
         let frame = self.frame.frame_size();
+        let align = self.frame.alignment();
+        // The stack pointer is only 16-byte aligned on entry. If any local needs more, the prologue
+        // must realign `sp` down to `align` (and the epilogue restore it from the frame pointer,
+        // since `sp` is then no longer a fixed distance below it).
+        let realign = align > 16;
         let mut f = MachFunction::new(self.name, self.is_global);
         f.call_sites = self.call_sites;
 
@@ -111,13 +116,21 @@ impl FunctionBuild {
         });
         f.push(Inst::MovSp { size: OperandSize::S64, rd: FP, rn: SP });
         push_sp_adjust(&mut f.insts, AddSub::Sub, frame);
+        if realign {
+            push_sp_realign(&mut f.insts, align);
+        }
 
         for (id, block) in self.blocks.into_iter().enumerate() {
             f.push(Inst::Label(id as Label));
             for inst in block {
                 if let Inst::Ret { .. } = inst {
                     // Epilogue before every return.
-                    push_sp_adjust(&mut f.insts, AddSub::Add, frame);
+                    if realign {
+                        // `sp` was realigned to an unknown distance below `fp`; restore it directly.
+                        f.push(Inst::MovSp { size: OperandSize::S64, rd: SP, rn: FP });
+                    } else {
+                        push_sp_adjust(&mut f.insts, AddSub::Add, frame);
+                    }
                     f.push(Inst::LoadStorePair {
                         load: true,
                         size: OperandSize::S64,
@@ -235,6 +248,37 @@ fn push_sp_adjust(out: &mut Vec<Inst>, op: AddSub, frame: u64) {
         push_load_imm64(out, X16, frame);
         out.push(Inst::AddSubExtReg { op, size: OperandSize::S64, rd: SP, rn: SP, rm: X16 });
     }
+}
+
+/// Realign the stack pointer downward to `align` (a power of two greater than 16): `sp &= ~(align-1)`.
+/// Computed via `x16`/`x17`, which are dead in the prologue (params are not spilled until the entry
+/// block). The stack pointer can only be written through the SP-aware move/extended forms, so the
+/// mask is applied in `x16` and moved back.
+fn push_sp_realign(out: &mut Vec<Inst>, align: u64) {
+    debug_assert!(align.is_power_of_two() && align > 16);
+    let mask = !(align - 1);
+    out.push(Inst::MovSp { size: OperandSize::S64, rd: X16, rn: SP });
+    if align <= (1 << 16) {
+        // `movn x17, #(align-1)` materializes `~(align-1)` = mask in one instruction.
+        out.push(Inst::MovWide {
+            kind: MovKind::Inverse,
+            size: OperandSize::S64,
+            rd: X17,
+            imm16: (align - 1) as u16,
+            shift: 0,
+        });
+    } else {
+        push_load_imm64(out, X17, mask);
+    }
+    out.push(Inst::Logical {
+        op: LogicOp::And,
+        size: OperandSize::S64,
+        rd: X16,
+        rn: X16,
+        rm: X17,
+        amount: 0,
+    });
+    out.push(Inst::MovSp { size: OperandSize::S64, rd: SP, rn: X16 });
 }
 
 /// A builder positioned at the end of a basic block.

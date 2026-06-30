@@ -35,21 +35,32 @@ pub struct FrameLayout {
     /// `sp`-relative offset at which the next local slot will be placed; starts just above the
     /// outgoing area and grows as slots are allocated.
     next_local: u64,
+    /// The largest alignment requested by any local slot. The stack pointer is only guaranteed
+    /// 16-byte aligned on entry, so if any slot needs more the prologue must dynamically realign
+    /// `sp` (see `builder::FunctionBuild::finish`).
+    max_align: u64,
 }
 
 impl FrameLayout {
     /// Reserve `outgoing_bytes` (rounded up to the 16-byte stack alignment) for outgoing call
     /// arguments at the bottom of the frame.
     pub fn new(outgoing_bytes: u64) -> FrameLayout {
-        FrameLayout { next_local: align_up(outgoing_bytes, 16) }
+        FrameLayout { next_local: align_up(outgoing_bytes, 16), max_align: 16 }
     }
 
     /// Allocate a local spill slot of `size`/`align` bytes, returning its `sp`-relative offset.
     pub fn alloc_local(&mut self, size: u64, align: u64) -> u64 {
         let align = align.max(1);
+        self.max_align = self.max_align.max(align);
         let off = align_up(self.next_local, align);
         self.next_local = off + size.max(1);
         off
+    }
+
+    /// The alignment the frame base (`sp`) must satisfy: the maximum over all local slots, never
+    /// below the 16-byte AArch64 stack alignment. When this exceeds 16 the prologue realigns `sp`.
+    pub fn alignment(&self) -> u64 {
+        self.max_align
     }
 
     /// The `fp`-relative offset of an incoming stack argument at byte position `arg_offset`.
@@ -120,5 +131,25 @@ mod tests {
         let frame = FrameLayout::new(0);
         assert_eq!(frame.incoming_arg(0), 16);
         assert_eq!(frame.incoming_arg(8), 24);
+    }
+
+    #[test]
+    fn tracks_max_alignment() {
+        // No locals, or only normally-aligned ones: the base needs only the 16-byte stack alignment.
+        let mut frame = FrameLayout::new(0);
+        assert_eq!(frame.alignment(), 16);
+        frame.alloc_local(8, 8);
+        assert_eq!(frame.alignment(), 16);
+        // An over-aligned local bumps the required base alignment (triggers prologue realignment).
+        frame.alloc_local(32, 32);
+        assert_eq!(frame.alignment(), 32);
+        // A larger one wins; a smaller later one does not lower it.
+        frame.alloc_local(64, 64);
+        frame.alloc_local(8, 8);
+        assert_eq!(frame.alignment(), 64);
+        // The over-aligned slot's own offset is aligned within the frame, too.
+        let off = frame.alloc_local(16, 128);
+        assert_eq!(off % 128, 0);
+        assert_eq!(frame.alignment(), 128);
     }
 }
