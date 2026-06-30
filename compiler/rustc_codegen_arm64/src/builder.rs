@@ -3468,18 +3468,163 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     }
 }
 
+impl<'a, 'tcx> Builder<'a, 'tcx> {
+    /// Store an inline-asm input `val` into the marshalling frame at `[sp, #off]`, in its register
+    /// class's slot (a general-purpose register, or a SIMD&FP register for floats).
+    fn marshal_store(&mut self, val: Value, off: u64) {
+        match self.cx.type_data(val.ty()) {
+            TypeData::Float(_) => {
+                let sz = fp_size(self.cx, val.ty());
+                self.materialize_fp(val, V0);
+                self.emit_mem_fp(false, sz, V0, SP, off);
+            }
+            TypeData::Int(bits) if bits <= 64 => {
+                self.materialize(val, X9);
+                self.emit_mem_gpr(false, false, MemSize::X, X9, SP, off);
+            }
+            TypeData::Ptr => {
+                self.materialize(val, X9);
+                self.emit_mem_gpr(false, false, MemSize::X, X9, SP, off);
+            }
+            other => self.cx.tcx.dcx().fatal(format!(
+                "rustc_codegen_arm64: unsupported inline-asm operand type {other:?} \
+                 (only integers, pointers, and scalar floats are supported)"
+            )),
+        }
+    }
+
+    /// Load an inline-asm output from the marshalling frame at `[sp, #off]` into `place`.
+    fn marshal_load(&mut self, place: PlaceRef<'tcx, Value>, off: u64) {
+        let ty = self.cx.immediate_backend_type(place.layout);
+        match self.cx.type_data(ty) {
+            TypeData::Float(_) => {
+                let sz = fp_size(self.cx, ty);
+                self.emit_mem_fp(true, sz, V0, SP, off);
+                let v = self.spill_fp(V0, ty);
+                OperandValue::Immediate(v).store(self, place);
+            }
+            TypeData::Int(bits) if bits <= 64 => {
+                self.emit_mem_gpr(true, false, MemSize::X, X9, SP, off);
+                let v = self.spill(X9, ty);
+                OperandValue::Immediate(v).store(self, place);
+            }
+            TypeData::Ptr => {
+                self.emit_mem_gpr(true, false, MemSize::X, X9, SP, off);
+                let v = self.spill(X9, ty);
+                OperandValue::Immediate(v).store(self, place);
+            }
+            other => self.cx.tcx.dcx().fatal(format!(
+                "rustc_codegen_arm64: unsupported inline-asm output type {other:?} \
+                 (only integers, pointers, and scalar floats are supported)"
+            )),
+        }
+    }
+}
+
 impl<'a, 'tcx> AsmBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn codegen_inline_asm(
         &mut self,
-        _template: &[InlineAsmTemplatePiece],
-        _operands: &[InlineAsmOperandRef<'tcx, Self>],
-        _options: InlineAsmOptions,
-        _line_spans: &[Span],
-        _instance: Instance<'_>,
-        _dest: Option<BasicBlock>,
+        template: &[InlineAsmTemplatePiece],
+        operands: &[InlineAsmOperandRef<'tcx, Self>],
+        options: InlineAsmOptions,
+        line_spans: &[Span],
+        instance: Instance<'_>,
+        dest: Option<BasicBlock>,
         _catch_funclet: Option<(BasicBlock, Option<&()>)>,
     ) {
-        todo!("rustc_codegen_arm64: codegen_inline_asm")
+        use crate::inline_asm::AsmOperand;
+
+        let tcx = self.cx.tcx;
+        // Lower operands into a descriptor list for the wrapper generator plus a parallel list of
+        // the SSA values to marshal (input value, output place) at the call site.
+        let mut gen_ops = Vec::with_capacity(operands.len());
+        let mut marshal: Vec<(Option<Value>, Option<PlaceRef<'tcx, Value>>)> =
+            Vec::with_capacity(operands.len());
+        for op in operands {
+            match op {
+                InlineAsmOperandRef::In { reg, value } => {
+                    gen_ops.push(AsmOperand::In { reg: *reg });
+                    marshal.push((Some(value.immediate()), None));
+                }
+                InlineAsmOperandRef::Out { reg, late, place } => {
+                    gen_ops.push(AsmOperand::Out { reg: *reg, late: *late, used: place.is_some() });
+                    marshal.push((None, *place));
+                }
+                InlineAsmOperandRef::InOut { reg, late, in_value, out_place } => {
+                    gen_ops.push(AsmOperand::InOut {
+                        reg: *reg,
+                        late: *late,
+                        out_used: out_place.is_some(),
+                    });
+                    marshal.push((Some(in_value.immediate()), *out_place));
+                }
+                InlineAsmOperandRef::Const { string } => {
+                    gen_ops.push(AsmOperand::Const { value: string.clone() });
+                    marshal.push((None, None));
+                }
+                InlineAsmOperandRef::SymFn { instance: sym_instance } => {
+                    let name = self.cx.mangle(tcx.symbol_name(*sym_instance).name);
+                    self.cx.asm_syms.borrow_mut().insert(name.clone().into());
+                    gen_ops.push(AsmOperand::Sym { value: name });
+                    marshal.push((None, None));
+                }
+                InlineAsmOperandRef::SymStatic { def_id } => {
+                    let name = self.cx.mangle(tcx.symbol_name(Instance::mono(tcx, *def_id)).name);
+                    self.cx.asm_syms.borrow_mut().insert(name.clone().into());
+                    gen_ops.push(AsmOperand::Sym { value: name });
+                    marshal.push((None, None));
+                }
+                InlineAsmOperandRef::Label { .. } => {
+                    let span = line_spans.first().copied().unwrap_or(rustc_span::DUMMY_SP);
+                    tcx.dcx().span_fatal(
+                        span,
+                        "rustc_codegen_arm64: `asm!` label operands (asm goto) are not supported",
+                    );
+                }
+            }
+        }
+
+        // Generate the wrapper function and its marshalling layout, and queue the wrapper for
+        // assembly. The wrapper name embeds the enclosing function's symbol (unique per
+        // monomorphization) and a per-unit index, so wrappers never collide across codegen units.
+        // `cur_instance` is the enclosing function (same as `instance`, but carries the `'tcx`
+        // lifetime that `symbol_name` needs).
+        let enclosing = self.cx.cur_instance.get().expect("inline asm outside a function body");
+        let idx = self.cx.inline_asm_index.get();
+        self.cx.inline_asm_index.set(idx + 1);
+        let asm_name = format!("{}__inline_asm_{}", tcx.symbol_name(enclosing).name, idx);
+        let (wrapper, layout) = crate::inline_asm::generate(
+            tcx,
+            instance.def_id(),
+            &asm_name,
+            template,
+            &gen_ops,
+            options,
+        );
+        self.cx.global_asm.borrow_mut().push_str(&wrapper);
+
+        // Marshalling frame: store inputs, call the wrapper with its address in x0, read outputs.
+        let frame = self.alloc_slot(layout.slot_size.max(8), 16);
+        for (i, (in_val, _)) in marshal.iter().enumerate() {
+            if let (Some(val), Some(off)) = (in_val, layout.in_slots[i]) {
+                self.marshal_store(*val, frame + off);
+            }
+        }
+        self.emit_frame_addr(X0, frame);
+        self.emit(Inst::Bl { sym: SymRef::new(self.cx.mangle(&asm_name)) });
+        for (i, (_, place)) in marshal.iter().enumerate() {
+            if let (Some(place), Some(off)) = (place, layout.out_slots[i]) {
+                self.marshal_load(*place, frame + off);
+            }
+        }
+
+        // Control flow out of the asm is normally emitted by the SSA layer *after* this returns
+        // (a branch to the destination block, or `unreachable()` for `options(noreturn)`). The
+        // only exception is when it hands us a normal-return target directly — the asm-goto and
+        // may-unwind paths — which we must branch to ourselves.
+        if let Some(dest) = dest {
+            self.br(dest);
+        }
     }
 }
 

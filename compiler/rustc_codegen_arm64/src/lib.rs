@@ -31,17 +31,23 @@
 //!   rand/chacha20, and the NEON `adler32` checksum in `simd-adler32`. A true NEON register model
 //!   (operating on `q`/`v` registers rather than memory) is not implemented.
 //!
-//! - **`global_asm!` and `#[naked]` functions are supported; inline `asm!` is not (yet).** This
-//!   object-emitting backend has no built-in textual assembler, so `global_asm!` blocks and
-//!   `#[naked]` function bodies (which `rustc_codegen_ssa` lowers through the same
-//!   `codegen_global_asm` path) are accumulated as assembly text and handed to the platform C
-//!   compiler (`$CC`/`cc`) to assemble into a side object that is linked in — the same approach the
-//!   cranelift backend uses. `sym` operands referencing internal-linkage items are force-promoted
-//!   to global symbols so the separately-assembled object can resolve them. Inline `asm!`
-//!   (`codegen_inline_asm`) is still unimplemented and fails loudly; crates using it can usually be
-//!   built via their software fallbacks. The dedicated AArch64 `crc32{c}{b,h,w,x}` instructions
-//!   *are* supported even though `zlib-rs` reaches them through `asm!` (other crates such as
-//!   `crc32fast` use the intrinsics, which work).
+//! - **`global_asm!`, `#[naked]` functions, and inline `asm!` are all supported.** This
+//!   object-emitting backend has no built-in textual assembler, so every kind of inline assembly is
+//!   ultimately accumulated as assembly text, handed to the platform C compiler (`$CC`/`cc`) to
+//!   assemble into a side object, and linked in — the same approach the cranelift backend uses.
+//!   `global_asm!` blocks and `#[naked]` function bodies (which `rustc_codegen_ssa` lowers through
+//!   the same `codegen_global_asm` path) are emitted verbatim. An inline `asm!`
+//!   (`codegen_inline_asm`) is lowered to a register-allocated *naked wrapper* function: the backend
+//!   allocates registers/clobber slots for the operands, generates the wrapper (which moves operands
+//!   between a marshalling stack frame and their registers around the user template), and replaces
+//!   the `asm!` itself with a `bl` to that wrapper after spilling inputs and reloading outputs — so
+//!   `asm!` is a real call, not a true inline (the `pure`/`nomem`/`nostack` options are therefore
+//!   no-ops). `sym` operands referencing internal-linkage items are force-promoted to global symbols
+//!   so the separately-assembled object can resolve them. Limitations: operands must be scalar
+//!   integer/pointer or scalar floating-point — vector and `i128` `asm!` operands are rejected with a
+//!   fatal error — and `label` operands (asm-goto) and `options(may_unwind)` are unsupported. The
+//!   dedicated AArch64 `crc32{c}{b,h,w,x}` instructions are also available as intrinsics (as used by
+//!   `crc32fast`).
 //!
 //! - **ARMv8 cryptography** *is* supported: the AES round/mix-columns intrinsics (`aese`/`aesd`/
 //!   `aesmc`/`aesimc`) and the SHA-1/SHA-256 round and message-schedule intrinsics
@@ -133,6 +139,7 @@ mod context;
 mod debuginfo;
 mod declare;
 mod dwarf;
+mod inline_asm;
 mod mach;
 mod type_;
 

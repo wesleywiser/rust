@@ -167,6 +167,9 @@ pub struct CodegenCx<'tcx> {
     /// Symbol names referenced by `sym` operands in this codegen unit's `global_asm!`/`asm!`. They
     /// must be emitted with global scope so the separately-assembled asm object can resolve them.
     pub asm_syms: RefCell<rustc_data_structures::fx::FxHashSet<Box<str>>>,
+
+    /// Counter for naming the generated wrapper function of each inline `asm!` in this unit.
+    pub inline_asm_index: Cell<usize>,
 }
 
 /// The target's macOS deployment version, packed as `major << 16 | minor << 8 | patch` for the
@@ -199,6 +202,7 @@ impl<'tcx> CodegenCx<'tcx> {
             debug: crate::dwarf::DebugContext::new(tcx).map(RefCell::new),
             global_asm: RefCell::new(String::new()),
             asm_syms: RefCell::new(rustc_data_structures::fx::FxHashSet::default()),
+            inline_asm_index: Cell::new(0),
         }
     }
 
