@@ -4702,6 +4702,16 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.fdiv(lhs, rhs)
     }
     fn frem(&mut self, lhs: Value, rhs: Value) -> Value {
+        // `f128` remainder would need `fmodf128`, which neither macOS's libm nor compiler-builtins
+        // provides. Fail loudly rather than silently computing against only the low 64 bits as an
+        // `f64` (which would also leave the result's high bits uninitialized) — this matches how the
+        // backend handles the other f128-without-libm operations (sqrt/sin/...).
+        if self.is_f128(lhs.ty()) {
+            self.cx.tcx.dcx().fatal(
+                "rustc_codegen_arm64: the f128 remainder operator (`%`) is not supported on this \
+                 target (no `fmodf128` is available)",
+            );
+        }
         // `frem` has no hardware instruction; lower to the C library `fmod`/`fmodf`.
         self.fp_libm_binary("fmod", lhs, rhs)
     }
@@ -5402,8 +5412,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn select(&mut self, cond: Value, then_val: Value, else_val: Value) -> Value {
         let ty = then_val.ty();
-        if self.is_int128(ty) {
-            // Select each 64-bit word independently after a single `cmp cond, #0`.
+        if self.is_int128(ty) || self.is_f128(ty) {
+            // A 16-byte value (`i128`/`u128` or `f128`) is selected one 64-bit word at a time after
+            // a single `cmp cond, #0`. Going through the scalar path below would `csel` only the low
+            // 8 bytes and leave the high half undefined.
             self.materialize(cond, X9);
             self.emit(Inst::AddSubImm { op: AddSub::Sub, size: OperandSize::S32, set_flags: true, rd: ZR, rn: X9, imm12: 0, shift12: false });
             self.materialize128(then_val, X10, X11);
