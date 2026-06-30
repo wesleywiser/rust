@@ -406,6 +406,20 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
     }
 
+    /// Copy `size` bytes between two frame slots (`src_off` -> `dst_off`, both `sp`-relative) through
+    /// the `x10` scratch. Used to marshal inline-asm vector operands to/from the marshalling frame.
+    fn copy_sp_to_sp(&mut self, src_off: u64, dst_off: u64, size: u64) {
+        let mut o = 0u64;
+        for chunk in [8u64, 4, 2, 1] {
+            let msize = mem_size_from_bytes(chunk);
+            while o + chunk <= size {
+                self.emit_mem_gpr(true, false, msize, X10, SP, src_off + o);
+                self.emit_mem_gpr(false, false, msize, X10, SP, dst_off + o);
+                o += chunk;
+            }
+        }
+    }
+
     /// Copy `size` bytes from frame slot `src_off` to `[base + dst_off]`, using descending
     /// power-of-two chunks through the `x10` scratch. Used to assemble/scatter `PassMode::Cast`
     /// register pieces, whose offsets within an aggregate need not be 8-aligned. `base` and `dst`
@@ -4066,9 +4080,17 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 self.materialize(val, X9);
                 self.emit_mem_gpr(false, false, MemSize::X, X9, SP, off);
             }
+            TypeData::Vector(..) => {
+                // A vector operand (e.g. a NEON `uint8x16_t`) lives in a frame slot; copy its bytes
+                // into the marshalling frame, where the wrapper loads it into a `v` register.
+                if let Some(src) = self.vector_to_slot(val) {
+                    let (size, _) = self.cx.type_size_align(val.ty());
+                    self.copy_sp_to_sp(src, off, size);
+                }
+            }
             other => self.cx.tcx.dcx().fatal(format!(
                 "rustc_codegen_arm64: unsupported inline-asm operand type {other:?} \
-                 (only integers, pointers, and scalar floats are supported)"
+                 (only integers, pointers, scalar floats, and vectors are supported)"
             )),
         }
     }
@@ -4093,9 +4115,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let v = self.spill(X9, ty);
                 OperandValue::Immediate(v).store(self, place);
             }
+            TypeData::Vector(..) => {
+                // Read the vector output straight out of the marshalling frame into the place.
+                OperandValue::Immediate(Value::Slot { off, ty }).store(self, place);
+            }
             other => self.cx.tcx.dcx().fatal(format!(
                 "rustc_codegen_arm64: unsupported inline-asm output type {other:?} \
-                 (only integers, pointers, and scalar floats are supported)"
+                 (only integers, pointers, scalar floats, and vectors are supported)"
             )),
         }
     }
