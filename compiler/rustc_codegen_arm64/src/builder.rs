@@ -2522,21 +2522,135 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.spill128(X0, X1, ty)
     }
 
-    /// A 128-bit shift implemented by a compiler-builtins libcall (`__ashlti3`/`__lshrti3`/
-    /// `__ashrti3`): the value is in `x0:x1`, the count (already masked to `< 128` by the generic
-    /// codegen) in `w2`, and the result returns in `x0:x1`.
-    fn int128_shift(&mut self, sym: &str, lhs: Value, rhs: Value) -> Value {
+    /// Shift a 128-bit integer by a *constant* amount, lowered inline as a few 64-bit word
+    /// operations (no libcall). This is required for `-Zbuild-std`: `compiler_builtins`' own
+    /// `__ashlti3`/`__lshrti3` build wide values with `x << 64`, so routing constant 128-bit shifts
+    /// back through the libcalls would make those routines call themselves and recurse forever.
+    /// `arithmetic` selects an arithmetic right shift (sign fill); ignored for left shifts.
+    fn int128_shift_const(&mut self, lhs: Value, raw_k: u32, left: bool, arithmetic: bool) -> Value {
         let ty = lhs.ty();
-        self.materialize128(lhs, X0, X1);
-        if self.is_int128(rhs.ty()) {
-            // The shift amount arrives as an i128 (extended to the value's type); its low word is
-            // the count.
-            self.materialize128(rhs, X2, X9);
-        } else {
-            self.materialize(rhs, X2);
+        let k = raw_k % 128;
+        if k == 0 {
+            return lhs;
         }
-        self.emit(Inst::Bl { sym: SymRef::new(sym) });
-        self.spill128(X0, X1, ty)
+        // Obtain the low/high 64-bit words as sub-slots (spilling a non-slot operand first).
+        let base = match lhs {
+            Value::Slot { off, .. } => off,
+            _ => {
+                self.materialize128(lhs, X9, X10);
+                let spilled = self.spill128(X9, X10, ty);
+                match spilled {
+                    Value::Slot { off, .. } => off,
+                    _ => unreachable!("spill128 returns a slot"),
+                }
+            }
+        };
+        let u64t = self.cx.intern_type(TypeData::Int(64));
+        let lo = Value::Slot { off: base, ty: u64t };
+        let hi = Value::Slot { off: base + 8, ty: u64t };
+        let c = |n: u64| Value::Const { bits: n as u128, ty: u64t };
+
+        let (lo_new, hi_new) = if left {
+            if k < 64 {
+                let lo_n = self.shl(lo, c(k as u64));
+                let a = self.shl(hi, c(k as u64));
+                let b = self.lshr(lo, c((64 - k) as u64));
+                let hi_n = self.or(a, b);
+                (lo_n, hi_n)
+            } else if k == 64 {
+                (c(0), lo)
+            } else {
+                let hi_n = self.shl(lo, c((k - 64) as u64));
+                (c(0), hi_n)
+            }
+        } else if k < 64 {
+            let a = self.lshr(lo, c(k as u64));
+            let b = self.shl(hi, c((64 - k) as u64));
+            let lo_n = self.or(a, b);
+            let hi_n = if arithmetic { self.ashr(hi, c(k as u64)) } else { self.lshr(hi, c(k as u64)) };
+            (lo_n, hi_n)
+        } else if k == 64 {
+            let hi_n = if arithmetic { self.ashr(hi, c(63)) } else { c(0) };
+            (hi, hi_n)
+        } else {
+            let lo_n = if arithmetic { self.ashr(hi, c((k - 64) as u64)) } else { self.lshr(hi, c((k - 64) as u64)) };
+            let hi_n = if arithmetic { self.ashr(hi, c(63)) } else { c(0) };
+            (lo_n, hi_n)
+        };
+
+        self.materialize(lo_new, X9);
+        self.materialize(hi_new, X10);
+        self.spill128(X9, X10, ty)
+    }
+
+    /// Spill a 128-bit value to a frame slot (if it is not already one) and return the slot offset,
+    /// so its two 64-bit words can be addressed as sub-slots.
+    fn slot128_base(&mut self, val: Value) -> u64 {
+        match val {
+            Value::Slot { off, .. } => off,
+            _ => {
+                self.materialize128(val, X9, X10);
+                match self.spill128(X9, X10, val.ty()) {
+                    Value::Slot { off, .. } => off,
+                    _ => unreachable!("spill128 returns a slot"),
+                }
+            }
+        }
+    }
+
+    /// Shift a 128-bit integer by a *runtime* amount, lowered inline (branchless) rather than through
+    /// a `compiler_builtins` libcall. This is required for `-Zbuild-std`: those libcalls
+    /// (`__ashlti3`/`__lshrti3`/`__ashrti3`) implement themselves with `wrapping_shl`/`wrapping_shr`
+    /// on 128-bit values, so routing 128-bit shifts back to the libcalls makes them recurse forever.
+    /// The classic two-word expansion: split the count into `m = n & 63` and `n & 64` (whether the
+    /// shift crosses the word boundary), shift each word, OR in the bits carried across the boundary
+    /// (computed as `(w >> 1) >> (63 - m)` so a zero `m` does not shift a 64-bit register by 64), and
+    /// `csel` the two-word result on `n >= 64`. `arithmetic` selects sign fill for a right shift.
+    fn int128_shift_var(&mut self, lhs: Value, rhs: Value, left: bool, arithmetic: bool) -> Value {
+        let ty = lhs.ty();
+        let u64t = self.cx.intern_type(TypeData::Int(64));
+        let c = |n: u64| Value::Const { bits: n as u128, ty: u64t };
+
+        // The shift amount's low 64 bits.
+        let n = if self.is_int128(rhs.ty()) {
+            let off = self.slot128_base(rhs);
+            Value::Slot { off, ty: u64t }
+        } else {
+            self.intcast(rhs, u64t, false)
+        };
+        let base = self.slot128_base(lhs);
+        let lo = Value::Slot { off: base, ty: u64t };
+        let hi = Value::Slot { off: base + 8, ty: u64t };
+
+        let m = self.and(n, c(63));
+        let cross = self.and(n, c(64));
+        let nge = self.icmp(IntPredicate::IntNE, cross, c(0));
+        let inv = self.sub(c(63), m); // 63 - m
+
+        let (lo_out, hi_out) = if left {
+            let lo_m = self.shl(lo, m);
+            let hi_m = self.shl(hi, m);
+            let lo1 = self.lshr(lo, c(1));
+            let carry = self.lshr(lo1, inv); // (lo >> 1) >> (63 - m) == lo >> (64 - m)
+            let hi_lt = self.or(hi_m, carry);
+            let lo_out = self.select(nge, c(0), lo_m);
+            let hi_out = self.select(nge, lo_m, hi_lt);
+            (lo_out, hi_out)
+        } else {
+            let lo_m = self.lshr(lo, m);
+            let hi_sm = if arithmetic { self.ashr(hi, m) } else { self.lshr(hi, m) };
+            let hi1 = self.shl(hi, c(1));
+            let borrow = self.shl(hi1, inv); // (hi << 1) << (63 - m) == hi << (64 - m)
+            let lo_lt = self.or(lo_m, borrow);
+            let sign_or_zero = if arithmetic { self.ashr(hi, c(63)) } else { c(0) };
+            let lo_out = self.select(nge, hi_sm, lo_lt);
+            let hi_out = self.select(nge, sign_or_zero, hi_sm);
+            (lo_out, hi_out)
+        };
+
+        self.materialize(lo_out, X9);
+        self.materialize(hi_out, X10);
+        self.spill128(X9, X10, ty)
     }
 
     /// Lower the `rotate_left`/`rotate_right` intrinsics as `(x << k) | (x >>u (W - k))`. The shift
@@ -4422,7 +4536,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
     fn shl(&mut self, lhs: Value, rhs: Value) -> Value {
         if self.is_int128(lhs.ty()) {
-            return self.int128_shift("___ashlti3", lhs, rhs);
+            if let Value::Const { bits, .. } = rhs {
+                return self.int128_shift_const(lhs, (bits % 128) as u32, true, false);
+            }
+            return self.int128_shift_var(lhs, rhs, true, false);
         }
         self.alu_rrr(
             |size, rd, rn, rm| Inst::DataProc2 { op: DataProc2::Lslv, size, rd, rn, rm },
@@ -4432,7 +4549,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
     fn lshr(&mut self, lhs: Value, rhs: Value) -> Value {
         if self.is_int128(lhs.ty()) {
-            return self.int128_shift("___lshrti3", lhs, rhs);
+            if let Value::Const { bits, .. } = rhs {
+                return self.int128_shift_const(lhs, (bits % 128) as u32, false, false);
+            }
+            return self.int128_shift_var(lhs, rhs, false, false);
         }
         self.alu_rrr(
             |size, rd, rn, rm| Inst::DataProc2 { op: DataProc2::Lsrv, size, rd, rn, rm },
@@ -4442,7 +4562,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
     fn ashr(&mut self, lhs: Value, rhs: Value) -> Value {
         if self.is_int128(lhs.ty()) {
-            return self.int128_shift("___ashrti3", lhs, rhs);
+            if let Value::Const { bits, .. } = rhs {
+                return self.int128_shift_const(lhs, (bits % 128) as u32, false, true);
+            }
+            return self.int128_shift_var(lhs, rhs, false, true);
         }
         // The shifted value must be sign-extended so the vacated high bits carry its sign; the
         // shift amount is a plain count and is loaded zero-extended.
