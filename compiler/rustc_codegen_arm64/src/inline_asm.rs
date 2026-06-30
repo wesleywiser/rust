@@ -293,14 +293,11 @@ impl Generator<'_, '_> {
             restore_register(&mut out, reg, slot);
         }
 
-        // Enable any non-baseline target features so their instructions assemble.
-        for feature in &self.tcx.codegen_fn_attrs(self.enclosing_def_id).target_features {
-            if feature.name != sym::neon {
-                let _ = writeln!(out, ".arch_extension {}", feature.name);
-            }
-        }
-
-        // The user's template, with placeholders substituted.
+        // The user's template, with placeholders substituted. (We rely on the platform assembler's
+        // default macOS/AArch64 architecture level, which already accepts the crypto, CRC, dot-product,
+        // and system-register instructions that target-feature-gated asm tends to use; emitting
+        // `.arch_extension <feature>` here is both unnecessary and wrong for feature names the
+        // assembler does not recognise as extensions, e.g. `dit`.)
         for piece in self.template {
             match piece {
                 InlineAsmTemplatePiece::String(s) => out.push_str(s),
@@ -319,12 +316,6 @@ impl Generator<'_, '_> {
             }
         }
         out.push('\n');
-
-        for feature in &self.tcx.codegen_fn_attrs(self.enclosing_def_id).target_features {
-            if feature.name != sym::neon {
-                let _ = writeln!(out, ".arch_extension no{}", feature.name);
-            }
-        }
 
         if !self.options.contains(InlineAsmOptions::NORETURN) {
             for (reg, slot) in self.iter_slots(&self.slots_output) {
