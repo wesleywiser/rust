@@ -4006,6 +4006,29 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                     self.emit(Inst::CryptoThree { op: CryptoThreeOp::Sha256su1, rd: V16, rn: V17, rm: V18 });
                     return self.store_q(V16, ret);
                 }
+                // SHA-512 hash update (FEAT_SHA512): (Qd, Qn, Vm) all v2i64.
+                "sha512h" | "sha512h2" => {
+                    let cop =
+                        if op == "sha512h" { CryptoThreeOp::Sha512h } else { CryptoThreeOp::Sha512h2 };
+                    self.load_q(args[0].immediate(), V16);
+                    self.load_q(args[1].immediate(), V17);
+                    self.load_q(args[2].immediate(), V18);
+                    self.emit(Inst::CryptoThree { op: cop, rd: V16, rn: V17, rm: V18 });
+                    return self.store_q(V16, ret);
+                }
+                "sha512su0" => {
+                    self.load_q(args[0].immediate(), V16);
+                    self.load_q(args[1].immediate(), V17);
+                    self.emit(Inst::CryptoTwo { op: CryptoTwoOp::Sha512su0, rd: V16, rn: V17 });
+                    return self.store_q(V16, ret);
+                }
+                "sha512su1" => {
+                    self.load_q(args[0].immediate(), V16);
+                    self.load_q(args[1].immediate(), V17);
+                    self.load_q(args[2].immediate(), V18);
+                    self.emit(Inst::CryptoThree { op: CryptoThreeOp::Sha512su1, rd: V16, rn: V17, rm: V18 });
+                    return self.store_q(V16, ret);
+                }
                 // SHA-1: c/p/m take (abcd: v4i32, e: i32 scalar in an `s` reg, wk: v4i32).
                 "sha1c" | "sha1p" | "sha1m" => {
                     let cop = match op {

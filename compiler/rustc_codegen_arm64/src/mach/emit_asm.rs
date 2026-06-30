@@ -489,6 +489,7 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
                 CryptoTwoOp::Sha256su0 => format!("sha256su0 v{d}.4s, v{n}.4s"),
                 CryptoTwoOp::Sha1h => format!("sha1h s{d}, s{n}"),
                 CryptoTwoOp::Sha1su1 => format!("sha1su1 v{d}.4s, v{n}.4s"),
+                CryptoTwoOp::Sha512su0 => format!("sha512su0 v{d}.2d, v{n}.2d"),
             };
             line(out, &text);
         }
@@ -502,6 +503,9 @@ fn fmt_inst(out: &mut String, inst: &Inst, fidx: usize) {
                 CryptoThreeOp::Sha1p => format!("sha1p q{d}, s{n}, v{m}.4s"),
                 CryptoThreeOp::Sha1m => format!("sha1m q{d}, s{n}, v{m}.4s"),
                 CryptoThreeOp::Sha1su0 => format!("sha1su0 v{d}.4s, v{n}.4s, v{m}.4s"),
+                CryptoThreeOp::Sha512h => format!("sha512h q{d}, q{n}, v{m}.2d"),
+                CryptoThreeOp::Sha512h2 => format!("sha512h2 q{d}, q{n}, v{m}.2d"),
+                CryptoThreeOp::Sha512su1 => format!("sha512su1 v{d}.2d, v{n}.2d, v{m}.2d"),
             };
             line(out, &text);
         }

@@ -393,6 +393,7 @@ pub enum CryptoTwoOp {
     Sha256su0,
     Sha1h,
     Sha1su1,
+    Sha512su0,
 }
 
 /// Three-register ARMv8 crypto-extension opcode (`rd`/`rn`/`rm`).
@@ -405,6 +406,9 @@ pub enum CryptoThreeOp {
     Sha1p,
     Sha1m,
     Sha1su0,
+    Sha512h,
+    Sha512h2,
+    Sha512su1,
 }
 
 /// NEON "3-same" three-register vector opcode (see [`Inst::SimdThree`]).
@@ -864,6 +868,7 @@ impl Inst {
                     CryptoTwoOp::Sha256su0 => 0x5E28_2800,
                     CryptoTwoOp::Sha1h => 0x5E28_0800,
                     CryptoTwoOp::Sha1su1 => 0x5E28_1800,
+                    CryptoTwoOp::Sha512su0 => 0xCEC0_8000,
                 };
                 base | (rn.encoding() << 5) | rd.encoding()
             }
@@ -876,6 +881,9 @@ impl Inst {
                     CryptoThreeOp::Sha1p => 0x5E00_1000,
                     CryptoThreeOp::Sha1m => 0x5E00_2000,
                     CryptoThreeOp::Sha1su0 => 0x5E00_3000,
+                    CryptoThreeOp::Sha512h => 0xCE60_8000,
+                    CryptoThreeOp::Sha512h2 => 0xCE60_8400,
+                    CryptoThreeOp::Sha512su1 => 0xCE60_8800,
                 };
                 base | (rm.encoding() << 16) | (rn.encoding() << 5) | rd.encoding()
             }
@@ -1428,6 +1436,11 @@ mod tests {
         assert_eq!(Inst::CryptoTwo { op: CryptoTwoOp::Sha1h, rd: V0, rn: V1 }.encode(), 0x5E280820);
         assert_eq!(Inst::CryptoThree { op: CryptoThreeOp::Sha1su0, rd: V0, rn: V1, rm: V2 }.encode(), 0x5E023020);
         assert_eq!(Inst::CryptoTwo { op: CryptoTwoOp::Sha1su1, rd: V0, rn: V1 }.encode(), 0x5E281820);
+        // SHA-512 (`sha512h`/`sha512h2 q0, q1, v2.2d`; `sha512su0 v0.2d, v1.2d`; `sha512su1 ...`).
+        assert_eq!(Inst::CryptoThree { op: CryptoThreeOp::Sha512h, rd: V0, rn: V1, rm: V2 }.encode(), 0xCE628020);
+        assert_eq!(Inst::CryptoThree { op: CryptoThreeOp::Sha512h2, rd: V0, rn: V1, rm: V2 }.encode(), 0xCE628420);
+        assert_eq!(Inst::CryptoTwo { op: CryptoTwoOp::Sha512su0, rd: V0, rn: V1 }.encode(), 0xCEC08020);
+        assert_eq!(Inst::CryptoThree { op: CryptoThreeOp::Sha512su1, rd: V0, rn: V1, rm: V2 }.encode(), 0xCE628820);
     }
 
     #[test]
