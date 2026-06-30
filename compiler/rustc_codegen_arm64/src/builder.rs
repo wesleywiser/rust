@@ -1928,7 +1928,16 @@ fn build_param_list<'tcx>(cx: &CodegenCx<'tcx>, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) 
                 push_scalar_param(cx, &mut params, &mut a, x);
                 push_scalar_param(cx, &mut params, &mut a, y);
             }
-            PassMode::Indirect { .. } => push_scalar_param(cx, &mut params, &mut a, ptr),
+            PassMode::Indirect { meta_attrs, .. } => {
+                // A sized indirect argument is a single (data) pointer. An *unsized* indirect
+                // argument is a wide pointer — the data pointer plus its metadata (slice length or
+                // vtable pointer) — and occupies two consecutive parameters, matching how the SSA
+                // driver reads it back (`get_param(i)`, `get_param(i + 1)`).
+                push_scalar_param(cx, &mut params, &mut a, ptr);
+                if meta_attrs.is_some() {
+                    push_scalar_param(cx, &mut params, &mut a, ptr);
+                }
+            }
             PassMode::Cast { ref cast, .. } => push_cast_param(cx, &mut params, &mut a, cast),
         }
     }
