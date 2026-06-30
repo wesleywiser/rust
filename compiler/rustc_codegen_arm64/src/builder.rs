@@ -2222,6 +2222,45 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.spill128(X9, X10, ty)
     }
 
+    /// `f128` `copysign(x, y)`: x's magnitude with y's sign. Both the sign bit and the magnitude
+    /// live in/around the high word, so combine `x_hi & ~signbit` with `y_hi & signbit`; there is no
+    /// `f128` libm `copysign` on macOS, so this is done inline on the GPR words.
+    fn f128_copysign(&mut self, x: Value, y: Value) -> Value {
+        let ty = x.ty();
+        self.materialize128(x, X9, X10); // X9 = x lo, X10 = x hi
+        self.materialize128(y, X12, X13); // X13 = y hi (X12 lo unused)
+        // Clear x's sign bit (high word & 0x7FFF...).
+        self.load_imm(X11_HACK, 0x7FFF_FFFF_FFFF_FFFF, OperandSize::S64);
+        self.emit(Inst::Logical {
+            op: LogicOp::And,
+            size: OperandSize::S64,
+            rd: X10,
+            rn: X10,
+            rm: X11_HACK,
+            amount: 0,
+        });
+        // Isolate y's sign bit (high word & 0x8000...).
+        self.load_imm(X11_HACK, 0x8000_0000_0000_0000, OperandSize::S64);
+        self.emit(Inst::Logical {
+            op: LogicOp::And,
+            size: OperandSize::S64,
+            rd: X13,
+            rn: X13,
+            rm: X11_HACK,
+            amount: 0,
+        });
+        // Combine: x_hi |= y_sign.
+        self.emit(Inst::Logical {
+            op: LogicOp::Orr,
+            size: OperandSize::S64,
+            rd: X10,
+            rn: X10,
+            rm: X13,
+            amount: 0,
+        });
+        self.spill128(X9, X10, ty)
+    }
+
     /// Load a 16-byte `f128` value into the `q` register `qreg`.
     fn materialize_q(&mut self, val: Value, qreg: Vreg) {
         match val {
@@ -3408,6 +3447,11 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             }
             sym::copysignf16 | sym::copysignf32 | sym::copysignf64 => {
                 let r = self.fp_libm_binary("copysign", args[0].immediate(), args[1].immediate());
+                IntrinsicResult::Operand(OperandValue::Immediate(r))
+            }
+            sym::copysignf128 => {
+                // No `f128` libm on macOS; combine the sign/magnitude on the GPR words inline.
+                let r = self.f128_copysign(args[0].immediate(), args[1].immediate());
                 IntrinsicResult::Operand(OperandValue::Immediate(r))
             }
             // Integer power -> the compiler-builtins routine `__powidf2`/`__powisf2`.
@@ -4766,9 +4810,11 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             return Value::Undef { ty: self.ptr_ty() };
         }
         if self.is_f128(val.ty()) {
-            // `f128` is a 16-byte value; store it through a `q` register.
-            self.materialize(ptr, X9);
+            // `f128` is a 16-byte value stored through a `q` register. Materialize the value first:
+            // for a constant/undef/symbol operand `materialize_q` uses x9 as scratch, so the pointer
+            // must be loaded into x9 *after* it, or the store address would be clobbered.
             self.materialize_q(val, V0);
+            self.materialize(ptr, X9);
             self.emit(Inst::LoadStoreQ { load: false, rt: V0, rn: X9, offset: 0 });
             return Value::Undef { ty: self.ptr_ty() };
         }
