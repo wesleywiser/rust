@@ -118,6 +118,29 @@
 //!   in `__thread_vars`, and a read loads the descriptor address (`TLVP_LOAD_PAGE21`/`PAGEOFF12`
 //!   relocations) and calls the thunk in its first word to get the per-thread address. This is what
 //!   unblocks `HashMap`/`HashSet`, whose `RandomState` seed is a thread-local.
+//!
+//! # Not yet supported (fails loudly)
+//!
+//! Running the compiler's own `tests/ui` suite through this backend exercises the breadth of the
+//! language and confirms the guiding principle above: the constructs that are not handled raise a
+//! clear error (an ICE via `todo!`/`unreachable!`) rather than miscompiling — never a wrong runtime
+//! result. The notable remaining gaps are:
+//!
+//! - **Link-time optimization (`-Clto`)** is intentionally out of scope — `thin_lto_supported` is
+//!   `false` and the fat-LTO entry points are `unreachable!`. Each codegen unit is compiled
+//!   independently, with no cross-module optimization, which is consistent with the compile-speed
+//!   goal.
+//! - **Explicit tail calls** (the `become` keyword, `tail_call`) are unimplemented.
+//! - **Defining a C-variadic function** (`va_start`/`va_arg`) is unimplemented. *Calling* variadic
+//!   functions such as `snprintf` is supported — every variadic argument is passed on the stack per
+//!   the Apple AArch64 ABI — but a Rust function that itself *receives* a `...` argument list is not.
+//! - **A handful of exotic `llvm.*` intrinsics** with no direct AArch64 lowering, falling outside the
+//!   `simd_*` and `llvm.aarch64.*` families already handled above.
+//! - The floating-point `min`/`max`/bitwise **SIMD reductions** and **debug info for local
+//!   variables**, both noted in their sections above.
+//!
+//! Everything else the suite reaches either compiles correctly or differs only in a *diagnostic* (an
+//! error message or a backtrace's formatting), not in generated code.
 
 // tidy-alphabetical-start
 #![feature(rustc_private)]
