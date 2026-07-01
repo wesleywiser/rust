@@ -11,19 +11,19 @@
 // CHECK-LABEL: _max:
 // CHECK: cmp x9, x10
 // CHECK-NEXT: csinc w9, wzr, wzr, ls
-// CHECK-NEXT: strb w9, [sp, #32]
-// CHECK-NEXT: ldrb w9, [sp, #32]
+// CHECK-NEXT: strb w9, [sp, #24]
+// CHECK-NEXT: ldrb w9, [sp, #24]
 // CHECK-NEXT: cbnz w9, LBB[[FN:[0-9]+]]_2
 // CHECK-NEXT: b LBB[[FN]]_1
 // The `else` arm returns `b` (spilled at offset 8).
 // CHECK: LBB[[FN]]_1:
-// CHECK-NEXT: ldr x9, [sp, #24]
+// CHECK-NEXT: add x9, sp, #16
 // CHECK-NEXT: ldr x10, [sp, #8]
 // CHECK-NEXT: str x10, [x9, #0]
 // CHECK-NEXT: b LBB[[FN]]_3
 // The `then` arm returns `a` (spilled at offset 0).
 // CHECK: LBB[[FN]]_2:
-// CHECK-NEXT: ldr x9, [sp, #24]
+// CHECK-NEXT: add x9, sp, #16
 // CHECK-NEXT: ldr x10, [sp, #0]
 // CHECK-NEXT: str x10, [x9, #0]
 // CHECK-NEXT: b LBB[[FN]]_3

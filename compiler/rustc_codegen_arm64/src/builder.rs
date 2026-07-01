@@ -2100,6 +2100,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             Value::Slot { off, ty } => {
                 self.emit_mem_gpr(true, false, mem_size(self.cx, ty), reg, SP, off);
             }
+            Value::FrameAddr { off, ty: _ } => self.emit_frame_addr(reg, off),
             Value::Sym { sym, offset, ty: _ } => {
                 let symref = SymRef { name: self.cx.sym_name(sym), addend: offset };
                 if self.cx.got_syms.borrow().contains(&sym) {
@@ -2191,6 +2192,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
             Value::Sym { .. } => {
                 panic!("rustc_codegen_arm64: a symbol address cannot be a 128-bit integer value")
+            }
+            Value::FrameAddr { .. } => {
+                panic!("rustc_codegen_arm64: a frame address cannot be a 128-bit integer value")
             }
         }
     }
@@ -2308,6 +2312,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 self.emit_mem_gpr(false, false, MemSize::X, ZR, SP, off);
                 self.emit_mem_gpr(false, false, MemSize::X, ZR, SP, off + 8);
                 self.emit_q(true, qreg, off);
+            }
+            Value::FrameAddr { .. } => {
+                panic!("rustc_codegen_arm64: a frame address cannot be an f128 value")
             }
         }
     }
@@ -3025,6 +3032,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             Value::Sym { .. } => {
                 // A symbol address is never a floating-point value; treat as zero defensively.
                 self.emit(Inst::FmovFromGpr { size, rd: vreg, rn: ZR });
+            }
+            Value::FrameAddr { off, .. } => {
+                // A pointer transmuted to a float: move the actual frame-address bits across.
+                self.emit_frame_addr(X9, off);
+                self.emit(Inst::FmovFromGpr { size, rd: vreg, rn: X9 });
             }
         }
     }
@@ -4334,6 +4346,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         match val {
             Value::Const { bits, .. } => Value::Const { bits, ty: dest_ty },
             Value::Slot { off, .. } => Value::Slot { off, ty: dest_ty },
+            Value::FrameAddr { off, .. } => Value::FrameAddr { off, ty: dest_ty },
             Value::Sym { sym, offset, .. } => Value::Sym { sym, offset, ty: dest_ty },
             Value::Undef { .. } => Value::Undef { ty: dest_ty },
         }
@@ -4871,9 +4884,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
 
     fn alloca(&mut self, size: Size, align: Align) -> Value {
         let off = self.alloc_slot(size.bytes(), align.bytes());
-        self.emit_frame_addr(X9, off);
-        let ptr_ty = self.ptr_ty();
-        self.spill(X9, ptr_ty)
+        // Return a rematerializable frame address rather than spilling `sp + off` to a slot: the
+        // pointer must stay usable from blocks that do not run the `alloca` (cleanup landing pads
+        // reuse one personality slot but each is entered directly by the unwinder).
+        Value::FrameAddr { off, ty: self.ptr_ty() }
     }
     fn alloca_with_ty(&mut self, layout: TyAndLayout<'tcx>) -> Value {
         self.alloca(layout.size, layout.align.abi)

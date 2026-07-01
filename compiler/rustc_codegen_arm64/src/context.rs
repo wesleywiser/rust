@@ -52,6 +52,11 @@ pub enum Value {
     /// offset. This is how the baseline keeps every non-constant SSA value live. The offset is a
     /// `u64` because frames are not bounded to 4 GiB.
     Slot { off: u64, ty: Type },
+    /// The address of a stack slot (`sp + off`), produced by `alloca`. Unlike a spilled pointer this
+    /// is rematerialized (`add rd, sp, #off`) on every use, like `Const`/`Sym`, so it stays valid in
+    /// blocks that are not dominated by the `alloca` — e.g. the several cleanup landing pads that
+    /// share one personality slot, each an independent entry point from the unwinder.
+    FrameAddr { off: u64, ty: Type },
     /// An undefined/poison value of the given type.
     Undef { ty: Type },
 }
@@ -63,6 +68,7 @@ impl Value {
             Value::Const { ty, .. }
             | Value::Sym { ty, .. }
             | Value::Slot { ty, .. }
+            | Value::FrameAddr { ty, .. }
             | Value::Undef { ty } => ty,
         }
     }

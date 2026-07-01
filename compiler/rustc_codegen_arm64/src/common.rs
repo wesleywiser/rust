@@ -132,8 +132,8 @@ impl<'tcx> ConstCodegenMethods for CodegenCx<'tcx> {
                     });
                     bytes.extend_from_slice(&(offset as u64).to_le_bytes()[..es as usize]);
                 }
-                // Undef/poison and (invalid here) runtime slots contribute zeroed bytes.
-                Value::Undef { .. } | Value::Slot { .. } => {
+                // Undef/poison and (invalid here) runtime slot/frame addresses contribute zeroed bytes.
+                Value::Undef { .. } | Value::Slot { .. } | Value::FrameAddr { .. } => {
                     bytes.resize(bytes.len() + es as usize, 0);
                 }
             }
