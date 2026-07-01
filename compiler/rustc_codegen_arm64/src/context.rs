@@ -414,9 +414,10 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn get_fn_addr(&self, instance: Instance<'tcx>) -> Value {
         let func = self.get_fn(instance);
         let sym = self.function_sym(func);
-        // Taking the address of a dylib-imported (foreign) function needs the GOT, same as a
-        // foreign static: a direct adrp+add cannot be fixed up (`_utimes` does not have address).
-        if self.tcx.is_foreign_item(instance.def_id()) {
+        // Taking the address of a function defined in another crate needs the GOT when that crate is
+        // linked dynamically, the same as a cross-crate static; a direct adrp+add against an
+        // undefined symbol cannot be fixed up. A dylib-imported foreign function always needs it.
+        if !instance.def_id().is_local() || self.tcx.is_foreign_item(instance.def_id()) {
             self.got_syms.borrow_mut().insert(sym);
         }
         Value::Sym { sym, offset: 0, ty: self.intern_type(TypeData::Ptr) }

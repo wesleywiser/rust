@@ -33,9 +33,11 @@ impl<'tcx> CodegenCx<'tcx> {
         let name = self.mangle(self.tcx.symbol_name(instance).name);
         let sym = self.intern_sym(&name);
         self.statics.borrow_mut().insert(def_id, sym);
-        // A dylib-imported (foreign) static has no in-image address; record it so references load
-        // the address from the GOT instead of forming an unresolvable adrp+add.
-        if self.tcx.is_foreign_item(def_id) {
+        // A static defined in another crate has no in-image address when that crate is linked
+        // dynamically (`-Cprefer-dynamic`, as compiletest uses), and a dylib-imported foreign static
+        // never does; record it so references load the address from the GOT instead of forming an
+        // unresolvable adrp+add against an undefined symbol.
+        if !def_id.is_local() || self.tcx.is_foreign_item(def_id) {
             self.got_syms.borrow_mut().insert(sym);
         }
         sym
