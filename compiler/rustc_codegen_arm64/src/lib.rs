@@ -9,9 +9,7 @@
 //!
 //! Most of the backend is implemented; the bullets below record the areas with non-obvious lowerings
 //! or remaining gaps. Genuinely unimplemented operations fail loudly (an ICE via `todo!`) rather than
-//! miscompiling, so they surface as clear errors instead of wrong runtime results. The one exception
-//! is unwinding — running destructors during a panic — which currently does less than it should
-//! without erroring (see below).
+//! miscompiling, so they surface as clear errors instead of wrong runtime results.
 //!
 //! - **SIMD / vector types.** Vector values live in frame slots. Native-width vectors (exactly 8 or
 //!   16 bytes) use real NEON instructions for the common arithmetic, bitwise, comparison, and unary
