@@ -76,16 +76,17 @@
 //!   lldb's `frame variable` shows nothing — emitting `DW_OP_fbreg` locations (values live at known
 //!   frame-slot offsets) plus base/aggregate type DIEs is the remaining work.
 //!
-//! - **Unwinding is partial: panics propagate, but destructors do not run while unwinding.** With
-//!   `-Cpanic=abort` everything is clean. Under the default `-Cpanic=unwind` a panic still unwinds
-//!   and exits cleanly (libunwind walks the `fp`/`lr` frames via macOS compact unwind), but the
-//!   backend does not emit a working `__eh_frame` personality entry, so cleanup landing pads never
-//!   fire: a value whose `Drop` would run only on the unwinding path is leaked, and `catch_unwind`
-//!   cannot catch. The CIE/FDE bytes are written byte-for-byte like LLVM but are gated off behind a
-//!   single tooling blocker — the `object` crate (0.39.1) cannot emit the GOT-indirect personality
-//!   relocation (`ARM64_RELOC_POINTER_TO_GOT`, pc-relative) that ld64 requires (see
-//!   `mach::emit_obj`). This is the one area that silently does less than it should rather than
-//!   failing loudly.
+//! - **Unwinding (`-Cpanic=unwind`) works: destructors run while unwinding and `catch_unwind`
+//!   catches.** Every function that can clean up or catch emits a macOS DWARF-mode `__compact_unwind`
+//!   entry pointing at an `__eh_frame` FDE (a `zPLR` CIE naming `rust_eh_personality`) plus a
+//!   `__gcc_except_tab` LSDA; other functions get a cheap fp-frame `__compact_unwind` entry. The LSDA
+//!   call-site table covers the whole function — the gaps between invokes are filled with
+//!   no-landing-pad regions so a cleanup pad can resume unwinding without the personality treating the
+//!   resume PC as a `nounwind` region — and `catch_unwind` is lowered as an invoke with a catch-all
+//!   landing pad that runs the catch closure. The CIE personality is a GOT-indirect
+//!   `ARM64_RELOC_POINTER_TO_GOT` (pc-relative) relocation, which the released `object` 0.39.1 cannot
+//!   emit; the backend currently depends on a patched `object` for it (see `mach::emit_obj`).
+//!   Differential-tested against the LLVM backend (destructor order, nested and deep `catch_unwind`).
 //!
 //! Implemented since the first cut, for reference:
 //!

@@ -3508,19 +3508,47 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                     IntrinsicResult::WroteIntoPlace
                 }
             }
-            // `catch_unwind(try, data, catch)`: this backend aborts on panic (it emits no unwind
-            // tables), so the catch path is never reached. Run the try function and report that no
-            // panic was caught (return 0) — exactly the panic=abort lowering.
+            // `catch_unwind(try, data, catch) -> i32`: run `try(data)`; if it unwinds, catch the
+            // panic and run `catch(data, exception)`, yielding 1 (caught) instead of 0 (ran cleanly).
+            // Modelled on LLVM's `codegen_gnu_try`, but inlined into the current function: the call to
+            // `try` is an invoke whose catch-all landing pad receives the exception pointer.
             sym::catch_unwind => {
-                // Pure FRAME-mode unwind tables can't run a personality, so the catch path is never
-                // reached: run try(data) and report no catch (return 0), matching panic=abort.
                 let try_func = args[0].immediate();
                 let data = args[1].immediate();
+                let catch_func = args[2].immediate();
                 let i32t = self.cx.intern_type(TypeData::Int(32));
-                self.emit_call_core(None, None, try_func, &[data]);
+                let ptr_ty = self.ptr_ty();
                 let res = self.alloc_slot(4, 4);
+
+                let then_bb = self.append_sibling_block("catch_unwind.then");
+                let catch_bb = self.append_sibling_block("catch_unwind.catch");
+                let cont_bb = self.append_sibling_block("catch_unwind.cont");
+
+                // invoke try(data): a catch call site (action 1) sends any unwind to `catch_bb`.
+                let begin = self.fresh_cs_label();
+                let end = self.fresh_cs_label();
+                self.emit(Inst::Label(begin));
+                self.emit_call_core(None, None, try_func, &[data]);
+                self.emit(Inst::Label(end));
+                self.record_call_site(begin, end, catch_bb.0, 1);
+                self.br(then_bb);
+
+                // Normal return: nothing was caught.
+                self.switch_to_block(then_bb);
                 self.load_imm(X9, 0, OperandSize::S32);
                 self.emit_mem_gpr(false, false, MemSize::W, X9, SP, res);
+                self.br(cont_bb);
+
+                // Caught a panic: the personality enters here with the exception pointer in x0. Hand
+                // it to `catch(data, exception)` (which consumes/frees it) and report a catch.
+                self.switch_to_block(catch_bb);
+                let exn = self.spill(X0, ptr_ty);
+                self.emit_call_core(None, None, catch_func, &[data, exn]);
+                self.load_imm(X9, 1, OperandSize::S32);
+                self.emit_mem_gpr(false, false, MemSize::W, X9, SP, res);
+                self.br(cont_bb);
+
+                self.switch_to_block(cont_bb);
                 IntrinsicResult::Operand(OperandValue::Immediate(Value::Slot { off: res, ty: i32t }))
             }
             // Saturating add/sub, clamped to the integer type's range.
