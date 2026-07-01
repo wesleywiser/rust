@@ -63,16 +63,32 @@
 //!   `sha256su1`) are lowered to the real instructions, moving the 128-bit operands between frame
 //!   slots and `v` registers via `q` loads/stores. Differential-tested against the LLVM backend.
 //!
-//! - **Debug info: line tables and (inlined) function frames, but not locals.** Under `-g` the
+//! - **Debug info: line tables, (inlined) function frames, and local variables.** Under `-g` the
 //!   backend emits DWARF — a `__DWARF` section set built with `gimli`: a compilation-unit DIE, a
 //!   `DW_TAG_subprogram` per function (name, linkage name, decl file/line, `low_pc`/`high_pc`, an
 //!   `x29` frame base), a line-number program mapping each instruction to its file/line/column, and
 //!   `DW_TAG_inlined_subroutine` trees that reconstruct the inline-call chain (so optimized
-//!   backtraces expand each inlined frame with its own name and call-site line). lldb gets accurate
-//!   backtraces and column-precise line breakpoints, and `llvm-dwarfdump --verify` is clean. Still
-//!   missing: local variable / parameter locations (`create_dbg_var` is a no-op) and type DIEs, so
-//!   lldb's `frame variable` shows nothing — emitting `DW_OP_fbreg` locations (values live at known
-//!   frame-slot offsets) plus base/aggregate type DIEs is the remaining work.
+//!   backtraces expand each inlined frame with its own name and call-site line). Locals and
+//!   parameters get `DW_TAG_variable` / `DW_TAG_formal_parameter` DIEs with a `DW_AT_type` and a
+//!   `DW_OP_fbreg` frame-relative location — a slot at `sp + off` sits at `off - frame_size` from the
+//!   `x29` frame base, and the driver's direct/indirect projection becomes `DW_OP_plus_uconst` /
+//!   `DW_OP_deref` — so lldb's `frame variable` shows correct argument and local values (including
+//!   through references and closure captures-by-reference). Locations are omitted for a realigned
+//!   frame (where the slot-to-`fp` distance is not static) and for the variables of an inlined callee
+//!   (whose abstract subprogram must not be given a concrete outer-frame location). Types so far are
+//!   the scalar base types (the `DW_ATE_*` encodings match the LLVM backend) and thin pointers /
+//!   references; aggregates (structs, enums, arrays, tuples, wide pointers) get a correctly-sized
+//!   opaque placeholder, and `dbg_var_value` (direct-value debug info) is not described yet. lldb
+//!   gets accurate backtraces and column-precise line breakpoints, and `llvm-dwarfdump --verify` is
+//!   clean.
+//!
+//! - **Deterministic emission (reproducible + incremental builds).** Object emission is
+//!   byte-for-byte deterministic — symbol, section, and relocation order is driven by the
+//!   codegen-order `Vec`s, hashed maps are used only for lookup, and nothing embeds a timestamp — so
+//!   identical inputs produce identical objects. Incremental compilation (`-Cincremental`) therefore
+//!   works through the standard `rustc_codegen_ssa` driver with no backend-specific machinery: each
+//!   codegen unit's object is cached and reused (hard-linked) when its dependencies are unchanged,
+//!   and only the codegen units affected by an edit are re-emitted.
 //!
 //! - **Unwinding (`-Cpanic=unwind`) works: destructors run while unwinding and `catch_unwind`
 //!   catches.** Every function that can clean up or catch emits a macOS DWARF-mode `__compact_unwind`
