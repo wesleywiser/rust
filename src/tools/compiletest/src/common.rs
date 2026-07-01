@@ -223,6 +223,7 @@ pub(crate) enum Sanitizer {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum CodegenBackend {
+    Arm64,
     Cranelift,
     Gcc,
     Llvm,
@@ -233,6 +234,7 @@ impl<'a> TryFrom<&'a str> for CodegenBackend {
 
     fn try_from(value: &'a str) -> Result<Self, Self::Error> {
         match value.to_lowercase().as_str() {
+            "arm64" => Ok(Self::Arm64),
             "cranelift" => Ok(Self::Cranelift),
             "gcc" => Ok(Self::Gcc),
             "llvm" => Ok(Self::Llvm),
@@ -244,6 +246,7 @@ impl<'a> TryFrom<&'a str> for CodegenBackend {
 impl CodegenBackend {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::Arm64 => "arm64",
             Self::Cranelift => "cranelift",
             Self::Gcc => "gcc",
             Self::Llvm => "llvm",

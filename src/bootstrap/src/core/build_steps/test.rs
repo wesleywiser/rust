@@ -2445,6 +2445,15 @@ HELP: You can add it into `bootstrap.toml` in `rust.codegen-backends = [{name:?}
                 crate::exit!(1);
             }
 
+            // Custom in-tree backends (currently only `arm64`) are not installed into the sysroot by
+            // `Assemble`, so install the selected one now — the same way the `assembly-arm64` step
+            // does — so compiletest can load it by name via `-Zcodegen-backend`.
+            if codegen_backend.name() == "arm64" {
+                let compilers = RustcPrivateCompilers::new(builder, test_compiler.stage, target);
+                let stamp = builder.ensure(compile::Arm64CodegenBackend { compilers });
+                compile::copy_codegen_backends_to_sysroot(builder, stamp, test_compiler);
+            }
+
             if let CodegenBackendKind::Gcc = codegen_backend
                 && builder.config.rustc_debug_assertions
             {
