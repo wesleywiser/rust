@@ -2470,6 +2470,14 @@ Please disable assertions with `rust.debug-assertions = false`.
             // Tells compiletest which codegen backend to use.
             // It is used to e.g. ignore tests that don't support that codegen backend.
             cmd.arg("--default-codegen-backend").arg(codegen_backend.name());
+        } else if self.suite == "assembly-arm64" {
+            // The `assembly-arm64` suite is inherently tied to the in-tree `arm64` backend, which
+            // the `AssemblyArm64` step has already built and installed into the test sysroot. Select
+            // it explicitly (the same way `--test-codegen-backend arm64` would) so the tests compile
+            // with it and the upstream `assembly-<backend>` directory filter — which only runs a
+            // suite when it matches the default backend — does not skip the whole suite.
+            cmd.arg("--override-codegen-backend").arg("arm64");
+            cmd.arg("--default-codegen-backend").arg("arm64");
         } else {
             // Tells compiletest which codegen backend to use.
             // It is used to e.g. ignore tests that don't support that codegen backend.
