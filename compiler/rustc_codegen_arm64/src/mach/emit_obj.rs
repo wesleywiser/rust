@@ -175,11 +175,11 @@ pub fn emit_object(module: &MachModule, debug: Option<DebugContext>) -> Vec<u8> 
     // + UNSIGNED pairs; the personality is a 4-byte GOT-relative pointer in the CIE.
     //
     // The CIE personality is a GOT-indirect pointer (DW_EH_PE 0x9b) that macOS ld requires as an
-    // `ARM64_RELOC_POINTER_TO_GOT` pc-relative relocation whose field holds the pcrel delta
-    // `-pers_field`. It is emitted below via the high-level `RelocationKind::GotRelative`, which the
-    // (patched) `object` crate lowers to `ARM64_RELOC_POINTER_TO_GOT` while writing the `-offset`
-    // field bias implicitly (no rejected `ARM64_RELOC_ADDEND`). Everything else here (table bytes,
-    // CIE/FDE layout, section flags 0x6800000b, SUB/UNSIGNED pointer pairs) is byte-identical to LLVM.
+    // `ARM64_RELOC_POINTER_TO_GOT` pc-relative relocation against the personality symbol. It is
+    // emitted below via the high-level `RelocationKind::GotRelative`, which the (patched) `object`
+    // crate lowers to `ARM64_RELOC_POINTER_TO_GOT`; ld then resolves it to the pc-relative delta to
+    // the symbol's GOT slot (the field is left zero). Everything else here (table bytes, CIE/FDE
+    // layout, section flags 0x6800000b, SUB/UNSIGNED pointer pairs) is byte-identical to LLVM.
     let any_eh = encoded.iter().any(|f| !f.call_sites.is_empty());
     let mut eh_bytes: Vec<u8> = Vec::new();
     let mut fde_off: Vec<Option<u32>> = vec![None; encoded.len()];
@@ -256,8 +256,8 @@ pub fn emit_object(module: &MachModule, debug: Option<DebugContext>) -> Vec<u8> 
         let ehbase = obj.append_section_data(ehs, &eh_bytes, 8);
         let pers = *symbols.entry("_rust_eh_personality".into()).or_insert_with(|| add_undefined(&mut obj, "_rust_eh_personality"));
         // The personality is a 4-byte GOT-relative pointer in the CIE. The high-level `GotRelative`
-        // reloc makes `object` emit `ARM64_RELOC_POINTER_TO_GOT` (pc-relative) and write the pcrel
-        // field bias (`-pers_field`) implicitly, exactly as ld64/LLVM require.
+        // reloc makes `object` emit `ARM64_RELOC_POINTER_TO_GOT` (pc-relative); ld resolves it to the
+        // pc-relative offset from this field to the personality symbol's GOT slot, as ld64/LLVM require.
         obj.add_relocation(ehs, Relocation {
             offset: ehbase + pers_field as u64,
             symbol: pers,
