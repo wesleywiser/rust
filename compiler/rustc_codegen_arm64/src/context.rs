@@ -172,6 +172,11 @@ pub struct CodegenCx<'tcx> {
     /// (via [`CodegenCx::take_debug_context`]) at the end of codegen to travel with the module.
     pub debug: Option<RefCell<crate::dwarf::DebugContext>>,
 
+    /// Cache of DWARF type DIEs by Rust type, for local-variable `DW_AT_type`. Lives only in the
+    /// `TyCtxt`-bearing half (keyed by `Ty<'tcx>`, like `self`); the DIEs it points at live in
+    /// `debug`'s unit and outlive it.
+    pub dbg_type_dies: RefCell<FxHashMap<Ty<'tcx>, gimli::write::UnitEntryId>>,
+
     /// Accumulated textual assembly for this codegen unit (`global_asm!` blocks and `#[naked]`
     /// function bodies). Assembled by an external assembler into a side object at emit time.
     pub global_asm: RefCell<String>,
@@ -212,6 +217,7 @@ impl<'tcx> CodegenCx<'tcx> {
             eh_personality: Cell::new(None),
             local_gen_sym_counter: Cell::new(0),
             debug: crate::dwarf::DebugContext::new(tcx).map(RefCell::new),
+            dbg_type_dies: RefCell::new(FxHashMap::default()),
             global_asm: RefCell::new(String::new()),
             asm_syms: RefCell::new(rustc_data_structures::fx::FxHashSet::default()),
             inline_asm_index: Cell::new(0),
@@ -305,7 +311,7 @@ impl<'tcx> BackendTypes for CodegenCx<'tcx> {
 
     type DIScope = gimli::write::UnitEntryId;
     type DILocation = crate::mach::inst::DebugLoc;
-    type DIVariable = ();
+    type DIVariable = Option<gimli::write::UnitEntryId>;
 }
 
 impl<'tcx> HasTyCtxt<'tcx> for CodegenCx<'tcx> {

@@ -58,6 +58,10 @@ pub struct MachFunction {
     /// call whose return address is in `[begin, end)` that unwinds transfers to `landing_pad`.
     /// `action` is 0 for a cleanup pad and 1 for a catch-all (catch_unwind). Empty for non-EH fns.
     pub call_sites: Vec<MachCallSite>,
+    /// Frame size (bytes) for `DW_OP_fbreg` local-variable debug locations, or `None` when the
+    /// function realigned `sp` (making slot-to-frame-base offsets runtime-variable) or was built
+    /// without debug info. Set by `FunctionBuild::finish`.
+    pub dbg_fp_frame_size: Option<u64>,
 }
 
 /// An EH call site recorded with label ids (resolved to byte offsets by `encode`).
@@ -90,11 +94,19 @@ pub struct EncodedFunction {
     /// Debug line markers resolved to byte offsets: `(code_offset, location)`, in program order.
     /// Empty unless the function was built with debug info enabled.
     pub line_rows: Vec<(u64, DebugLoc)>,
+    /// Frame size for `DW_OP_fbreg` local-variable locations (see [`MachFunction::dbg_fp_frame_size`]).
+    pub dbg_fp_frame_size: Option<u64>,
 }
 
 impl MachFunction {
     pub fn new(name: impl Into<Box<str>>, is_global: bool) -> MachFunction {
-        MachFunction { name: name.into(), is_global, insts: Vec::new(), call_sites: Vec::new() }
+        MachFunction {
+            name: name.into(),
+            is_global,
+            insts: Vec::new(),
+            call_sites: Vec::new(),
+            dbg_fp_frame_size: None,
+        }
     }
 
     #[inline]
@@ -191,7 +203,15 @@ impl MachFunction {
             })
             .collect();
 
-        EncodedFunction { name: self.name.clone(), is_global: self.is_global, code, relocs, call_sites, line_rows }
+        EncodedFunction {
+            name: self.name.clone(),
+            is_global: self.is_global,
+            code,
+            relocs,
+            call_sites,
+            line_rows,
+            dbg_fp_frame_size: self.dbg_fp_frame_size,
+        }
     }
 }
 

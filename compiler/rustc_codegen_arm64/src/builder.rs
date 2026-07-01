@@ -125,6 +125,10 @@ impl FunctionBuild {
         let realign = align > 16;
         let mut f = MachFunction::new(self.name, self.is_global);
         f.call_sites = self.call_sites;
+        // Local-variable debug locations are `x29`-relative (`off - frame_size`), which is only
+        // valid when `sp` sits a fixed distance below `fp`. A realigned frame breaks that, so leave
+        // the frame size unset there — locations are then omitted rather than emitted incorrectly.
+        f.dbg_fp_frame_size = if realign { None } else { Some(frame) };
 
         // Prologue: save FP/LR, set up the frame pointer, reserve the local frame.
         f.push(Inst::LoadStorePair {
@@ -1589,7 +1593,7 @@ impl<'a, 'tcx> BackendTypes for Builder<'a, 'tcx> {
 
     type DIScope = gimli::write::UnitEntryId;
     type DILocation = crate::mach::inst::DebugLoc;
-    type DIVariable = ();
+    type DIVariable = Option<gimli::write::UnitEntryId>;
 }
 
 // The layout/abi helper traits delegate to the context so the blanket `LayoutOf`/`FnAbiOf` impls
@@ -3297,23 +3301,54 @@ impl<'a, 'tcx> CoverageInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
 impl<'a, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn dbg_var_addr(
         &mut self,
-        _dbg_var: (),
+        dbg_var: Option<gimli::write::UnitEntryId>,
         _dbg_loc: crate::mach::inst::DebugLoc,
-        _variable_alloca: Value,
-        _direct_offset: Size,
-        _indirect_offsets: &[Size],
-        _fragment: &Option<std::ops::Range<Size>>,
+        variable_alloca: Value,
+        direct_offset: Size,
+        indirect_offsets: &[Size],
+        fragment: &Option<std::ops::Range<Size>>,
     ) {
+        // A variable the debug context declined to describe (e.g. one inside an inlined callee) is
+        // reported as `None`; there is nothing to locate.
+        let Some(dbg_var) = dbg_var else { return };
+        // A fragment describes only part of the variable. Modelling it correctly needs `DW_OP_piece`
+        // accumulated across the one call the driver makes per fragment; until that lands, skip
+        // fragmented variables rather than describe a fragment as if it were the whole variable.
+        if fragment.is_some() {
+            return;
+        }
+        // A local's backing store is its `alloca`, i.e. a frame-slot address (`sp + off`). Any other
+        // value shape (a spilled pointer, a constant, ...) has no static frame-relative location, so
+        // leave the variable unlocated rather than emit an incorrect one.
+        let Value::FrameAddr { off, .. } = variable_alloca else { return };
+
+        // Record the location; it is resolved to `DW_OP_fbreg(off - frame_size)` (plus the
+        // dereference/offset projection) during object emission, once the frame size is final. The
+        // owning function is the one currently being lowered; its name matches the `MachFunction`
+        // (hence the `FnDebug`) the resolver keys on.
+        let indirect_offsets: Vec<u64> = indirect_offsets.iter().map(|s| s.bytes()).collect();
+        let fn_name =
+            self.cx.cur_fn.borrow().as_ref().expect("function being built").name.clone();
+        self.cx.debug_context().borrow_mut().record_var_loc(
+            &fn_name,
+            dbg_var,
+            off,
+            direct_offset.bytes(),
+            indirect_offsets,
+        );
     }
     fn dbg_var_value(
         &mut self,
-        _dbg_var: (),
+        _dbg_var: Option<gimli::write::UnitEntryId>,
         _dbg_loc: crate::mach::inst::DebugLoc,
         _value: Value,
         _direct_offset: Size,
         _indirect_offsets: &[Size],
         _fragment: &Option<std::ops::Range<Size>>,
     ) {
+        // Direct-value debug info (a variable whose value, not address, is a known SSA value or
+        // constant) is not described yet: in the stack-slot model such values are not kept in a
+        // stable location, so emitting one would risk being wrong. Left for a later phase.
     }
     fn set_dbg_loc(&mut self, dbg_loc: crate::mach::inst::DebugLoc) {
         // Record a source-location marker in the instruction stream; layout turns it into a

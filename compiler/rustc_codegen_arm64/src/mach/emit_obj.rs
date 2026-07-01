@@ -430,6 +430,7 @@ fn emit_debug_info(
             text_offset: off,
             size: f.code.len() as u64,
             line_rows: &f.line_rows,
+            frame_size: f.dbg_fp_frame_size,
         })
         .collect();
     let sections = debug.emit(&fn_debugs);

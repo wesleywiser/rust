@@ -17,7 +17,7 @@ use gimli::write::{
     Range, RangeList, Result as GimliResult, Sections, UnitEntryId, Writer,
 };
 use gimli::{Encoding, Format, LineEncoding, Register, RunTimeEndian, SectionId};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_middle::ty::{Instance, TyCtxt};
 use rustc_span::{Pos, SourceFile, Span, StableSourceFileId};
 
@@ -82,6 +82,25 @@ pub struct FnDebug<'a> {
     pub text_offset: u64,
     pub size: u64,
     pub line_rows: &'a [(u64, DebugLoc)],
+    /// Frame size for resolving `DW_OP_fbreg` local-variable locations: an `sp`-relative slot at
+    /// `off` sits at `off - frame_size` from the `x29` frame base. `None` when the function
+    /// realigned `sp` (so slot-to-frame-base offsets are not statically known) or has no debug info.
+    pub frame_size: Option<u64>,
+}
+
+/// A pending local-variable location, recorded during codegen and resolved to a `DW_AT_location`
+/// during [`DebugContext::emit`] once the containing function's frame size is known.
+struct VarLoc {
+    /// Mangled symbol name of the owning function (matches [`FnDebug::name`]).
+    fn_name: Box<str>,
+    /// The `DW_TAG_variable` / `DW_TAG_formal_parameter` DIE the location attaches to.
+    var_die: UnitEntryId,
+    /// `sp`-relative byte offset of the variable's storage slot (from its `alloca`).
+    frame_off: u64,
+    /// Constant byte offset added to the base address before any dereference.
+    direct_offset: u64,
+    /// Pointer-chain steps: each entry is a dereference followed by adding that byte offset.
+    indirect_offsets: Vec<u64>,
 }
 
 /// All DWARF state for one codegen unit. Built in the `TyCtxt`-bearing half of the backend and then
@@ -100,6 +119,12 @@ pub struct DebugContext {
     /// Abstract subprogram DIEs for inlined callees, keyed by the callee's symbol name (one per
     /// callee per codegen unit, shared by every inlined instance / `DW_TAG_inlined_subroutine`).
     abstract_fns: FxHashMap<Box<str>, UnitEntryId>,
+    /// Pending local-variable locations, resolved to `DW_AT_location` during [`DebugContext::emit`].
+    var_locs: Vec<VarLoc>,
+    /// DIEs of concrete functions defined in this codegen unit (as opposed to the abstract
+    /// subprograms created for inlined callees). Located variable DIEs are only attached to these,
+    /// so an abstract template never receives a concrete `DW_OP_fbreg` location.
+    concrete_fns: FxHashSet<UnitEntryId>,
 }
 
 impl DebugContext {
@@ -157,6 +182,8 @@ impl DebugContext {
             functions: FxHashMap::default(),
             locations: Vec::new(),
             abstract_fns: FxHashMap::default(),
+            var_locs: Vec::new(),
+            concrete_fns: FxHashSet::default(),
         })
     }
 
@@ -283,7 +310,15 @@ impl DebugContext {
             inlined_at: None,
         });
         self.functions.insert(mangled_name.into(), FnEntry { die, decl });
+        self.concrete_fns.insert(die);
         die
+    }
+
+    /// Whether `scope` is the DIE of a concrete function defined in this codegen unit, rather than
+    /// an abstract subprogram created for an inlined callee. Used to decide whether a variable in
+    /// that scope may be given a concrete frame-relative location.
+    pub fn is_concrete_fn(&self, scope: UnitEntryId) -> bool {
+        self.concrete_fns.contains(&scope)
     }
 
     /// Create (or reuse) the abstract `DW_TAG_subprogram` DIE for a callee that is inlined into one
@@ -317,6 +352,87 @@ impl DebugContext {
         }
         self.abstract_fns.insert(key.into(), die);
         die
+    }
+
+    /// Create a `DW_TAG_base_type` DIE for a scalar (integers, floats, `bool`, `char`).
+    pub fn add_base_type(&mut self, name: &str, encoding: gimli::DwAte, byte_size: u64) -> UnitEntryId {
+        let name_id = self.dwarf.strings.add(name);
+        let id = self.dwarf.unit.add(self.dwarf.unit.root(), gimli::DW_TAG_base_type);
+        let entry = self.dwarf.unit.get_mut(id);
+        entry.set(gimli::DW_AT_name, AttributeValue::StringRef(name_id));
+        entry.set(gimli::DW_AT_encoding, AttributeValue::Encoding(encoding));
+        entry.set(gimli::DW_AT_byte_size, AttributeValue::Udata(byte_size));
+        id
+    }
+
+    /// Create a `DW_TAG_pointer_type` DIE (a thin pointer/reference) pointing at `pointee`.
+    pub fn add_pointer_type(&mut self, name: &str, pointee: UnitEntryId, byte_size: u64) -> UnitEntryId {
+        let name_id = self.dwarf.strings.add(name);
+        let id = self.dwarf.unit.add(self.dwarf.unit.root(), gimli::DW_TAG_pointer_type);
+        let entry = self.dwarf.unit.get_mut(id);
+        entry.set(gimli::DW_AT_name, AttributeValue::StringRef(name_id));
+        entry.set(gimli::DW_AT_byte_size, AttributeValue::Udata(byte_size));
+        entry.set(gimli::DW_AT_type, AttributeValue::UnitRef(pointee));
+        id
+    }
+
+    /// Create an opaque, correctly-sized `DW_TAG_structure_type` DIE with no members — the fallback
+    /// for types whose full layout debuginfo (aggregates, closures, wide pointers, ...) is not
+    /// emitted yet. The variable's name, type name, and byte extent are still described correctly.
+    pub fn add_opaque_type(&mut self, name: &str, byte_size: u64) -> UnitEntryId {
+        let name_id = self.dwarf.strings.add(name);
+        let id = self.dwarf.unit.add(self.dwarf.unit.root(), gimli::DW_TAG_structure_type);
+        let entry = self.dwarf.unit.get_mut(id);
+        entry.set(gimli::DW_AT_name, AttributeValue::StringRef(name_id));
+        entry.set(gimli::DW_AT_byte_size, AttributeValue::Udata(byte_size));
+        id
+    }
+
+    /// Create a `DW_TAG_variable` (local) or `DW_TAG_formal_parameter` (argument) DIE under `scope`,
+    /// naming it and giving it a type. `DW_AT_location` is attached later, in [`Self::emit`], once
+    /// the frame size is known.
+    pub fn create_variable(
+        &mut self,
+        tcx: TyCtxt<'_>,
+        scope: UnitEntryId,
+        is_parameter: bool,
+        name: &str,
+        type_die: UnitEntryId,
+        span: Span,
+    ) -> UnitEntryId {
+        let (file, line, _col) = self.resolve_span(tcx, span);
+        let name_id = self.dwarf.strings.add(name);
+        let tag =
+            if is_parameter { gimli::DW_TAG_formal_parameter } else { gimli::DW_TAG_variable };
+        let id = self.dwarf.unit.add(scope, tag);
+        let entry = self.dwarf.unit.get_mut(id);
+        entry.set(gimli::DW_AT_name, AttributeValue::StringRef(name_id));
+        entry
+            .set(gimli::DW_AT_decl_file, AttributeValue::FileIndex(Some(self.file_ids[file as usize])));
+        entry.set(gimli::DW_AT_decl_line, AttributeValue::Udata(line as u64));
+        entry.set(gimli::DW_AT_type, AttributeValue::UnitRef(type_die));
+        id
+    }
+
+    /// Record a pending local-variable location, resolved to `DW_AT_location` in [`Self::emit`].
+    /// `frame_off` is the `sp`-relative offset of the variable's storage slot; `direct_offset` and
+    /// `indirect_offsets` describe the projection from that slot to the variable (each indirect
+    /// offset is a dereference followed by adding the offset).
+    pub fn record_var_loc(
+        &mut self,
+        fn_name: &str,
+        var_die: UnitEntryId,
+        frame_off: u64,
+        direct_offset: u64,
+        indirect_offsets: Vec<u64>,
+    ) {
+        self.var_locs.push(VarLoc {
+            fn_name: fn_name.into(),
+            var_die,
+            frame_off,
+            direct_offset,
+            indirect_offsets,
+        });
     }
 
     /// Finalize the line-number program and address ranges, then serialize all DWARF sections.
@@ -363,6 +479,32 @@ impl DebugContext {
         let range_list = self.dwarf.unit.ranges.add(RangeList(ranges));
         let root = self.dwarf.unit.root();
         self.dwarf.unit.get_mut(root).set(gimli::DW_AT_ranges, AttributeValue::RangeListRef(range_list));
+
+        // Resolve pending local-variable locations now that every function's frame size is known. A
+        // slot at `sp + off` sits at `fp + (off - frame_size)`, and `DW_AT_frame_base` is `fp`
+        // (`x29`), so the location is `DW_OP_fbreg(off - frame_size)` plus the projection steps.
+        // Variables in a realigned frame (`frame_size` is `None`) have no static frame-base offset
+        // and are left unlocated rather than described incorrectly.
+        let frame_sizes: FxHashMap<&str, Option<u64>> =
+            funcs.iter().map(|f| (f.name, f.frame_size)).collect();
+        for v in std::mem::take(&mut self.var_locs) {
+            let Some(&Some(frame_size)) = frame_sizes.get(v.fn_name.as_ref()) else { continue };
+            let mut expr = Expression::new();
+            expr.op_fbreg(v.frame_off as i64 - frame_size as i64);
+            if v.direct_offset != 0 {
+                expr.op_plus_uconst(v.direct_offset);
+            }
+            for off in v.indirect_offsets {
+                expr.op_deref();
+                if off != 0 {
+                    expr.op_plus_uconst(off);
+                }
+            }
+            self.dwarf
+                .unit
+                .get_mut(v.var_die)
+                .set(gimli::DW_AT_location, AttributeValue::Exprloc(expr));
+        }
 
         let mut sections = Sections::new(WriterRelocate::new(self.endian));
         self.dwarf.write(&mut sections).expect("gimli DWARF write failed");
