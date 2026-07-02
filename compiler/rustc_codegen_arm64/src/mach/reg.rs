@@ -162,6 +162,16 @@ pub enum FpSize {
 }
 
 impl FpSize {
+    /// The width in bytes of a value of this size (`h` = 2, `s` = 4, `d` = 8).
+    #[inline]
+    pub const fn bytes(self) -> u32 {
+        match self {
+            FpSize::S16 => 2,
+            FpSize::S32 => 4,
+            FpSize::S64 => 8,
+        }
+    }
+
     /// The 2-bit `ftype` field used by scalar FP instructions (`00` = single, `01` = double,
     /// `11` = half).
     #[inline]

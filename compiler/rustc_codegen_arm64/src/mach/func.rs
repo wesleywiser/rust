@@ -44,6 +44,7 @@ pub enum RelocKind {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Reloc {
     pub offset: u64,
+    /// Name of the symbol this relocation targets; resolved to an object symbol during emission.
     pub sym: Box<str>,
     pub addend: i64,
     pub kind: RelocKind,
@@ -51,6 +52,7 @@ pub struct Reloc {
 
 /// A function being built: a flat instruction stream (including [`Inst::Label`] pseudo-ops).
 pub struct MachFunction {
+    /// The function's symbol name (emitted as the object symbol, and the relocation target for calls).
     pub name: Box<str>,
     pub is_global: bool,
     pub insts: Vec<Inst>,

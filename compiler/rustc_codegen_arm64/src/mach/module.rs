@@ -54,6 +54,8 @@ impl MachModule {
         MachModule {
             functions: Vec::new(),
             data: Vec::new(),
+            // Packed 11.0.0 (`major << 16`): the default macOS deployment target, overridden per
+            // session from the actual target in `CodegenCx::new` (see the field doc above).
             macho_min_os: 0x000B_0000,
             forced_globals: FxHashSet::default(),
         }

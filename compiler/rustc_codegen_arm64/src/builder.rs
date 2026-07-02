@@ -78,6 +78,8 @@ enum SimdBitOp {
 
 /// State for the function currently being lowered.
 pub struct FunctionBuild {
+    /// The function's final (mangled) symbol name. Becomes the `MachFunction`'s name, and is the key
+    /// debug info uses to attach this function's variable locations to its frame.
     pub name: Box<str>,
     pub is_global: bool,
     /// Instruction list for each basic block, indexed by block id (which is also its [`Label`]).
@@ -102,6 +104,8 @@ impl FunctionBuild {
             frame: FrameLayout::new(outgoing_bytes),
             param_slots: Vec::new(),
             call_sites: Vec::new(),
+            // Start synthetic call-site bracket labels high so they never collide with basic-block
+            // labels (which are the small, zero-based block indices).
             next_cs_label: 0xF000_0000,
         }
     }
@@ -128,6 +132,8 @@ impl FunctionBuild {
         // Local-variable debug locations are `x29`-relative (`off - frame_size`), which is only
         // valid when `sp` sits a fixed distance below `fp`. A realigned frame breaks that, so leave
         // the frame size unset there — locations are then omitted rather than emitted incorrectly.
+        // (Describing them correctly would need a base-pointer register pinned to the realigned `sp`,
+        // or CFI/CFA-relative locations — neither of which this baseline backend emits.)
         f.dbg_fp_frame_size = if realign { None } else { Some(frame) };
 
         // Prologue: save FP/LR, set up the frame pointer, reserve the local frame.
@@ -227,11 +233,7 @@ fn push_mem_gpr(
 /// Push a floating-point load/store of `rt` at `[base, #offset]`, with the same large-offset
 /// handling as [`push_mem_gpr`].
 fn push_mem_fp(out: &mut Vec<Inst>, load: bool, size: FpSize, rt: Vreg, base: Gpr, offset: u64) {
-    let bytes = match size {
-        FpSize::S16 => 2,
-        FpSize::S32 => 4,
-        FpSize::S64 => 8,
-    };
+    let bytes = size.bytes() as u64;
     if imm_offset_fits(offset, bytes) {
         out.push(Inst::LoadStoreFpUImm { load, size, rt, rn: base, offset });
     } else {
@@ -590,6 +592,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             1 => MemSize::B,
             2 => MemSize::H,
             4 => MemSize::W,
+            // An 8-byte (or wider) lane already fills the 64-bit register; nothing to sign-extend.
             _ => return,
         };
         self.emit(Inst::Sxt { from, to: OperandSize::S64, rd: reg, rn: reg });
@@ -1650,11 +1653,17 @@ fn op_size(cx: &CodegenCx<'_>, ty: Type) -> OperandSize {
             todo!("{bits}-bit integer operations are not yet supported by the arm64 backend")
         }
         TypeData::Int(bits) => OperandSize::from_bits(bits as u64),
+        // A pointer fills a 64-bit register; so does any other value materialized bit-for-bit into a
+        // scratch register here (e.g. a float or aggregate constant en route to a store). The 64-bit
+        // register form is correct for all of them.
         _ => OperandSize::S64,
     }
 }
 
-/// Memory access width for a backend type.
+/// Memory access width for a backend type. Values wider than a register (i128, f128, vectors) are
+/// normally moved by dedicated paths, but ABI return/argument marshalling can still route a 16-byte
+/// value (e.g. a returned vector materialized into a register) through here, so `X` is a catch-all
+/// rather than a hard error.
 fn mem_size(cx: &CodegenCx<'_>, ty: Type) -> MemSize {
     let (size, _) = cx.type_size_align(ty);
     match size {
@@ -1718,8 +1727,9 @@ fn fp_op1_to_simd(op: FpOp1) -> Option<SimdUnOp> {
     })
 }
 
-/// Floating-point operand size for a float backend type (`f16` -> half, `f32` -> single, otherwise
-/// double). `f128` has no hardware FP register form and is handled by libcalls before this is hit.
+/// Floating-point operand size for a float backend type (`f16` -> half, `f32` -> single, `f64` ->
+/// double). `f128` has no hardware FP register form and is handled by libcalls before this is
+/// reached, so the `S64` fallback only ever applies to `f64`.
 fn fp_size(cx: &CodegenCx<'_>, ty: Type) -> FpSize {
     match cx.type_data(ty) {
         TypeData::Float(16) => FpSize::S16,
@@ -2134,6 +2144,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let from = match self.cx.type_data(val.ty()) {
             TypeData::Int(8) => MemSize::B,
             TypeData::Int(16) => MemSize::H,
+            // `i32`/`i64` already occupy their full operation width, and non-integer operands are
+            // never sign-extended, so there is nothing to do.
             _ => return,
         };
         let to = op_size(self.cx, val.ty());
@@ -2176,7 +2188,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
     /// Whether `ty` is a 128-bit integer (handled as a low/high 64-bit word pair).
     fn is_int128(&self, ty: Type) -> bool {
-        matches!(self.cx.type_data(ty), TypeData::Int(b) if b > 64)
+        matches!(self.cx.type_data(ty), TypeData::Int(128))
     }
 
     /// Load a 128-bit value into the register pair `(lo, hi)` (low word in `lo`, high in `hi`).
@@ -3280,7 +3292,8 @@ fn mem_size_from_bytes(bytes: u64) -> MemSize {
         1 => MemSize::B,
         2 => MemSize::H,
         4 => MemSize::W,
-        _ => MemSize::X,
+        8 => MemSize::X,
+        other => unreachable!("no single-register memory access width for {other} bytes"),
     }
 }
 
@@ -5747,6 +5760,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn call(
         &mut self,
         llty: Type,
+        // The baseline backend does no attribute-driven optimization (inlining, target features,
+        // ...), so the caller's codegen attributes do not affect the emitted call.
         _caller_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         fn_val: Value,
