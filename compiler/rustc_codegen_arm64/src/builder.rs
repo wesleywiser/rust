@@ -100,7 +100,7 @@ impl FunctionBuild {
         FunctionBuild {
             name,
             is_global,
-            blocks: Vec::new(),
+            blocks: Vec::new(), // FIXME: right size this capacity
             frame: FrameLayout::new(outgoing_bytes),
             param_slots: Vec::new(),
             call_sites: Vec::new(),
@@ -113,7 +113,7 @@ impl FunctionBuild {
     /// Append a fresh empty basic block, returning its id.
     pub fn new_block(&mut self) -> BasicBlock {
         let id = self.blocks.len() as u32;
-        self.blocks.push(Vec::new());
+        self.blocks.push(Vec::new()); // FIXME: right size this capacity
         BasicBlock(id)
     }
 
@@ -592,8 +592,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             1 => MemSize::B,
             2 => MemSize::H,
             4 => MemSize::W,
-            // An 8-byte (or wider) lane already fills the 64-bit register; nothing to sign-extend.
-            _ => return,
+            _ => return, // FIXME: should this panic?
         };
         self.emit(Inst::Sxt { from, to: OperandSize::S64, rd: reg, rn: reg });
     }
@@ -1727,14 +1726,13 @@ fn fp_op1_to_simd(op: FpOp1) -> Option<SimdUnOp> {
     })
 }
 
-/// Floating-point operand size for a float backend type (`f16` -> half, `f32` -> single, `f64` ->
-/// double). `f128` has no hardware FP register form and is handled by libcalls before this is
-/// reached, so the `S64` fallback only ever applies to `f64`.
+/// Floating-point operand size for a float backend type (`f16` -> half, `f32` -> single, otherwise
+/// double). `f128` has no hardware FP register form and is handled by libcalls before this is hit.
 fn fp_size(cx: &CodegenCx<'_>, ty: Type) -> FpSize {
     match cx.type_data(ty) {
         TypeData::Float(16) => FpSize::S16,
         TypeData::Float(32) => FpSize::S32,
-        _ => FpSize::S64,
+        _ => FpSize::S64, // FIXME: explicitly match 64 bit (right?) and panic otherwise
     }
 }
 
@@ -2144,9 +2142,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let from = match self.cx.type_data(val.ty()) {
             TypeData::Int(8) => MemSize::B,
             TypeData::Int(16) => MemSize::H,
-            // `i32`/`i64` already occupy their full operation width, and non-integer operands are
-            // never sign-extended, so there is nothing to do.
-            _ => return,
+            _ => return, // FIXME: should this panic instead?
         };
         let to = op_size(self.cx, val.ty());
         self.emit(Inst::Sxt { from, to, rd: reg, rn: reg });
